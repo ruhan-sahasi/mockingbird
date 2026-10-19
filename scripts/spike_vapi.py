@@ -11,6 +11,7 @@ Run it with uv (no pyproject exists yet, so the deps are declared above):
     uv run scripts/spike_vapi.py serve                    # shell 2
     uv run scripts/spike_vapi.py call --interrupt-at 1.5  # shell 3
     uv run scripts/spike_vapi.py fixtures                 # scrub raw logs into fixtures
+    uv run scripts/spike_vapi.py selftest                 # offline checks, no Vapi credit
 
 Raw captures (unscrubbed, never committed) go to scripts/.spike/raw/.
 Scrubbed fixtures go to server/tests/fixtures/vapi/.
@@ -31,6 +32,7 @@ import sys
 import time
 import wave
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request  # top level: FastAPI resolves annotations from module globals
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -45,6 +47,9 @@ SAMPLE_RATE = 16000
 FRAME_SAMPLES = 320  # 20 ms at 16 kHz
 FRAME_BYTES = FRAME_SAMPLES * 2  # pcm_s16le
 FRAME_SECONDS = 0.02
+
+# model.url is "<public url>" + LLM_MOUNT. Whatever Vapi appends after it is question 1.
+LLM_MOUNT = "/spike/llm"
 
 ANSWERS = {
     "answer1": (
@@ -174,13 +179,13 @@ def build_app():
         reply = LONG_REPLY if state["llm_calls"] == 1 else SHORT_REPLY
         return sse_reply(reply)
 
-    @app.post("/spike/llm/chat/completions")
+    @app.post(f"{LLM_MOUNT}/chat/completions")
     async def llm_chat(request: Request):
         return await handle_llm(request, expected_path=True)
 
     # Catch-all: if Vapi appends a different path, save it and still answer so
     # the call keeps going. Question 1 is about exactly this.
-    @app.post("/spike/llm/{rest:path}")
+    @app.post(LLM_MOUNT + "/{rest:path}")
     async def llm_other(rest: str, request: Request):
         return await handle_llm(request, expected_path=False)
 
@@ -243,7 +248,7 @@ def read_wav(path: Path) -> bytes:
 def build_assistant(ngrok: str, with_artifact_plan: bool = True) -> dict:
     assistant = {
         "firstMessage": "Hi, this is a Mockingbird test call. Tell me about a project you led.",
-        "model": {"provider": "custom-llm", "url": f"{ngrok}/spike/llm", "model": "mockingbird-brain"},
+        "model": {"provider": "custom-llm", "url": f"{ngrok}{LLM_MOUNT}", "model": "mockingbird-brain"},
         "server": {"url": f"{ngrok}/spike/webhook"},
         "serverMessages": ["status-update", "speech-update", "user-interrupted", "end-of-call-report"],
         "maxDurationSeconds": 120,
@@ -290,6 +295,7 @@ class CallState:
         self.rx_frames = 0
         self.first_frames: list[dict] = []
         self.text_frames: list[dict] = []
+        self.frames_path: Path | None = None  # each text frame is appended here as it arrives
         self.pcm = bytearray()
         self.closed = asyncio.Event()
         self.close_info: dict | None = None
@@ -368,7 +374,12 @@ async def receiver(ws, state: CallState) -> None:
                     parsed = json.loads(msg)
                 except ValueError:
                     parsed = None
-                state.text_frames.append({"t": round(t, 3), "raw": msg, "json": parsed})
+                frame = {"t": round(t, 3), "raw": msg, "json": parsed}
+                state.text_frames.append(frame)
+                if state.frames_path is not None:
+                    # write now, not at the end: a crash or Ctrl-C must not lose question 4's evidence
+                    with state.frames_path.open("a") as fh:
+                        fh.write(json.dumps(frame) + "\n")
                 print(f"[{t:6.2f}] TEXT FRAME {msg[:200]}", flush=True)
     except ConnectionClosed:
         pass
@@ -412,7 +423,11 @@ def _json_or_text(resp):
         return resp.text
 
 
-async def run_call(args) -> None:
+async def run_call(args, transport=None) -> None:
+    """Create the call, run the scripted conversation, always save what was seen.
+
+    `transport` is only for the offline selftest (an httpx.MockTransport standing in for Vapi's REST API).
+    """
     import httpx
     import websockets
 
@@ -423,9 +438,11 @@ async def run_call(args) -> None:
     pcm1 = read_wav(Path(args.wav))
     pcm2 = read_wav(Path(args.wav2)) if args.interrupt_at is not None else b""
     RAW.mkdir(parents=True, exist_ok=True)
+    # fixtures uses this to replace the tunnel host, which is the user's, not ours to publish
+    write_json(RAW / "public_url.json", {"public_url": ngrok})
     print(f"using public url {ngrok}", flush=True)
 
-    async with httpx.AsyncClient(timeout=30) as http:
+    async with httpx.AsyncClient(timeout=30, transport=transport) as http:
         call, artifact_ok = await create_call(http, args.api_base, key, ngrok)
         write_json(RAW / "create_call_response.json", call)
         ws_url = call["transport"]["websocketCallUrl"]
@@ -433,40 +450,56 @@ async def run_call(args) -> None:
         print(f"call {call_id} created; artifactPlan accepted: {artifact_ok}", flush=True)
 
         state = CallState()
+        state.frames_path = RAW / "ws_text_frames.jsonl"
+        state.frames_path.write_text("")  # frames are appended as they arrive
         streamer = Streamer()
-        stop = asyncio.Event()
-        marks: dict[str, float] = {}
-        async with websockets.connect(ws_url, max_size=None, ping_interval=None) as ws:
-            state.t0 = time.monotonic()
-            send_task = asyncio.create_task(streamer.run(ws, state, stop))
-            recv_task = asyncio.create_task(receiver(ws, state))
-            try:
-                await drive(args, ws, state, streamer, pcm1, pcm2, marks)
-            finally:
-                stop.set()
-                await send_task
-                if not state.closed.is_set():
-                    await asyncio.sleep(0)  # let the receiver see any close
-                    try:
-                        await asyncio.wait_for(recv_task, timeout=1)
-                    except asyncio.TimeoutError:
-                        pass
-                if not recv_task.done():
-                    recv_task.cancel()
+        marks: dict[str, float | bool] = {}
+        ended: dict | None = None
+        run_error: str | None = None
+        # From here on the call exists and costs money: whatever happens (socket closed early,
+        # an error, Ctrl-C), poll REST and write the summary so the evidence is never lost.
+        try:
+            async with websockets.connect(ws_url, max_size=None, ping_interval=None) as ws:
+                state.t0 = time.monotonic()
+                stop = asyncio.Event()
+                send_task = asyncio.create_task(streamer.run(ws, state, stop))
+                recv_task = asyncio.create_task(receiver(ws, state))
+                try:
+                    await drive(args, ws, state, streamer, pcm1, pcm2, marks)
+                finally:
+                    stop.set()
+                    await send_task
+                    if not state.closed.is_set():
+                        await asyncio.sleep(0)  # let the receiver see any close
+                        try:
+                            await asyncio.wait_for(recv_task, timeout=1)
+                        except asyncio.TimeoutError:
+                            pass
+                    if not recv_task.done():
+                        recv_task.cancel()
+        except BaseException as exc:  # recorded in the summary, then re-raised
+            run_error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            ended = await fetch_call_after(http, args.api_base, key, call_id)
+            save_call_artifacts(state, streamer, marks, call_id, artifact_ok, ended, run_error)
 
-        # Did the call really end on Vapi's side? Ask the REST API.
-        ended = None
-        for _ in range(10):
-            got = await http.get(
-                f"{args.api_base}/call/{call_id}", headers={"Authorization": f"Bearer {key}"}
-            )
-            ended = got.json() if got.status_code < 300 else {"status_code": got.status_code}
-            if ended.get("status") == "ended":
-                break
-            await asyncio.sleep(1.5)
-        write_json(RAW / "get_call_after.json", ended)
 
-    save_call_artifacts(state, streamer, marks, call_id, artifact_ok, ended)
+async def fetch_call_after(http, api_base: str, key: str, call_id) -> dict:
+    """Did the call really end on Vapi's side? Ask the REST API. Never raises."""
+    ended: dict = {}
+    for _ in range(10):
+        try:
+            got = await http.get(f"{api_base}/call/{call_id}", headers={"Authorization": f"Bearer {key}"})
+            body = got.json() if got.status_code < 300 else {"status_code": got.status_code}
+            ended = body if isinstance(body, dict) else {"unexpected_body": body}
+        except Exception as exc:  # network trouble must not hide the rest of the evidence
+            ended = {"poll_error": f"{type(exc).__name__}: {exc}"}
+        if ended.get("status") == "ended":
+            break
+        await asyncio.sleep(1.5)
+    write_json(RAW / "get_call_after.json", ended)
+    return ended
 
 
 async def drive(args, ws, state, streamer, pcm1, pcm2, marks) -> None:
@@ -518,21 +551,41 @@ async def drive(args, ws, state, streamer, pcm1, pcm2, marks) -> None:
         40, "final reply to end", state,
     )
     log("final reply ended (or timed out)")
-    await asyncio.sleep(3)
+    if not state.closed.is_set():
+        await asyncio.sleep(3)
 
     # 6. hang up
+    await send_end_call(ws, state, marks, log)
+
+
+async def send_end_call(ws, state: CallState, marks: dict, log=print) -> None:
+    """Send {"type": "end-call"} unless Vapi already hung up (silence timeout, error, max duration).
+
+    Question 7 is only answered when the frame really went out, so `end_call_sent` and
+    `closed_after_end_call` are only recorded then; `closed_before_end_call` says which case it was.
+    """
+    from websockets.exceptions import ConnectionClosed
+
+    if state.closed.is_set():
+        marks["closed_before_end_call"] = True
+        log("socket already closed; end-call not sent")
+        return
+    try:
+        await ws.send(json.dumps({"type": "end-call"}))
+    except ConnectionClosed:
+        marks["closed_before_end_call"] = True
+        log("socket closed just as end-call was sent; not honored or refused")
+        return
+    marks["closed_before_end_call"] = False
     marks["end_call_sent"] = state.now()
-    await ws.send(json.dumps({"type": "end-call"}))
     log('sent text frame {"type": "end-call"}')
     ok = await wait_for(lambda: state.closed.is_set(), 15, "socket to close after end-call", state)
     marks["closed_after_end_call"] = ok
     log(f"socket closed after end-call: {ok}")
 
 
-def save_call_artifacts(state, streamer, marks, call_id, artifact_ok, ended) -> None:
-    with (RAW / "ws_text_frames.jsonl").open("w") as fh:
-        for frame in state.text_frames:
-            fh.write(json.dumps(frame) + "\n")
+def save_call_artifacts(state, streamer, marks, call_id, artifact_ok, ended, run_error=None) -> None:
+    # ws_text_frames.jsonl is not written here: the receiver appends each frame as it arrives.
     write_json(RAW / "ws_binary_frames_first20.json", state.first_frames)
     (RAW / "received.pcm").write_bytes(bytes(state.pcm))
     with wave.open(str(RAW / "received_assumed_16k.wav"), "wb") as wf:
@@ -543,7 +596,7 @@ def save_call_artifacts(state, streamer, marks, call_id, artifact_ok, ended) -> 
 
     sizes = sorted({f["bytes"] for f in state.first_frames})
     gaps = [round(b["t"] - a["t"], 4) for a, b in zip(state.first_frames, state.first_frames[1:])]
-    duration = state.pcm and len(state.pcm) / 2 / SAMPLE_RATE
+    duration = round(len(state.pcm) / 2 / SAMPLE_RATE, 3)  # 0.0 when no audio came back
     summary = {
         "call_id": call_id,
         "artifact_plan_accepted": artifact_ok,
@@ -558,6 +611,7 @@ def save_call_artifacts(state, streamer, marks, call_id, artifact_ok, ended) -> 
         "text_frame_count": len(state.text_frames),
         "get_call_status_after": (ended or {}).get("status"),
         "get_call_ended_reason_after": (ended or {}).get("endedReason"),
+        "aborted_with": run_error,
     }
     write_json(RAW / "call_summary.json", summary)
     print(json.dumps(summary, indent=2), flush=True)
@@ -572,47 +626,122 @@ def cmd_call(args) -> None:
 # --------------------------------------------------------------------------
 
 _KEY_REDACT = re.compile(
-    r"^(authorization|x-api-key|api[-_]?key|cookie|set-cookie|.*secret.*|.*password.*|.*credential.*|.*token)$",
+    r"^(authorization|x-api-key|cookie|set-cookie|.*api[-_]?key.*|.*secret.*|.*password.*|.*credential.*|.*token"
+    r"|x-forwarded-for|x-real-ip|forwarded|cf-connecting-ip|true-client-ip)$",
     re.I,
 )
 _COUNT_KEY = re.compile(r"(max|prompt|completion|total|input|output)[-_]?tokens?$", re.I)
+# Keys whose value is a capability or recording URL. Redacted by key, whatever the URL scheme.
+_URL_KEY = re.compile(
+    r"^(websocketCallUrl|listenUrl|controlUrl|logUrl|pcapUrl|recordingUrl|.*RecordingUrl|.*CallUrl)$", re.I
+)
+_ORG_KEY = re.compile(r"^org[-_]?id$", re.I)
 _JWT = re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}")
-_BEARER = re.compile(r"Bearer\s+\S+", re.I)
+_BEARER = re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]+", re.I)
 _SK = re.compile(r"\b(sk|pk|key)[-_][A-Za-z0-9_-]{16,}")
-_WS_URL = re.compile(r"^(wss?://[^/]+/).+$")
+_URL_WHOLE = re.compile(r"^((?:wss?|https?)://[^/\s]+/).+$", re.I | re.S)
+# Anywhere inside a longer string: every ws(s) URL, and every path on a vapi.ai host (call-scoped URLs).
+_WS_IN_TEXT = re.compile(r"\b(wss?://[^/\s\"'\\]+/)[^\s\"'\\]+", re.I)
+_VAPI_IN_TEXT = re.compile(r"\b(https?://[^/\s\"'\\]*vapi\.ai/)[^\s\"'\\]+", re.I)
+_NGROK_HOST = re.compile(
+    r"\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.ngrok(?:-free)?\.(?:app|dev|io|pizza|pro)\b", re.I
+)
 ZERO_UUID = "00000000-0000-0000-0000-000000000000"
+TUNNEL_PLACEHOLDER = "tunnel.example"
 
 
-def scrub(value, api_key: str | None, key: str = ""):
-    """Return a copy of a JSON value with anything secret-looking replaced."""
-    if key == "orgId":
+def scrub(value, literals: dict[str, str], key: str = "", redact: bool = False):
+    """Return a copy of a JSON value with anything secret-looking replaced.
+
+    `literals` maps an exact secret string (the API key, the tunnel host) to its replacement.
+    `redact` is set once an enclosing key marked the whole subtree secret.
+    """
+    if _ORG_KEY.match(key):
         return ZERO_UUID
+    secret_key = bool(key) and bool(_KEY_REDACT.match(key)) and not _COUNT_KEY.search(key)
+    redact = redact or secret_key
     if isinstance(value, dict):
-        return {k: scrub(v, api_key, k) for k, v in value.items()}
+        return {k: scrub(v, literals, k, redact) for k, v in value.items()}
     if isinstance(value, list):
-        return [scrub(v, api_key, key) for v in value]
-    if isinstance(value, str):
-        if key and _KEY_REDACT.match(key) and not _COUNT_KEY.search(key):
-            return "REDACTED"
-        if api_key and api_key in value:
-            value = value.replace(api_key, "REDACTED")
-        value = _BEARER.sub("Bearer REDACTED", value)
-        value = _JWT.sub("REDACTED_JWT", value)
-        value = _SK.sub("REDACTED_KEY", value)
-        # websocketCallUrl, listenUrl and controlUrl are capability URLs: keep host only
-        return _WS_URL.sub(r"\1REDACTED", value)
-    return value
+        return [scrub(v, literals, key, redact) for v in value]
+    if not isinstance(value, str):
+        return value
+    if redact:
+        return "REDACTED"
+    if _URL_KEY.match(key):
+        # capability / recording URLs: keep the scheme and host, drop everything after
+        whole = _URL_WHOLE.match(value)
+        return whole.group(1) + "REDACTED" if whole else "REDACTED"
+    for literal, replacement in literals.items():
+        if literal and literal in value:
+            value = value.replace(literal, replacement)
+    stripped = value.strip()
+    if stripped[:1] in ("{", "["):
+        # JSON hidden inside a string (a raw copy of a frame, tool-call arguments): scrub it by key too
+        try:
+            inner = json.loads(stripped)
+        except ValueError:
+            inner = None
+        if isinstance(inner, (dict, list)):
+            cleaned = scrub(inner, literals)
+            if cleaned != inner:
+                value = json.dumps(cleaned, ensure_ascii=False)
+    value = _BEARER.sub("Bearer REDACTED", value)
+    value = _JWT.sub("REDACTED_JWT", value)
+    value = _SK.sub("REDACTED_KEY", value)
+    value = _NGROK_HOST.sub(TUNNEL_PLACEHOLDER, value)
+    value = _WS_IN_TEXT.sub(r"\1REDACTED", value)
+    return _VAPI_IN_TEXT.sub(r"\1REDACTED", value)
+
+
+# What must never appear in a published fixture. Each is checked on the scrubbed text, as a second
+# line of defence: if scrub() misses something, fixtures fails loudly instead of writing it.
+_LEAK_PATTERNS = [
+    ("a Bearer token", re.compile(r"Bearer\s+(?!REDACTED)", re.I)),
+    ("JWT-looking text (eyJ)", re.compile(r"eyJ")),
+    ("an sk-/pk-/key- style key", _SK),
+    ("a ws(s):// URL with a path", re.compile(r"wss?://[^/\s\"'\\]+/(?!REDACTED)", re.I)),
+    ("a path on a vapi.ai host", re.compile(r"vapi\.ai/(?!REDACTED)[^\s\"'\\]", re.I)),
+    (
+        "a control/listen/transport URL",
+        re.compile(r"(?:wss?|https?)://[^\s\"'\\]*/(?:control|listen|transport)\b", re.I),
+    ),
+    ("an ngrok host", re.compile(r"\.ngrok(?:-free)?\.(?:app|dev|io|pizza|pro)\b", re.I)),
+    ("an orgId that is not the zero UUID", re.compile(r'"orgId"\s*:\s*"(?!0{8}-0{4}-0{4}-0{4}-0{12}")', re.I)),
+]
+
+
+def find_leaks(text: str, forbidden: list[str]) -> list[str]:
+    """Names of the leak kinds found in `text`. Never returns the matched text itself."""
+    found = [name for name, pattern in _LEAK_PATTERNS if pattern.search(text)]
+    if any(f and f in text for f in forbidden):
+        found.append("a literal secret (the API key or the tunnel host)")
+    return found
 
 
 def cmd_fixtures(args) -> None:
     api_key = load_env().get("VAPI_API_KEY")
+    literals: dict[str, str] = {}
+    if api_key:
+        literals[api_key] = "REDACTED"
+    if (RAW / "public_url.json").exists():
+        host = urlparse(json.loads((RAW / "public_url.json").read_text()).get("public_url", "")).hostname
+        if host:
+            literals[host] = TUNNEL_PLACEHOLDER
+    forbidden = list(literals)
     events = [json.loads(line) for line in (RAW / "events.jsonl").read_text().splitlines() if line]
     FIXTURES.mkdir(parents=True, exist_ok=True)
     written: list[str] = []
 
-    def emit(name: str, data) -> None:
-        write_json(FIXTURES / name, scrub(data, api_key))
+    def write_fixture(name: str, text: str) -> None:
+        leaks = find_leaks(text, forbidden)
+        if leaks:
+            raise SystemExit(f"refusing to write {name}: still contains {', '.join(leaks)} after scrubbing")
+        (FIXTURES / name).write_text(text)
         written.append(name)
+
+    def emit(name: str, data) -> None:
+        write_fixture(name, json.dumps(scrub(data, literals), indent=2, ensure_ascii=False) + "\n")
 
     def raw_for(event) -> dict:
         if event["kind"] == "webhook":
@@ -621,9 +750,11 @@ def cmd_fixtures(args) -> None:
 
     llm = [e for e in events if e["kind"] in ("llm", "llm_other")]
     hooks = [e for e in events if e["kind"] == "webhook"]
+    fixture_for_seq: dict[int, str] = {}
 
     if llm:
         emit("llm_request_turn1.json", raw_for(llm[0]))
+        fixture_for_seq[llm[0]["seq"]] = "llm_request_turn1.json"
     interrupted = [e for e in hooks if e["type"] == "user-interrupted"]
     if interrupted:
         emit("webhook_user_interrupted.json", raw_for(interrupted[0]))
@@ -635,7 +766,29 @@ def cmd_fixtures(args) -> None:
         pick, rule = llm[1], "second LLM request (no later one than a user-interrupted webhook)"
     if pick:
         emit("llm_request_after_interrupt.json", raw_for(pick))
+        fixture_for_seq.setdefault(pick["seq"], "llm_request_after_interrupt.json")
         print(f"llm_request_after_interrupt.json = seq {pick['seq']}: {rule}")
+
+    # Question 1 evidence: the path Vapi appends to model.url, plus the query and headers it sent.
+    paths = []
+    for e in llm:
+        meta_file = RAW / f"llm_{e['seq']:03d}.meta.json"
+        meta = json.loads(meta_file.read_text()) if meta_file.exists() else {}
+        path = meta.get("path", e["path"])
+        paths.append(
+            {
+                "seq": e["seq"],
+                "method": meta.get("method", "POST"),
+                "path": path,
+                "appended_to_model_url": path[len(LLM_MOUNT):] if path.startswith(LLM_MOUNT) else None,
+                "matched_chat_completions_route": e["kind"] == "llm",
+                "query": meta.get("query", e.get("query", "")),
+                "headers": meta.get("headers", {}),
+                "body_fixture": fixture_for_seq.get(e["seq"]),
+            }
+        )
+    if paths:
+        emit("llm_request_paths.json", paths)
 
     seen_speech: set[tuple] = set()
     seen_status: set[str] = set()
@@ -668,14 +821,502 @@ def cmd_fixtures(args) -> None:
     src = RAW / "ws_text_frames.jsonl"
     if src.exists():
         for line in src.read_text().splitlines():
-            if line:
-                lines.append(json.dumps(scrub(json.loads(line), api_key)))
-    (FIXTURES / "ws_text_frames.jsonl").write_text("".join(l + "\n" for l in lines))
-    written.append("ws_text_frames.jsonl")
+            if not line:
+                continue
+            frame = json.loads(line)
+            if frame.get("json") is not None:
+                frame.pop("raw", None)  # same payload twice; the parsed copy is the one scrub() can read by key
+            lines.append(json.dumps(scrub(frame, literals)))
+    write_fixture("ws_text_frames.jsonl", "".join(l + "\n" for l in lines))
 
+    sweep_fixtures(forbidden)
     print("wrote to", FIXTURES)
     for name in sorted(written):
         print("  ", name)
+    print("Scrubbing is automatic but not proof. Read every file above before you commit it.")
+
+
+def sweep_fixtures(forbidden: list[str]) -> None:
+    """Re-read everything in the fixtures directory (also stale files from earlier runs)."""
+    problems = []
+    for path in sorted(FIXTURES.rglob("*")):
+        if path.is_file():
+            for leak in find_leaks(path.read_text(errors="replace"), forbidden):
+                problems.append(f"{path.relative_to(FIXTURES)}: {leak}")
+    if problems:
+        raise SystemExit("fixtures are NOT safe to commit:\n  " + "\n  ".join(problems))
+
+
+# --------------------------------------------------------------------------
+# selftest: offline checks of the parts that decide whether the one paid run is wasted
+# --------------------------------------------------------------------------
+
+FAKE_KEY = "test-key-0123456789abcdefghij"
+FAKE_ORG = "11111111-aaaa-bbbb-cccc-222222222222"
+FAKE_CALL = "99999999-8888-7777-6666-555555555555"
+CAP_LISTEN = f"wss://phone-call-websocket.aws-us-west-2-backend-production2.vapi.ai/{FAKE_CALL}/listen"
+CAP_CONTROL = f"https://phone-call-websocket.aws-us-west-2-backend-production2.vapi.ai/{FAKE_CALL}/control"
+CAP_TRANSPORT = f"wss://phone-call-websocket.aws-us-west-2-backend-production2.vapi.ai/{FAKE_CALL}/transport"
+FAKE_NGROK = "https://abcd-12-34-56-78.ngrok-free.app"
+
+
+def _tone(seconds: float, amplitude: int = 8000) -> bytes:
+    n = int(seconds * SAMPLE_RATE)
+    samples = array.array("h", (int(amplitude * math.sin(2 * math.pi * 440 * i / SAMPLE_RATE)) for i in range(n)))
+    if sys.byteorder == "big":
+        samples.byteswap()
+    return samples.tobytes()
+
+
+def _write_wav(path: Path, pcm: bytes) -> None:
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(pcm)
+
+
+class _Sandbox:
+    """Point the module's paths at a temp dir and give it a fake API key, then put everything back."""
+
+    def __enter__(self):
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        g = globals()
+        self.saved = {k: g[k] for k in ("SPIKE", "RAW", "FIXTURES", "ENV_FILE")}
+        self.saved_env = os.environ.get("VAPI_API_KEY")
+        g.update(SPIKE=root / "spike", RAW=root / "spike" / "raw", FIXTURES=root / "fixtures", ENV_FILE=root / ".env")
+        os.environ["VAPI_API_KEY"] = FAKE_KEY
+        RAW.mkdir(parents=True)
+        return root
+
+    def __exit__(self, *exc):
+        globals().update(self.saved)
+        if self.saved_env is None:
+            os.environ.pop("VAPI_API_KEY", None)
+        else:
+            os.environ["VAPI_API_KEY"] = self.saved_env
+        self.tmp.cleanup()
+
+
+def _fake_vapi_rest(ws_port: int):
+    """An httpx.MockTransport that answers POST /call and GET /call/{id} like Vapi, capability URLs and all."""
+    import httpx
+
+    call_object = {
+        "id": FAKE_CALL,
+        "orgId": FAKE_ORG,
+        "status": "ended",
+        "endedReason": "customer-ended-call",
+        "transport": {"provider": "vapi.websocket", "websocketCallUrl": f"ws://127.0.0.1:{ws_port}/{FAKE_CALL}/transport"},
+        "monitor": {"listenUrl": CAP_LISTEN, "controlUrl": CAP_CONTROL},
+    }
+
+    def handler(request: "httpx.Request") -> "httpx.Response":
+        assert request.headers["authorization"] == f"Bearer {FAKE_KEY}"
+        if request.method == "POST" and request.url.path == "/call":
+            body = json.loads(request.content)
+            assert body["assistant"]["artifactPlan"] == {"recordingEnabled": False}
+            assert body["assistant"]["model"]["url"] == FAKE_NGROK + LLM_MOUNT
+            return httpx.Response(201, json={**call_object, "status": "queued"})
+        if request.method == "GET" and request.url.path == f"/call/{FAKE_CALL}":
+            return httpx.Response(200, json=call_object)
+        return httpx.Response(404, json={"message": "unexpected request"})
+
+    return httpx.MockTransport(handler)
+
+
+def _call_args(root: Path, **overrides):
+    wav = root / "tone.wav"
+    _write_wav(wav, _tone(0.5))
+    values = dict(wav=str(wav), wav2=str(wav), interrupt_at=None, ngrok=FAKE_NGROK, api_base="http://vapi.test")
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+async def _drain(ws) -> None:
+    """A real server keeps reading; one that does not stalls the close handshake for 10 s."""
+    try:
+        async for _ in ws:
+            pass
+    except Exception:
+        pass
+
+
+async def _with_fake_socket(handler, body):
+    import websockets
+
+    server = await websockets.serve(handler, "127.0.0.1", 0)
+    try:
+        return await body(server.sockets[0].getsockname()[1])
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+def test_scrub_hides_capability_urls_by_key_and_by_shape():
+    payload = {
+        "monitor": {"listenUrl": CAP_LISTEN, "controlUrl": CAP_CONTROL},
+        "transport": {"websocketCallUrl": CAP_TRANSPORT},
+        "artifact": {
+            "recordingUrl": f"https://storage.vapi.ai/{FAKE_CALL}.wav",
+            "stereoRecordingUrl": f"https://storage.vapi.ai/{FAKE_CALL}-stereo.wav",
+            "logUrl": f"https://logs.vapi.ai/{FAKE_CALL}.log",
+        },
+        "note": f"connect to {CAP_TRANSPORT} now, or poll https://api.vapi.ai/call/{FAKE_CALL}.",
+    }
+    out = scrub(payload, {})
+    text = json.dumps(out)
+    assert out["monitor"]["controlUrl"] == "https://phone-call-websocket.aws-us-west-2-backend-production2.vapi.ai/REDACTED"
+    assert out["monitor"]["listenUrl"].endswith("vapi.ai/REDACTED")
+    assert out["artifact"]["recordingUrl"] == "https://storage.vapi.ai/REDACTED"
+    assert out["artifact"]["stereoRecordingUrl"] == "https://storage.vapi.ai/REDACTED"
+    assert out["artifact"]["logUrl"] == "https://logs.vapi.ai/REDACTED"
+    assert FAKE_CALL not in text, text
+    assert not find_leaks(text, []), find_leaks(text, [])
+    # The key rule is what protects URLs on hosts the shape rule does not know (storage buckets, a proxy).
+    elsewhere = {
+        "monitor": {"controlUrl": f"https://call-control.example.net/{FAKE_CALL}/c", "listenUrl": f"wss://l.example.net/{FAKE_CALL}"},
+        "artifact": {
+            "recordingUrl": f"https://bucket.s3.amazonaws.com/{FAKE_CALL}.wav",
+            "stereoRecordingUrl": f"https://bucket.s3.amazonaws.com/{FAKE_CALL}-s.wav",
+            "logUrl": f"https://logs.example.net/{FAKE_CALL}.log",
+        },
+    }
+    out = scrub(elsewhere, {})
+    assert out["monitor"] == {"controlUrl": "https://call-control.example.net/REDACTED", "listenUrl": "wss://l.example.net/REDACTED"}
+    assert out["artifact"]["recordingUrl"] == "https://bucket.s3.amazonaws.com/REDACTED"
+    assert out["artifact"]["stereoRecordingUrl"] == "https://bucket.s3.amazonaws.com/REDACTED"
+    assert out["artifact"]["logUrl"] == "https://logs.example.net/REDACTED"
+    assert FAKE_CALL not in json.dumps(out)
+
+
+def test_scrub_redacts_a_whole_secret_subtree_and_nested_json():
+    payload = {
+        "secret": {"value": "hunter2", "list": ["a", {"b": "c"}]},
+        "credentials": [{"id": "cred-1", "apiKey": "xyz"}],
+        "server": {"url": FAKE_NGROK + "/spike/webhook", "headers": {"Authorization": "Bearer abc.def"}},
+        "orgId": FAKE_ORG,
+        "max_tokens": 200,
+        "frame_copy": json.dumps({"orgId": FAKE_ORG, "url": CAP_TRANSPORT, "token": "t0k3n"}),
+    }
+    out = scrub(payload, {"abcd-12-34-56-78.ngrok-free.app": TUNNEL_PLACEHOLDER})
+    text = json.dumps(out)
+    assert out["secret"] == {"value": "REDACTED", "list": ["REDACTED", {"b": "REDACTED"}]}
+    assert out["credentials"] == [{"id": "REDACTED", "apiKey": "REDACTED"}]
+    assert out["server"]["url"] == f"https://{TUNNEL_PLACEHOLDER}/spike/webhook"
+    assert out["server"]["headers"]["Authorization"] == "REDACTED"
+    assert out["orgId"] == ZERO_UUID and out["max_tokens"] == 200
+    inner = json.loads(out["frame_copy"])
+    assert inner == {"orgId": ZERO_UUID, "url": inner["url"], "token": "REDACTED"}, inner
+    assert inner["url"].endswith("vapi.ai/REDACTED")
+    for needle in (FAKE_ORG, "hunter2", "t0k3n", "ngrok", FAKE_CALL):
+        assert needle not in text, needle
+
+
+def test_scrub_handles_key_literals_bearer_and_jwt_in_free_text():
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJl"
+    text = f"call with Bearer {FAKE_KEY} and {jwt}, key {FAKE_KEY}, host eu.ngrok.io, sk-abcdefghijklmnopqrstuvwxyz"
+    out = scrub(text, {FAKE_KEY: "REDACTED"})
+    assert FAKE_KEY not in out and jwt not in out and "ngrok" not in out and "sk-abc" not in out, out
+    assert "Bearer REDACTED" in out
+
+
+def test_find_leaks_flags_what_scrub_might_miss():
+    clean = json.dumps({"orgId": ZERO_UUID, "u": "wss://h.vapi.ai/REDACTED", "auth": "Bearer REDACTED"})
+    assert find_leaks(clean, [FAKE_KEY]) == []
+    dirty = {
+        "a Bearer token": "Authorization: Bearer abc123",
+        "JWT-looking text (eyJ)": "x eyJabc y",
+        "a ws(s):// URL with a path": "wss://h.example/secret-path",
+        "a path on a vapi.ai host": "https://api.vapi.ai/call/abc",
+        "a control/listen/transport URL": "https://h.example/x/control",
+        "an ngrok host": "abc.ngrok-free.app",
+        "an orgId that is not the zero UUID": f'"orgId": "{FAKE_ORG}"',
+        "a literal secret (the API key or the tunnel host)": f"leaked {FAKE_KEY}",
+    }
+    for name, text in dirty.items():
+        assert name in find_leaks(text, [FAKE_KEY]), (name, find_leaks(text, [FAKE_KEY]))
+
+
+def test_summary_is_written_when_no_audio_arrived():
+    with _Sandbox():
+        async def go():
+            state, streamer = CallState(), Streamer()
+            save_call_artifacts(state, streamer, {"closed_before_end_call": True}, FAKE_CALL, True, None)
+
+        asyncio.run(go())
+        summary = json.loads((RAW / "call_summary.json").read_text())
+        assert summary["received_seconds_if_16k"] == 0.0, summary
+        assert summary["marks"]["closed_before_end_call"] is True
+        assert (RAW / "received.pcm").read_bytes() == b""
+
+
+def test_end_call_is_not_sent_into_a_closed_socket():
+    from websockets.exceptions import ConnectionClosedOK
+
+    class DeadSocket:
+        sent = 0
+
+        async def send(self, data):
+            DeadSocket.sent += 1
+            raise ConnectionClosedOK(None, None)
+
+    async def go():
+        # 1. we already saw the close: do not even try
+        state = CallState()
+        state.closed.set()
+        marks: dict = {}
+        await send_end_call(DeadSocket(), state, marks, lambda m: None)
+        assert marks == {"closed_before_end_call": True} and DeadSocket.sent == 0, marks
+        # 2. the close races the send: swallow ConnectionClosed
+        state, marks = CallState(), {}
+        await send_end_call(DeadSocket(), state, marks, lambda m: None)
+        assert marks == {"closed_before_end_call": True} and DeadSocket.sent == 1, marks
+
+    asyncio.run(go())
+
+
+def test_call_survives_the_socket_closing_early_and_keeps_the_evidence():
+    async def handler(ws):
+        drain = asyncio.create_task(_drain(ws))
+        await ws.send(json.dumps({"type": "transport-ready", "listenUrl": CAP_LISTEN}))
+        await asyncio.sleep(0.4)
+        await ws.close(code=1011, reason="pipeline-error")
+        await drain
+
+    with _Sandbox() as root:
+        async def body(port):
+            await run_call(_call_args(root), transport=_fake_vapi_rest(port))
+
+        asyncio.run(_with_fake_socket(handler, body))
+        summary = json.loads((RAW / "call_summary.json").read_text())
+        assert summary["close"]["code"] == 1011 and summary["close"]["reason"] == "pipeline-error", summary
+        assert summary["marks"]["closed_before_end_call"] is True
+        assert "end_call_sent" not in summary["marks"]
+        assert summary["received_seconds_if_16k"] == 0.0 and summary["text_frame_count"] == 1
+        assert summary["get_call_status_after"] == "ended" and summary["aborted_with"] is None
+        frames = (RAW / "ws_text_frames.jsonl").read_text().splitlines()
+        assert len(frames) == 1 and json.loads(frames[0])["json"]["type"] == "transport-ready"
+        assert json.loads((RAW / "get_call_after.json").read_text())["id"] == FAKE_CALL
+
+
+def test_an_error_mid_run_still_writes_frames_summary_and_get_call():
+    async def handler(ws):
+        await ws.send(json.dumps({"type": "hello"}))
+        await _drain(ws)
+
+    async def exploding_drive(args, ws, state, streamer, pcm1, pcm2, marks):
+        marks["opening_started"] = 0.1
+        await asyncio.sleep(0.3)
+        raise RuntimeError("boom")
+
+    with _Sandbox() as root:
+        real_drive = globals()["drive"]
+        globals()["drive"] = exploding_drive
+        try:
+            async def body(port):
+                try:
+                    await run_call(_call_args(root), transport=_fake_vapi_rest(port))
+                except RuntimeError as exc:
+                    assert str(exc) == "boom"
+                else:
+                    raise AssertionError("run_call swallowed the error")
+
+            asyncio.run(_with_fake_socket(handler, body))
+        finally:
+            globals()["drive"] = real_drive
+        summary = json.loads((RAW / "call_summary.json").read_text())
+        assert summary["aborted_with"] == "RuntimeError: boom", summary
+        assert summary["marks"] == {"opening_started": 0.1} and summary["text_frame_count"] == 1
+        assert len((RAW / "ws_text_frames.jsonl").read_text().splitlines()) == 1
+        assert (RAW / "get_call_after.json").exists() and (RAW / "received.pcm").exists()
+
+
+def test_full_call_still_ends_on_end_call():
+    async def handler(ws):
+        loop = asyncio.get_running_loop()
+
+        async def speak(seconds):
+            tone = _tone(seconds)
+            for i in range(0, len(tone), FRAME_BYTES):
+                await ws.send(tone[i : i + FRAME_BYTES])
+                await asyncio.sleep(FRAME_SECONDS)
+
+        await ws.send(json.dumps({"type": "hello"}))
+        await speak(0.6)  # the opening line
+        last_loud, replied, reply_task = None, False, None
+        async for msg in ws:
+            if isinstance(msg, bytes):
+                now = loop.time()
+                if rms(msg) > CallState.VOICE_RMS:
+                    last_loud = now
+                elif last_loud is not None and not replied and now - last_loud > 0.3:
+                    replied = True
+                    reply_task = asyncio.create_task(speak(1.5))
+            elif json.loads(msg).get("type") == "end-call":
+                await ws.close(code=1000, reason="end-call honored")
+                return
+
+    with _Sandbox() as root:
+        async def body(port):
+            await run_call(_call_args(root), transport=_fake_vapi_rest(port))
+
+        asyncio.run(_with_fake_socket(handler, body))
+        summary = json.loads((RAW / "call_summary.json").read_text())
+        marks = summary["marks"]
+        assert marks["closed_before_end_call"] is False and marks["closed_after_end_call"] is True, marks
+        assert marks["reply1_started"] > marks["answer1_end"] and "end_call_sent" in marks, marks
+        assert summary["close"]["code"] == 1000 and summary["received_seconds_if_16k"] > 1.5, summary
+        assert summary["first_frame_byte_sizes"] == [FRAME_BYTES] and summary["aborted_with"] is None
+
+
+def _seed_raw_capture() -> None:
+    """A synthetic capture shaped like what serve + call would leave in RAW."""
+    events = [
+        {"seq": 1, "t": 1.0, "kind": "webhook", "type": "status-update"},
+        {"seq": 2, "t": 2.0, "kind": "llm", "path": f"{LLM_MOUNT}/chat/completions", "query": ""},
+        {"seq": 3, "t": 3.0, "kind": "webhook", "type": "speech-update"},
+        {"seq": 4, "t": 4.0, "kind": "webhook", "type": "user-interrupted"},
+        {"seq": 5, "t": 5.0, "kind": "llm_other", "path": f"{LLM_MOUNT}/v1/chat/completions", "query": "x=1"},
+        {"seq": 6, "t": 6.0, "kind": "webhook", "type": "end-of-call-report"},
+    ]
+    (RAW / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+    call = {
+        "id": FAKE_CALL,
+        "orgId": FAKE_ORG,
+        "monitor": {"listenUrl": CAP_LISTEN, "controlUrl": CAP_CONTROL},
+        "assistant": {"model": {"url": FAKE_NGROK + LLM_MOUNT}, "server": {"url": FAKE_NGROK + "/spike/webhook"}},
+    }
+    messages = [{"role": "user", "content": "hello"}]
+    meta = {
+        "method": "POST",
+        "query": "",
+        "headers": {
+            "host": "abcd-12-34-56-78.ngrok-free.app",
+            "authorization": "REDACTED",
+            "x-forwarded-for": "203.0.113.9",
+            "user-agent": "vapi",
+        },
+    }
+    write_json(RAW / "llm_002.json", {"call": call, "messages": messages})
+    write_json(RAW / "llm_002.meta.json", {**meta, "path": f"{LLM_MOUNT}/chat/completions"})
+    write_json(RAW / "llm_005.json", {"call": call, "messages": messages + messages})
+    write_json(RAW / "llm_005.meta.json", {**meta, "path": f"{LLM_MOUNT}/v1/chat/completions", "query": "x=1"})
+    write_json(RAW / "webhook_status-update_001.json", {"message": {"type": "status-update", "status": "in-progress", "call": call}})
+    write_json(RAW / "webhook_speech-update_003.json", {"message": {"type": "speech-update", "role": "assistant", "status": "started"}})
+    write_json(RAW / "webhook_user-interrupted_004.json", {"message": {"type": "user-interrupted"}})
+    write_json(
+        RAW / "webhook_end-of-call-report_006.json",
+        {"message": {"type": "end-of-call-report", "artifact": {"recordingUrl": f"https://storage.vapi.ai/{FAKE_CALL}.wav"}, "call": call}},
+    )
+    write_json(RAW / "create_call_response.json", {**call, "transport": {"websocketCallUrl": CAP_TRANSPORT}})
+    write_json(RAW / "get_call_after.json", call)
+    write_json(RAW / "call_summary.json", {"call_id": FAKE_CALL, "marks": {}, "close": {"code": 1000, "reason": ""}})
+    write_json(RAW / "ws_binary_frames_first20.json", [{"i": 1, "t": 0.1, "bytes": 640}])
+    write_json(RAW / "public_url.json", {"public_url": FAKE_NGROK})
+    frame_json = {"type": "transport-ready", "orgId": FAKE_ORG, "listenUrl": CAP_LISTEN, "token": "abc"}
+    (RAW / "ws_text_frames.jsonl").write_text(
+        json.dumps({"t": 0.5, "raw": json.dumps(frame_json), "json": frame_json}) + "\n"
+        + json.dumps({"t": 0.9, "raw": f"not json, but mentions {CAP_TRANSPORT}", "json": None}) + "\n"
+    )
+
+
+def test_fixtures_publish_the_path_evidence_and_nothing_secret():
+    with _Sandbox():
+        _seed_raw_capture()
+        cmd_fixtures(argparse.Namespace())
+        names = sorted(p.name for p in FIXTURES.iterdir())
+        for expected in (
+            "llm_request_paths.json", "llm_request_turn1.json", "llm_request_after_interrupt.json",
+            "webhook_speech_update.json", "webhook_user_interrupted.json", "webhook_status_update_in-progress.json",
+            "webhook_end_of_call_report.json", "create_call_response.json", "ws_text_frames.jsonl",
+        ):
+            assert expected in names, (expected, names)
+        paths = json.loads((FIXTURES / "llm_request_paths.json").read_text())
+        assert [p["appended_to_model_url"] for p in paths] == ["/chat/completions", "/v1/chat/completions"], paths
+        assert paths[0]["query"] == "" and paths[1]["query"] == "x=1"
+        assert paths[0]["matched_chat_completions_route"] is True and paths[1]["matched_chat_completions_route"] is False
+        assert paths[0]["body_fixture"] == "llm_request_turn1.json"
+        assert paths[1]["body_fixture"] == "llm_request_after_interrupt.json"
+        assert paths[0]["headers"]["user-agent"] == "vapi" and paths[0]["headers"]["x-forwarded-for"] == "REDACTED"
+        assert paths[0]["headers"]["host"] == TUNNEL_PLACEHOLDER
+        frames = [json.loads(line) for line in (FIXTURES / "ws_text_frames.jsonl").read_text().splitlines()]
+        assert "raw" not in frames[0] and frames[0]["json"]["orgId"] == ZERO_UUID and frames[0]["json"]["token"] == "REDACTED"
+        assert frames[1]["json"] is None and frames[1]["raw"].endswith("vapi.ai/REDACTED")
+        everything = "".join(p.read_text() for p in FIXTURES.iterdir())
+        # the bare call id is kept (it is an id, not a credential); the URLs that carried it are gone
+        for needle in (FAKE_ORG, f"/{FAKE_CALL}", "ngrok", "203.0.113.9", "abc\"", FAKE_KEY):
+            assert needle not in everything, needle
+        assert FAKE_CALL in (FIXTURES / "create_call_response.json").read_text()
+        assert find_leaks(everything, [FAKE_KEY]) == []
+
+
+def test_fixtures_refuse_to_write_what_scrub_missed():
+    with _Sandbox():
+        _seed_raw_capture()
+        # "eyJ" followed by too little to look like a full JWT: scrub() lets it through, the check must not
+        write_json(RAW / "webhook_end-of-call-report_006.json", {"message": {"type": "end-of-call-report", "note": "eyJabc"}})
+        try:
+            cmd_fixtures(argparse.Namespace())
+        except SystemExit as exc:
+            assert "JWT-looking text" in str(exc) and "webhook_end_of_call_report.json" in str(exc), exc
+        else:
+            raise AssertionError("fixtures wrote a file that still looks like it holds a JWT")
+        assert not (FIXTURES / "webhook_end_of_call_report.json").exists()
+
+
+def test_the_sweep_catches_stale_dirty_files():
+    with _Sandbox():
+        _seed_raw_capture()
+        FIXTURES.mkdir(parents=True)
+        (FIXTURES / "old.json").write_text(f'{{"u": "{CAP_CONTROL}"}}')
+        try:
+            cmd_fixtures(argparse.Namespace())
+        except SystemExit as exc:
+            assert "old.json" in str(exc) and "NOT safe to commit" in str(exc), exc
+        else:
+            raise AssertionError("sweep ignored a dirty file already in the fixtures directory")
+
+
+SELFTESTS = [
+    test_scrub_hides_capability_urls_by_key_and_by_shape,
+    test_scrub_redacts_a_whole_secret_subtree_and_nested_json,
+    test_scrub_handles_key_literals_bearer_and_jwt_in_free_text,
+    test_find_leaks_flags_what_scrub_might_miss,
+    test_summary_is_written_when_no_audio_arrived,
+    test_end_call_is_not_sent_into_a_closed_socket,
+    test_call_survives_the_socket_closing_early_and_keeps_the_evidence,
+    test_an_error_mid_run_still_writes_frames_summary_and_get_call,
+    test_full_call_still_ends_on_end_call,
+    test_fixtures_publish_the_path_evidence_and_nothing_secret,
+    test_fixtures_refuse_to_write_what_scrub_missed,
+    test_the_sweep_catches_stale_dirty_files,
+]
+
+
+def cmd_selftest(args) -> None:
+    import contextlib
+    import io
+
+    failed = 0
+    for test in SELFTESTS:
+        started = time.monotonic()
+        noise = io.StringIO()  # the code under test prints a lot; show it only when a test fails
+        try:
+            with contextlib.redirect_stdout(noise):
+                test()
+        except BaseException as exc:  # SystemExit from the code under test counts as a failure too
+            failed += 1
+            print(noise.getvalue()[-1500:], end="")
+            print(f"FAIL {test.__name__}: {type(exc).__name__}: {exc}", flush=True)
+        else:
+            print(f"ok   {test.__name__} ({time.monotonic() - started:.1f} s)", flush=True)
+    print(f"{len(SELFTESTS) - failed} passed, {failed} failed")
+    if failed:
+        raise SystemExit(1)
 
 
 # --------------------------------------------------------------------------
@@ -703,6 +1344,9 @@ def main() -> None:
 
     p = sub.add_parser("fixtures", help="scrub raw captures into server/tests/fixtures/vapi")
     p.set_defaults(fn=cmd_fixtures)
+
+    p = sub.add_parser("selftest", help="offline checks (scrubber, early close, fixtures); spends no Vapi credit")
+    p.set_defaults(fn=cmd_selftest)
 
     args = parser.parse_args()
     args.fn(args)
