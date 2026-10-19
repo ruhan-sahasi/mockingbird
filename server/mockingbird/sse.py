@@ -25,9 +25,12 @@ def sse_chunk(
     """Return one `data:` event for a chat.completion.chunk.
 
     The first chunk carries role "assistant" with its text. Later chunks carry only content.
-    The finish chunk has an empty delta and finish_reason "stop", so `text` is ignored when
-    `finish` is true.
+    The finish chunk has an empty delta and finish_reason "stop", so it cannot carry text. A
+    non-empty `text` with `finish` raises ValueError rather than being dropped silently. Send the
+    last fragment as its own chunk, then the finish chunk with `text=""`.
     """
+    if finish and text:
+        raise ValueError("finish=True takes no text: send the last fragment as its own chunk first")
     if finish:
         delta: dict[str, str] = {}
         finish_reason: str | None = "stop"

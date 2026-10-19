@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from mockingbird.sse import SSE_DONE, sse_chunk
 
 
@@ -22,6 +24,13 @@ def test_later_chunk_carries_only_content():
 def test_finish_chunk():
     body = json.loads(sse_chunk("", chunk_id="c1", created=1, finish=True)[6:])
     assert body["choices"][0]["finish_reason"] == "stop" and body["choices"][0]["delta"] == {}
+
+
+def test_finish_chunk_refuses_text_instead_of_dropping_it():
+    # The finish chunk has an empty delta, so text sent with finish would vanish from the
+    # stream. Raising keeps the last words of a reply from being lost without an error.
+    with pytest.raises(ValueError, match="finish=True"):
+        sse_chunk("Thanks, that's all.", chunk_id="c1", created=1, finish=True)
 
 
 def test_non_ascii_text_round_trips_unescaped():
