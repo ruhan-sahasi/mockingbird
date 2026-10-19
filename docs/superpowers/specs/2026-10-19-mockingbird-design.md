@@ -140,8 +140,9 @@ points at the brain endpoint, so Vapi never calls Claude directly.
 and quotes. A Storage bucket for audio.
 
 **AWS.** ECR for images; one ECS Fargate service behind an Application Load
-Balancer with an ACM certificate; secrets in AWS Secrets Manager or SSM;
-logs in CloudWatch. Everything in Terraform under `infra/`.
+Balancer; CloudFront in front of both the static site and the API; secrets
+in SSM Parameter Store; logs in CloudWatch. Everything in Terraform under
+`infra/`.
 
 ### One turn, step by step
 
@@ -310,9 +311,9 @@ existing Vapi, Claude, and AWS credits, plus Supabase's free tier.
 
 ### Deployment
 
-- Terraform defines the VPC and subnets, ALB, target group, ACM certificate,
-  ECR, ECS cluster, service and task definition, IAM roles, secrets, logs,
-  and the frontend hosting.
+- Terraform defines the VPC and subnets, ALB, target group, ECR, ECS
+  cluster, service and task definition, IAM roles, secrets, logs, the S3
+  bucket for the frontend, and the CloudFront distribution.
 - The ALB's idle timeout is raised above the default 60 s, and the app sends
   a heartbeat ping on both sockets, so a long pause doesn't drop a call.
 - GitHub Actions: tests on every PR. On merge to main: build the image, push
@@ -328,9 +329,16 @@ existing Vapi, Claude, and AWS credits, plus Supabase's free tier.
 - Post-call work (batch transcription, grading) runs in a separate worker,
   never in the process carrying live audio, so a heavy job can't add
   latency to someone else's call.
-- Domain: picked before the first deploy. Terraform manages a Route 53 hosted
-  zone for it; if the domain's DNS lives elsewhere, the plan adds the
-  certificate and alias records by hand. Not Cloudflare.
+- No custom domain in v1 (my call, from the no-spending rule: credits
+  generally don't cover buying a domain). CloudFront's free
+  `*.cloudfront.net` HTTPS address serves the site and proxies `/api/*`,
+  `/ws/*`, `/vapi/*`, and `/healthz` to the load balancer, so there is no
+  certificate to manage. The load balancer listens on HTTP and accepts
+  traffic only from CloudFront's origin-facing IP ranges. A custom domain
+  can be added later without changing the app.
+- One server task (my call): the live-session registry is in memory, so the
+  ECS service runs exactly one task. Running more would need sticky routing
+  or a shared registry, which is out of scope for v1.
 
 ### Browser support (my call)
 
@@ -404,6 +412,8 @@ v1.
 - Desktop browsers only in v1.
 - faster-whisper as an on-demand ECS task for batch transcription, to stay
   free on AWS credits.
+- No custom domain: CloudFront's default HTTPS address fronts everything.
+- One server task, with the live-session registry in memory.
 
 Two of these are expensive to change once code exists, because the latency
 harness, schema, and interruption tests are built around them: the
