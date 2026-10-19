@@ -1,0 +1,77 @@
+# Behavioral question bank for the mock interviewer. The interviewer says these out loud, so each
+# one is a single plain sentence a person would actually ask an early-career software engineer.
+# Keep at least two questions per competency. load_questions() spreads picks across competencies.
+#
+# Competencies: ownership, conflict, failure, ambiguity, leadership, impact.
+
+- id: ownership-1
+  text: "Tell me about a time you noticed something broken on a project and fixed it without being asked."
+  competency: ownership
+
+- id: ownership-2
+  text: "Tell me about a project you were responsible for from start to finish and what you did to see it through."
+  competency: ownership
+
+- id: ownership-3
+  text: "Tell me about a time you took on a problem that was not really yours to solve."
+  competency: ownership
+
+- id: conflict-1
+  text: "Tell me about a time you disagreed with a teammate about how to do something and how you handled it."
+  competency: conflict
+
+- id: conflict-2
+  text: "Tell me about a time you had to work closely with someone whose style was very different from yours."
+  competency: conflict
+
+- id: conflict-3
+  text: "Tell me about a time you got feedback you did not agree with."
+  competency: conflict
+
+- id: failure-1
+  text: "Tell me about a time a project or assignment did not go the way you hoped."
+  competency: failure
+
+- id: failure-2
+  text: "Tell me about a mistake you made on a team project and what you did once you noticed it."
+  competency: failure
+
+- id: failure-3
+  text: "Tell me about a time you missed a deadline or a goal and how you dealt with it."
+  competency: failure
+
+- id: ambiguity-1
+  text: "Tell me about a time you were given a task with very little direction and had to work out what to do."
+  competency: ambiguity
+
+- id: ambiguity-2
+  text: "Tell me about a time the goal of a project changed after you had already started."
+  competency: ambiguity
+
+- id: ambiguity-3
+  text: "Tell me about a time you had to make a decision without all the information you wanted."
+  competency: ambiguity
+
+- id: leadership-1
+  text: "Tell me about a time you led a group, even without the title, to get something done."
+  competency: leadership
+
+- id: leadership-2
+  text: "Tell me about a time you helped a teammate who was struggling."
+  competency: leadership
+
+- id: leadership-3
+  text: "Tell me about a time you had to convince other people to try your idea."
+  competency: leadership
+
+- id: impact-1
+  text: "Tell me about a piece of work you are proud of and the difference it made for the people who used it."
+  competency: impact
+
+- id: impact-2
+  text: "Tell me about a time you made something faster, simpler, or more reliable for other people."
+  competency: impact
+
+- id: impact-3
+  text: "Tell me about a time your work helped your team or a customer in a way you could actually point to."
+  competency: impact
