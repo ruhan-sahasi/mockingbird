@@ -184,9 +184,11 @@ def build_app():
         return await handle_llm(request, expected_path=True)
 
     # Catch-all: if Vapi appends a different path, save it and still answer so
-    # the call keeps going. Question 1 is about exactly this.
+    # the call keeps going. Question 1 is about exactly this. The bare model.url
+    # (nothing appended at all) is a separate route: "{rest:path}" needs the slash.
+    @app.post(LLM_MOUNT)
     @app.post(LLM_MOUNT + "/{rest:path}")
-    async def llm_other(rest: str, request: Request):
+    async def llm_other(request: Request, rest: str = ""):
         return await handle_llm(request, expected_path=False)
 
     @app.post("/spike/webhook")
@@ -445,9 +447,18 @@ async def run_call(args, transport=None) -> None:
     async with httpx.AsyncClient(timeout=30, transport=transport) as http:
         call, artifact_ok = await create_call(http, args.api_base, key, ngrok)
         write_json(RAW / "create_call_response.json", call)
-        ws_url = call["transport"]["websocketCallUrl"]
-        call_id = call.get("id")
+        call_id = call.get("id") if isinstance(call, dict) else None
+        transport_info = call.get("transport") if isinstance(call, dict) else None
+        ws_url = transport_info.get("websocketCallUrl") if isinstance(transport_info, dict) else None
         print(f"call {call_id} created; artifactPlan accepted: {artifact_ok}", flush=True)
+        if not ws_url:
+            # The response is already saved. Record what Vapi says about the call, then stop cleanly.
+            ended = await fetch_call_after(http, args.api_base, key, call_id)
+            save_call_artifacts(
+                CallState(), Streamer(), {}, call_id, artifact_ok, ended,
+                "create-call response has no transport.websocketCallUrl",
+            )
+            raise SystemExit("create-call response has no transport.websocketCallUrl; create_call_response.json is saved")
 
         state = CallState()
         state.frames_path = RAW / "ws_text_frames.jsonl"
@@ -901,7 +912,7 @@ class _Sandbox:
         self.tmp.cleanup()
 
 
-def _fake_vapi_rest(ws_port: int):
+def _fake_vapi_rest(ws_port: int, with_socket: bool = True):
     """An httpx.MockTransport that answers POST /call and GET /call/{id} like Vapi, capability URLs and all."""
     import httpx
 
@@ -920,7 +931,10 @@ def _fake_vapi_rest(ws_port: int):
             body = json.loads(request.content)
             assert body["assistant"]["artifactPlan"] == {"recordingEnabled": False}
             assert body["assistant"]["model"]["url"] == FAKE_NGROK + LLM_MOUNT
-            return httpx.Response(201, json={**call_object, "status": "queued"})
+            created = {**call_object, "status": "queued"}
+            if not with_socket:
+                created["transport"] = {"provider": "vapi.websocket"}
+            return httpx.Response(201, json=created)
         if request.method == "GET" and request.url.path == f"/call/{FAKE_CALL}":
             return httpx.Response(200, json=call_object)
         return httpx.Response(404, json={"message": "unexpected request"})
@@ -1173,6 +1187,46 @@ def test_full_call_still_ends_on_end_call():
         assert summary["first_frame_byte_sizes"] == [FRAME_BYTES] and summary["aborted_with"] is None
 
 
+def test_the_bare_model_url_and_any_appended_path_get_an_answer_and_are_recorded():
+    from fastapi.testclient import TestClient
+
+    with _Sandbox():
+        client = TestClient(build_app())
+        for path in (LLM_MOUNT, LLM_MOUNT + "/", LLM_MOUNT + "/v1/chat/completions", LLM_MOUNT + "/chat/completions"):
+            resp = client.post(path, json={"messages": [], "call": {"id": "c1"}})
+            assert resp.status_code == 200 and resp.text.rstrip().endswith("data: [DONE]"), (path, resp.status_code)
+            assert '"finish_reason": "stop"' in resp.text
+        events = [json.loads(line) for line in (RAW / "events.jsonl").read_text().splitlines()]
+        assert [(e["kind"], e["path"]) for e in events] == [
+            ("llm_other", LLM_MOUNT),
+            ("llm_other", LLM_MOUNT + "/"),
+            ("llm_other", LLM_MOUNT + "/v1/chat/completions"),
+            ("llm", LLM_MOUNT + "/chat/completions"),
+        ], events
+        for e in events:
+            assert json.loads((RAW / f"llm_{e['seq']:03d}.json").read_text())["call"] == {"id": "c1"}
+            assert json.loads((RAW / f"llm_{e['seq']:03d}.meta.json").read_text())["path"] == e["path"]
+
+
+def test_a_create_call_response_without_a_socket_url_is_saved_and_exits_cleanly():
+    with _Sandbox() as root:
+        async def go():
+            try:
+                await run_call(_call_args(root), transport=_fake_vapi_rest(0, with_socket=False))
+            except SystemExit as exc:
+                assert "websocketCallUrl" in str(exc), exc
+            else:
+                raise AssertionError("run_call carried on without a socket URL")
+
+        asyncio.run(go())
+        saved = json.loads((RAW / "create_call_response.json").read_text())
+        assert saved["id"] == FAKE_CALL and "websocketCallUrl" not in saved["transport"], saved
+        summary = json.loads((RAW / "call_summary.json").read_text())
+        assert summary["call_id"] == FAKE_CALL and "websocketCallUrl" in summary["aborted_with"], summary
+        assert summary["get_call_status_after"] == "ended"
+        assert (RAW / "get_call_after.json").exists()
+
+
 def _seed_raw_capture() -> None:
     """A synthetic capture shaped like what serve + call would leave in RAW."""
     events = [
@@ -1291,6 +1345,8 @@ SELFTESTS = [
     test_call_survives_the_socket_closing_early_and_keeps_the_evidence,
     test_an_error_mid_run_still_writes_frames_summary_and_get_call,
     test_full_call_still_ends_on_end_call,
+    test_the_bare_model_url_and_any_appended_path_get_an_answer_and_are_recorded,
+    test_a_create_call_response_without_a_socket_url_is_saved_and_exits_cleanly,
     test_fixtures_publish_the_path_evidence_and_nothing_secret,
     test_fixtures_refuse_to_write_what_scrub_missed,
     test_the_sweep_catches_stale_dirty_files,
