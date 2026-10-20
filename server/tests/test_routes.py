@@ -20,6 +20,7 @@ import queue
 import threading
 import time
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs
 
@@ -551,6 +552,13 @@ def test_ws_token_reuse_closes_4401(client, app, fakes):
 
     # The same link replayed after the call.
     assert closed_with(client, body["ws_path"]) == 4401
+
+
+def test_the_close_codes_are_the_ones_the_browser_expects():
+    # web/src/interviewSession.test.ts reads the same file and maps each code to its message.
+    wire = json.loads((Path(__file__).parent / "fixtures" / "wire_protocol.json").read_text())
+    assert routes_ws.TOKEN_REJECTED == wire["close_codes"]["token_rejected"]
+    assert routes_ws.INTERNAL_ERROR == wire["close_codes"]["call_not_started"]
 
 
 @pytest.mark.parametrize("wrong", ["token", "interview"])

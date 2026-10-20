@@ -11,13 +11,22 @@ Vapi's text frames here have the shapes recorded in fixtures/vapi/ws_text_frames
 import asyncio
 import json
 import logging
+from pathlib import Path
 
 import pytest
 from starlette.websockets import WebSocket
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from websockets.frames import Close
 
-from mockingbird.relay import Relay, SocketClosed, StarletteSocket, WebsocketsSocket
+from mockingbird.relay import (
+    FLUSH,
+    PING,
+    Relay,
+    SocketClosed,
+    StarletteSocket,
+    WebsocketsSocket,
+    _is_end_request,
+)
 from mockingbird.vapi_types import SpeechUpdate, StatusUpdate, UserInterrupted
 
 # One 20 ms frame each way: 320 samples of s16le, 640 bytes. Different bytes, so a frame sent the
@@ -861,3 +870,31 @@ async def test_websockets_socket_close_cut_short_drops_the_connection():
 
     assert conn.close_codes == [1000]
     assert conn.transport.aborted
+
+
+# --- the wire contract the browser's tests share -----------------------------------------------
+
+WIRE = json.loads(
+    (Path(__file__).parent / "fixtures" / "wire_protocol.json").read_text(encoding="utf-8")
+)
+
+
+def test_the_text_frames_are_the_ones_the_browser_expects():
+    # web/src/protocol.test.ts and interviewSession.test.ts read the same file.
+    assert json.loads(FLUSH) == WIRE["server_to_browser"]["flush"]
+    assert json.loads(PING) == WIRE["server_to_browser"]["ping"]
+    assert _is_end_request(json.dumps(WIRE["browser_to_server"]["end"]))
+
+
+@pytest.mark.parametrize("reason", ["cap", "browser_closed", "vapi_closed", "plan_done"])
+async def test_the_ended_frame_has_the_shape_and_reasons_the_browser_expects(reason):
+    relay, browser, _ = make_relay()
+    task = await start(relay)
+
+    await relay.end(reason)
+
+    assert await finished(task) == reason
+    sent = await browser.next_sent()
+    assert sent.keys() == WIRE["server_to_browser"]["ended"].keys()
+    assert sent["type"] == "ended"
+    assert sent["reason"] in WIRE["ended_reasons"]

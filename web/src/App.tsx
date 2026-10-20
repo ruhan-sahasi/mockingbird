@@ -2,7 +2,7 @@
 //
 // The interview page opens only after the Start button, which is where consent is given. A
 // reload, a typed #/interview or the Forward button lands on the first page instead, so the mic
-// never turns on without a fresh Start.
+// never turns on without a fresh Start. Those rules are screenFor and startHolds in route.ts.
 
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import type { LimitReason } from './api'
@@ -10,7 +10,14 @@ import { isPhone } from './device'
 import Interview from './pages/Interview'
 import Landing from './pages/Landing'
 import Report from './pages/Report'
-import { INTERVIEW_HASH, LANDING_HASH, parseRoute, reportHash } from './route'
+import {
+  INTERVIEW_HASH,
+  LANDING_HASH,
+  parseRoute,
+  reportHash,
+  screenFor,
+  startHolds,
+} from './route'
 
 function subscribe(onChange: () => void): () => void {
   window.addEventListener('hashchange', onChange)
@@ -32,17 +39,18 @@ export default function App() {
   // Leaving the interview page uses up the Start that opened it.
   const lastPage = useRef(route.page)
   useEffect(() => {
-    if (lastPage.current === 'interview' && route.page !== 'interview') setStarted(false)
+    if (!startHolds(lastPage.current, route.page)) setStarted(false)
     lastPage.current = route.page
   }, [route.page])
 
-  const blocked = route.page === 'interview' && !started
+  const screen = screenFor(route, started, phone)
+  const blocked = screen.page === 'landing' && screen.redirect
   useEffect(() => {
     if (blocked) window.location.replace(LANDING_HASH)
   }, [blocked])
 
-  if (route.page === 'report') return <Report key={route.id} id={route.id} />
-  if (route.page === 'interview' && started) {
+  if (screen.page === 'report') return <Report key={screen.id} id={screen.id} />
+  if (screen.page === 'interview') {
     return (
       <Interview
         onLimit={(reason) => {

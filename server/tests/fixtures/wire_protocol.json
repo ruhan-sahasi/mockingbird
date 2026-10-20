@@ -1,0 +1,16 @@
+{
+  "_about": "The browser socket's wire contract. The server side is server/mockingbird/relay.py and routes_ws.py; the browser side is web/src/protocol.ts and web/src/interviewSession.ts. Tests on both sides read this file, so renaming a frame or a close code on one side fails the other side's tests. Audio is binary frames both ways: 16 kHz s16le mono, 640 bytes.",
+  "server_to_browser": {
+    "flush": { "type": "flush" },
+    "ping": { "type": "ping" },
+    "ended": { "type": "ended", "reason": "browser_closed" }
+  },
+  "browser_to_server": {
+    "end": { "type": "end" }
+  },
+  "ended_reasons": ["cap", "browser_closed", "vapi_closed", "plan_done", "error"],
+  "close_codes": {
+    "token_rejected": 4401,
+    "call_not_started": 1011
+  }
+}
