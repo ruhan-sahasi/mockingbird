@@ -38,7 +38,13 @@ from mockingbird.plan import DEMO, InterviewPlan, Question
 from mockingbird.relay import Relay
 from mockingbird.report import GradeResult, ItemGrade, QuestionGrade
 from mockingbird.routes_api import QUESTIONS_PATH
-from mockingbird.sessions import LiveSession, SessionRegistry, run_sweeper, sweep_once
+from mockingbird.sessions import (
+    LiveSession,
+    SessionRegistry,
+    purge_once,
+    run_sweeper,
+    sweep_once,
+)
 from mockingbird.sse import SSE_DONE
 from mockingbird.store import MemoryStore
 from mockingbird.vapi_client import VapiCall, VapiError
@@ -98,16 +104,25 @@ class FakeStreamer:
 
 
 class FakeVapi:
+    """Vapi's REST API. `delete_errors` makes delete_call fail for the calls named in it."""
+
     def __init__(self) -> None:
         self.call_id = CALL_ID
         self.assistants: list[dict] = []
         self.error: Exception | None = None
+        self.deleted: list[str] = []
+        self.delete_errors: dict[str, Exception] = {}
 
     async def create_call(self, assistant: dict) -> VapiCall:
         self.assistants.append(assistant)
         if self.error is not None:
             raise self.error
         return VapiCall(self.call_id, SOCKET_URL)
+
+    async def delete_call(self, call_id: str) -> None:
+        if call_id in self.delete_errors:
+            raise self.delete_errors[call_id]
+        self.deleted.append(call_id)
 
 
 class FakeVapiConnection:
@@ -1105,12 +1120,12 @@ class SweptStore(MemoryStore):
             raise RuntimeError(f"the database is down, call {CALL_ID}")
         return await super().list_live_interviews()
 
-    async def delete_demo_data_older_than(self, days: int) -> int:
+    async def delete_demo_data_older_than(self, days: int, **kwargs) -> int:
         self.purges.append((days, self.sweeps))
         if self.failing_purges:
             self.failing_purges -= 1
             raise RuntimeError(f"the database is down, call {CALL_ID}")
-        return await super().delete_demo_data_older_than(days)
+        return await super().delete_demo_data_older_than(days, **kwargs)
 
 
 T0 = 1_800_000_000.0  # some time in 2027, in seconds since the epoch
@@ -1149,7 +1164,9 @@ async def test_the_sweeper_sweeps_every_minute_and_deletes_week_old_demo_data_ho
         await asyncio.sleep(0)
 
     clock = scripted_clock(0, 60, 3599, 3600, 3660, 7199, 7200)  # one reading per sweep
-    sweeper = asyncio.create_task(run_sweeper(SessionRegistry(), store, clock=clock, sleep=sleep))
+    sweeper = asyncio.create_task(
+        run_sweeper(SessionRegistry(), store, FakeVapi(), clock=clock, sleep=sleep)
+    )
     await until(lambda: store.sweeps >= 9)
     await stop(sweeper)
 
@@ -1163,7 +1180,9 @@ async def test_a_failing_sweep_or_purge_is_logged_and_the_sweeper_goes_on(caplog
     store.failing_sweeps = 2
     store.failing_purges = 1
     clock = scripted_clock(0, 60, 120, 3600)
-    sweeper = asyncio.create_task(run_sweeper(SessionRegistry(), store, clock=clock, sleep=no_wait))
+    sweeper = asyncio.create_task(
+        run_sweeper(SessionRegistry(), store, FakeVapi(), clock=clock, sleep=no_wait)
+    )
     await until(lambda: store.sweeps >= 5)
     await stop(sweeper)
 
@@ -1188,7 +1207,7 @@ async def test_cancelling_the_sweeper_stops_it_whatever_it_is_doing(when):
             return listed
 
     store = Store()
-    sweeper = asyncio.create_task(run_sweeper(SessionRegistry(), store))
+    sweeper = asyncio.create_task(run_sweeper(SessionRegistry(), store, FakeVapi()))
     if when == "mid_sweep":
         await until(lambda: store.sweeps == 1)
     else:
@@ -1196,6 +1215,88 @@ async def test_cancelling_the_sweeper_stops_it_whatever_it_is_doing(when):
         await asyncio.sleep(0)
 
     await stop(sweeper)
+
+
+def old_demo(id: str, call_id: str | None, days: float = 8, mode: str = "demo") -> Interview:
+    return Interview(
+        id=id,
+        mode=mode,
+        status="graded",
+        visitor_hash="v",
+        ip_hash="ip",
+        cap_s=300,
+        questions=["Q"],
+        created_at=datetime.now(UTC) - timedelta(days=days),
+        vapi_call_id=call_id,
+    )
+
+
+async def test_the_purge_deletes_each_old_demos_call_at_vapi_before_its_row():
+    # Vapi keeps its own copy of every call: the transcript, the messages, logs and a summary.
+    # The 7-day retention covers that copy too, and only the row knows which call it was.
+    store = MemoryStore()
+    for interview in (
+        old_demo("old-a", "call-a"),
+        old_demo("old-b", "call-b"),
+        old_demo("old-no-call", None),  # its call never got created
+        old_demo("recent", "call-recent", days=6),
+        old_demo("old-full", "call-full", mode="full"),  # full mode is kept, here and at Vapi
+    ):
+        await store.create_interview(interview)
+
+    class Vapi(FakeVapi):
+        async def delete_call(self, call_id: str) -> None:
+            assert await store.get_interview_by_call(call_id) is not None  # the row comes after
+            await super().delete_call(call_id)
+
+    vapi = Vapi()
+    await purge_once(store, vapi)
+
+    assert sorted(vapi.deleted) == ["call-a", "call-b"]
+    for gone in ("old-a", "old-b", "old-no-call"):
+        assert await store.get_interview(gone) is None
+    for kept in ("recent", "old-full"):
+        assert await store.get_interview(kept) is not None
+
+
+async def test_a_call_vapi_would_not_delete_keeps_its_row_for_the_next_purge(caplog):
+    caplog.set_level(logging.DEBUG)
+    secret_id = "01a15690-48f3-7331-a348-64c2e5c04886"
+    store = MemoryStore()
+    await store.create_interview(old_demo("stuck", secret_id))
+    await store.create_interview(old_demo("fine", "call-fine"))
+    vapi = FakeVapi()
+    vapi.delete_errors = {
+        secret_id: VapiError("Vapi returned 503: try again"),
+    }
+
+    await purge_once(store, vapi)
+
+    assert vapi.deleted == ["call-fine"]
+    assert await store.get_interview("fine") is None
+    assert (await store.get_interview("stuck")).vapi_call_id == secret_id
+    [warning] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert "Vapi returned 503: try again" in warning.getMessage()
+    assert secret_id not in caplog.text
+
+    vapi.delete_errors = {}
+    await purge_once(store, vapi)  # an hour later
+    assert vapi.deleted == ["call-fine", secret_id]
+    assert await store.get_interview("stuck") is None
+
+
+async def test_a_purge_whose_vapi_delete_breaks_logs_only_the_error_type(caplog):
+    caplog.set_level(logging.DEBUG)
+    store = MemoryStore()
+    await store.create_interview(old_demo("stuck", "call-stuck"))
+    vapi = FakeVapi()
+    vapi.delete_errors = {"call-stuck": RuntimeError("bug near call-stuck")}
+
+    await purge_once(store, vapi)
+
+    assert await store.get_interview("stuck") is not None
+    assert "RuntimeError" in caplog.text
+    assert "call-stuck" not in caplog.text
 
 
 def test_the_app_runs_the_sweeper_from_start_up_to_shutdown(settings, fakes):

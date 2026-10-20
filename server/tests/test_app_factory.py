@@ -79,8 +79,8 @@ def idle_sweeper(monkeypatch):
     tests see what the app built without a sweep running against it."""
     seen: list = []
 
-    async def run_sweeper(registry, store) -> None:
-        seen.append(store)
+    async def run_sweeper(registry, store, vapi) -> None:
+        seen.append((store, vapi))
         await asyncio.Event().wait()
 
     monkeypatch.setattr(app_module, "run_sweeper", run_sweeper)
@@ -141,7 +141,8 @@ def test_with_a_database_url_the_store_is_postgres_and_its_pool_closes_on_shutdo
         store = c.app.state.store
         assert isinstance(store, PostgresStore)
         assert store._pool is pool
-        assert idle_sweeper == [store]  # the sweeper works on the store that was built
+        # The sweeper works on the store that was built, and the Vapi client for the purge.
+        assert idle_sweeper == [(store, c.app.state.vapi)]
         assert not pool.closed
 
     assert dsns == [dsn]
@@ -182,6 +183,6 @@ def test_injected_dependencies_are_used_as_given_and_nothing_real_is_built(
         assert state.vapi is vapi
         assert state.streamer_factory is streamer_factory
         assert state.grader is grader
-        assert idle_sweeper == [store]
+        assert idle_sweeper == [(store, vapi)]
 
     assert built == []

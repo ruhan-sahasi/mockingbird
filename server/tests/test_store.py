@@ -513,6 +513,39 @@ async def test_an_interview_exactly_seven_days_old_is_kept(store):
     assert await store.get_interview("past-edge") is None
 
 
+async def test_demo_calls_older_than_lists_the_vapi_call_of_each_old_demo(store):
+    old = NOW - timedelta(days=8)
+    await store.create_interview(make_interview("old-a", created_at=old, vapi_call_id="call-a"))
+    await store.create_interview(make_interview("old-b", created_at=old, vapi_call_id="call-b"))
+    await store.create_interview(make_interview("old-no-call", created_at=old))
+    await store.create_interview(make_interview("recent", vapi_call_id="call-recent"))
+    await store.create_interview(
+        make_interview("old-full", mode="full", created_at=old, vapi_call_id="call-full")
+    )
+
+    assert sorted(await store.demo_calls_older_than(7)) == ["call-a", "call-b"]
+
+
+async def test_an_old_demo_that_holds_a_call_id_is_deleted_only_once_vapi_deleted_its_call(store):
+    # The call id is the only way to delete Vapi's copy of the call, so the row keeps it until
+    # that copy is gone. The next purge tries the rest again.
+    old = NOW - timedelta(days=8)
+    await store.create_interview(
+        make_interview("deleted-at-vapi", created_at=old, vapi_call_id="a")
+    )
+    await store.create_interview(make_interview("still-at-vapi", created_at=old, vapi_call_id="b"))
+    await store.create_interview(make_interview("no-call", created_at=old))
+
+    assert await store.delete_demo_data_older_than(7, vapi_deleted=["a"]) == 2
+
+    assert await store.get_interview("deleted-at-vapi") is None
+    assert await store.get_interview("no-call") is None
+    assert (await store.get_interview("still-at-vapi")).vapi_call_id == "b"
+    assert await store.demo_calls_older_than(7) == ["b"]
+    assert await store.delete_demo_data_older_than(7) == 0  # by default no call counts as deleted
+    assert await store.delete_demo_data_older_than(7, vapi_deleted=["b"]) == 1
+
+
 # --- the Vapi call id is a credential while a call is live -------------------------------------
 
 

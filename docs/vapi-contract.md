@@ -197,6 +197,20 @@ analysis (a summary and a success evaluation by a Google model, about $0.001
 together). We do not need the analysis. Disabling it is likely done with an
 `analysisPlan` setting in the assistant, but that was not tested here.
 
+Decided after the final review (not yet checked against live Vapi):
+- `build_assistant` sets `analysisPlan: {"summaryPlan": {"enabled": false},
+  "successEvaluationPlan": {"enabled": false}}`. The analysis sends each
+  transcript to a model the consent copy does not name, keeps a summary of the
+  answers at Vapi, and nothing reads it.
+- Vapi keeps its own copy of every call (`transcript`, `messages`,
+  `artifact.logUrl`, `analysis` in `get_call_after.json`). The hourly purge
+  deletes each old demo's call with `DELETE /call/{id}` before it deletes our
+  row, and keeps the row while Vapi refuses, so the 7-day retention covers
+  Vapi's copy too. A 404 counts as already deleted.
+- Task 13b checks both: Vapi accepts the setting, the end-of-call report and
+  `GET /call/{id}` show no analysis and no analysis cost, and `GET /call/{id}`
+  returns 404 after the delete.
+
 Evidence: `create_call_response.json` (`assistant.artifactPlan`),
 `webhook_end_of_call_report.json` (`message.artifact.recording`,
 `message.analysis`), `call_summary.json` (`artifact_plan_accepted: true`).
@@ -322,6 +336,9 @@ Evidence: `ws_text_frames.jsonl` (last three frames), `call_summary.json`
    `vapi` voice `Elliot` model `vapi-v2`, and the end-of-call analysis. None were
    required for the create call to succeed. Task 8 should decide whether to set a
    system prompt (our Brain ignores the system message) and disable the analysis.
+   Decided: the system prompt stays Vapi's default, since the brain reads only
+   the last user and assistant messages of a request and never sends Vapi's
+   system message to Claude; the analysis is turned off (question 5).
 7. **Text is normalised.** The opening line "Hi, this is a Mockingbird test call."
    shows up as "Hi. This is a Mockingbird test call." in history and transcripts.
 8. **Cost.** The 37 s call cost $0.0469 (stt $0.0065, tts $0.0083, Vapi $0.031,
@@ -337,7 +354,9 @@ Evidence: `ws_text_frames.jsonl` (last three frames), `call_summary.json`
 - The value of the `Authorization` header Vapi sends to the custom-LLM URL (the
   recorder redacted it before saving).
 - Webhook request headers (the recorder did not save them).
-- Whether `analysisPlan` turns off the default analysis.
+- Whether `analysisPlan` turns off the default analysis (Task 13b checks it).
+- Whether `DELETE /call/{id}` removes the call's transcript and logs, and what it
+  answers for a call that is already gone (Task 13b checks it).
 - What the stream cancellation looks like for a real Claude stream. Our fake
   streamed at about 16 words a second, so the cancellation timings above are for
   that pace.

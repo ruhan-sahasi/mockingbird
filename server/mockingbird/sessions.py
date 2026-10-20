@@ -21,7 +21,10 @@ session's repr, and nothing here logs either of them.
   its token's minute goes live a little over a minute after it was created, so its last few
   seconds can pass the stale line. That call's route marks it ended again when it does end,
   with the real reason and duration, so the stale mark only stands for a call nobody ends.
-`run_sweeper` also deletes demo data older than RETENTION_DAYS, once an hour.
+`run_sweeper` also deletes demo data older than RETENTION_DAYS, once an hour (`purge_once`). That
+covers Vapi's copy of each call too, the transcript, messages, logs and analysis it keeps: each
+old demo's call is deleted at Vapi first, while its row still holds the call id, and a row whose
+call Vapi would not delete is kept, call id and all, for the next purge to try again.
 """
 
 import asyncio
@@ -30,11 +33,13 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from mockingbird.brain import Brain
 from mockingbird.models import Interview
 from mockingbird.relay import Relay
 from mockingbird.store import Store
+from mockingbird.vapi_client import VapiError
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +50,12 @@ STALE_AFTER_CAP_S = 60
 SWEEP_EVERY_S = 60.0
 PURGE_EVERY_S = 3600.0
 RETENTION_DAYS = 7  # demo audio and transcripts are deleted after this many days (the spec)
+
+
+class CallDeleter(Protocol):
+    """The part of VapiClient the purge uses."""
+
+    async def delete_call(self, call_id: str) -> None: ...
 
 
 @dataclass
@@ -140,6 +151,7 @@ async def _end_stale(store: Store, i: Interview) -> None:
 async def run_sweeper(
     registry: SessionRegistry,
     store: Store,
+    vapi: CallDeleter,
     *,
     clock: Callable[[], float] = time.time,
     every_s: float = SWEEP_EVERY_S,
@@ -155,12 +167,28 @@ async def run_sweeper(
         await _attempt("sweep the sessions", sweep_once(registry, store, now))
         if last_purge is None or now - last_purge >= purge_every_s:
             last_purge = now
-            await _attempt("delete old demo data", _purge(store))
+            await _attempt("delete old demo data", purge_once(store, vapi))
         await sleep(every_s)
 
 
-async def _purge(store: Store) -> None:
-    deleted = await store.delete_demo_data_older_than(RETENTION_DAYS)
+async def purge_once(store: Store, vapi: CallDeleter) -> None:
+    """Delete the demo data older than RETENTION_DAYS: each call's copy at Vapi first, then our
+    rows. A row whose call Vapi would not delete is kept for the next purge."""
+    deleted_at_vapi = []
+    for call_id in await store.demo_calls_older_than(RETENTION_DAYS):
+        try:
+            await vapi.delete_call(call_id)
+        except VapiError as exc:
+            # Its message never holds the call id, a URL or the key (vapi_client.py).
+            log.warning("could not delete an old call at Vapi, kept for the next purge: %s", exc)
+        except Exception as exc:
+            log.warning(
+                "could not delete an old call at Vapi, kept for the next purge: %s",
+                type(exc).__name__,
+            )
+        else:
+            deleted_at_vapi.append(call_id)
+    deleted = await store.delete_demo_data_older_than(RETENTION_DAYS, vapi_deleted=deleted_at_vapi)
     if deleted:
         log.info("deleted %d demo interview(s) older than %d days", deleted, RETENTION_DAYS)
 

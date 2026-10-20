@@ -19,7 +19,7 @@ Two rules every store follows:
 
 import copy
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import fields, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, get_args
@@ -117,9 +117,20 @@ class Store(Protocol):
         """Raises if the store cannot be reached."""
         ...
 
-    async def delete_demo_data_older_than(self, days: int) -> int:
+    async def demo_calls_older_than(self, days: int) -> list[str]:
+        """The Vapi call ids of the demo interviews created more than `days` days ago that have
+        one. Vapi keeps its own copy of each call, which has to be deleted too."""
+        ...
+
+    async def delete_demo_data_older_than(
+        self, days: int, *, vapi_deleted: Collection[str] = ()
+    ) -> int:
         """Delete demo interviews created more than `days` days ago, with their turns, scores
-        and quotes. Full-mode interviews are kept. Returns how many interviews it deleted."""
+        and quotes. Full-mode interviews are kept. Returns how many interviews it deleted.
+
+        A demo that holds a Vapi call id is deleted only when that id is in `vapi_deleted`, the
+        calls whose copy at Vapi is gone. The id is the only way to delete that copy, so the row
+        keeps it until then."""
         ...
 
 
@@ -252,10 +263,25 @@ class MemoryStore:
     async def ping(self) -> None:
         return None
 
-    async def delete_demo_data_older_than(self, days: int) -> int:
+    async def demo_calls_older_than(self, days: int) -> list[str]:
         cutoff = self._clock() - timedelta(days=days)
+        return [
+            i.vapi_call_id
+            for i in self._interviews.values()
+            if i.mode == "demo" and i.created_at < cutoff and i.vapi_call_id is not None
+        ]
+
+    async def delete_demo_data_older_than(
+        self, days: int, *, vapi_deleted: Collection[str] = ()
+    ) -> int:
+        cutoff = self._clock() - timedelta(days=days)
+        gone = set(vapi_deleted)
         old = [
-            i.id for i in self._interviews.values() if i.mode == "demo" and i.created_at < cutoff
+            i.id
+            for i in self._interviews.values()
+            if i.mode == "demo"
+            and i.created_at < cutoff
+            and (i.vapi_call_id is None or i.vapi_call_id in gone)
         ]
         for id in old:
             del self._interviews[id]
@@ -456,13 +482,26 @@ class PostgresStore:
     async def ping(self) -> None:
         await self._pool.execute("select 1")
 
-    async def delete_demo_data_older_than(self, days: int) -> int:
+    async def demo_calls_older_than(self, days: int) -> list[str]:
+        cutoff = self._clock() - timedelta(days=days)
+        rows = await self._pool.fetch(
+            "select vapi_call_id from interviews"
+            " where mode = 'demo' and created_at < $1 and vapi_call_id is not null",
+            cutoff,
+        )
+        return [row["vapi_call_id"] for row in rows]
+
+    async def delete_demo_data_older_than(
+        self, days: int, *, vapi_deleted: Collection[str] = ()
+    ) -> int:
         cutoff = self._clock() - timedelta(days=days)
         # The turns, scores and quotes go with their interview (on delete cascade).
         return await self._pool.fetchval(
             "with gone as (delete from interviews where mode = 'demo' and created_at < $1"
+            "   and (vapi_call_id is null or vapi_call_id = any($2::text[]))"
             " returning 1) select count(*) from gone",
             cutoff,
+            list(vapi_deleted),
         )
 
 
