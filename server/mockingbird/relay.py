@@ -14,11 +14,22 @@ socket. The only text the browser may send is `{"type": "end"}`.
 `run()` holds two pumps (one per direction), a cap timer and a browser ping under one
 TaskGroup. `end(reason)` starts the hang-up and stops that group. The hang-up runs as its own
 task, so cancelling whoever called `end()` cannot stop it halfway. It sends Vapi `end-call` first,
-because that is what stops the call and its bill, then tells the browser, then closes both. When
+because that is what stops the call and its bill. Then two things run side by side: the browser
+is told why and closed, and the Vapi socket is closed. So a browser that has stopped reading
+cannot hold up the Vapi close. Each of those steps gets at most `hang_up_timeout_s`, so `run()`
+and every `end()` caller return within a few seconds whatever state either socket is in. When
 `run()` exits without anyone having called `end()` (a task failed, or `run()` itself was
 cancelled by a server shutdown), it hangs up anyway with reason "error" before raising, so no
 path out of `run()` leaves a Vapi call running until its own time limit. `run()` only ever
 returns "cap", "browser_closed", "vapi_closed" or "plan_done".
+
+A browser can also vanish without closing. When its network drops with no FIN or RST, nothing
+reaches the relay, and its sends to the browser only fill a buffer that drains once the kernel
+gives up on the connection, many minutes later. uvicorn's keepalive does not end that wait
+either: it closes the transport but tells the app nothing. So the relay judges the browser
+itself. The browser streams mic frames every 20 ms from the moment its socket opens, silence
+included, so once `browser_timeout_s` passes with no frame from it, or with a send to it not
+done, it counts as gone and the relay ends with "browser_closed".
 
 The relay never sees the call id or the websocket URL, which are credentials while a call is live
 (ruling R19). It logs frame types, exception type names and where an error was raised, never a
@@ -149,7 +160,13 @@ class WebsocketsSocket:
             raise SocketClosed from None
 
     async def close(self, code: int = 1000) -> None:
-        await self._conn.close(code)  # does nothing on a connection that is already closed
+        try:
+            await self._conn.close(code)  # does nothing on a connection that is already closed
+        except asyncio.CancelledError:
+            # The relay's time limit on a hang-up step cut the closing handshake short. Drop the
+            # connection rather than leave it half-closed until websockets' own close_timeout.
+            self._conn.transport.abort()
+            raise
 
 
 class _Stopped(Exception):
@@ -157,6 +174,16 @@ class _Stopped(Exception):
 
 
 class Relay:
+    """Relays one call's audio between the browser and Vapi until the call ends.
+
+    `cap_s` is the call's time cap, `on_event` hears Vapi's live events, and the browser gets a
+    ping every `ping_every_s`. The browser counts as gone once `browser_timeout_s` passes with no
+    frame from it, or with a send to it not done. Its mic frames come every 20 ms, so the 2 s
+    default is 100 missing frames: enough to ride out a busy page or a few TCP retransmits, while
+    a dropped network costs about 2 s of call. Each hang-up step, one send or one close, gets at
+    most `hang_up_timeout_s`.
+    """
+
     def __init__(
         self,
         browser: Socket,
@@ -165,12 +192,16 @@ class Relay:
         cap_s: float,
         on_event: OnEvent | None = None,
         ping_every_s: float = 20.0,
+        browser_timeout_s: float = 2.0,
+        hang_up_timeout_s: float = 1.0,
     ) -> None:
         self._browser = browser
         self._vapi = vapi
         self._cap_s = cap_s
         self._on_event = on_event
         self._ping_every_s = ping_every_s
+        self._browser_timeout_s = browser_timeout_s
+        self._hang_up_timeout_s = hang_up_timeout_s
         self._reason: str | None = None
         self._stopping = asyncio.Event()
         self._hang_up_task: asyncio.Task | None = None
@@ -213,15 +244,29 @@ class Relay:
 
     async def _hang_up(self, reason: str) -> None:
         # Vapi first: end-call is what stops the call, and the bill.
-        await _attempt("send end-call to Vapi", self._vapi.send_text(END_CALL))
-        ended = json.dumps({"type": "ended", "reason": reason})
-        await _attempt("tell the browser the call ended", self._browser.send_text(ended))
-        # Both at once, so a slow closing handshake on one side does not hold up the other.
+        await self._attempt("send end-call to Vapi", self._vapi.send_text(END_CALL))
+        # Then the two sides at once, so a browser that has stopped reading cannot hold up the
+        # Vapi close, and a slow closing handshake with Vapi cannot hold up the browser.
         await asyncio.gather(
-            _attempt("close the Vapi socket", self._vapi.close()),
-            _attempt("close the browser socket", self._browser.close()),
+            self._tell_and_close_browser(reason),
+            self._attempt("close the Vapi socket", self._vapi.close()),
         )
         log.info("relay ended: %s", reason)
+
+    async def _tell_and_close_browser(self, reason: str) -> None:
+        ended = json.dumps({"type": "ended", "reason": reason})
+        await self._attempt("tell the browser the call ended", self._browser.send_text(ended))
+        await self._attempt("close the browser socket", self._browser.close())
+
+    async def _attempt(self, what: str, step: Awaitable[None]) -> None:
+        """Await one hang-up step for at most hang_up_timeout_s. A failure, running out of time
+        included, is logged and the hang-up goes on to the next step."""
+        try:
+            async with asyncio.timeout(self._hang_up_timeout_s):
+                await step
+        except Exception as exc:
+            # Only the type: a library's message could hold a URL (ruling R19).
+            log.info("could not %s: %s", what, type(exc).__name__)
 
     async def _stop_when_ending(self) -> None:
         await self._stopping.wait()
@@ -238,7 +283,7 @@ class Relay:
                 return
 
     async def _browser_to_vapi(self) -> None:
-        while (frame := await self._browser.recv()) is not None:
+        while (frame := await self._next_browser_frame()) is not None:
             if isinstance(frame, bytes):
                 try:
                     await self._vapi.send_bytes(frame)
@@ -251,6 +296,16 @@ class Relay:
             else:
                 log.debug("dropped a browser text frame that is not an end request")
         await self.end("browser_closed")
+
+    async def _next_browser_frame(self) -> bytes | str | None:
+        """The browser's next frame. None once it has closed, or sent nothing for
+        browser_timeout_s, which is how a network that dropped without a close shows up."""
+        try:
+            async with asyncio.timeout(self._browser_timeout_s):
+                return await self._browser.recv()
+        except TimeoutError:
+            log.info("the browser sent nothing for %s s: gone", self._browser_timeout_s)
+            return None
 
     async def _vapi_to_browser(self) -> None:
         while (frame := await self._vapi.recv()) is not None:
@@ -305,16 +360,25 @@ class Relay:
             )
 
     async def _send_browser(self, frame: bytes | str) -> bool:
-        """Send one frame to the browser. If it has gone, end the relay and return False."""
+        """Send one frame to the browser. If it has gone, end the relay and return False.
+
+        A send not done within browser_timeout_s means it has gone too: it stopped reading, or
+        its network dropped and the send buffer is full.
+        """
         try:
-            if isinstance(frame, bytes):
-                await self._browser.send_bytes(frame)
-            else:
-                await self._browser.send_text(frame)
+            async with asyncio.timeout(self._browser_timeout_s):
+                if isinstance(frame, bytes):
+                    await self._browser.send_bytes(frame)
+                else:
+                    await self._browser.send_text(frame)
         except SocketClosed:
-            await self.end("browser_closed")
-            return False
-        return True
+            pass
+        except TimeoutError:
+            log.info("a send to the browser waited %s s: gone", self._browser_timeout_s)
+        else:
+            return True
+        await self.end("browser_closed")
+        return False
 
 
 def _is_end_request(text: str) -> bool:
@@ -323,12 +387,3 @@ def _is_end_request(text: str) -> bool:
     except ValueError:
         return False
     return isinstance(message, dict) and message.get("type") == "end"
-
-
-async def _attempt(what: str, step: Awaitable[None]) -> None:
-    """Await one hang-up step. A failure is logged and the hang-up goes on to the next step."""
-    try:
-        await step
-    except Exception as exc:
-        # Only the type: a library's message could hold a URL (ruling R19).
-        log.info("could not %s: %s", what, type(exc).__name__)

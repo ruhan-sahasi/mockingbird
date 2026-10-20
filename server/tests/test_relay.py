@@ -56,16 +56,25 @@ class FakeSocket:
 
     Put frames into `incoming` for the relay to receive. None means the far end closed, and an
     exception is raised from `recv()`. What the relay sends lands in `sent`, and `actions` keeps
-    every send and close in order. `dropped = True` makes sends fail the way a lost connection
-    does, without the relay having seen a close yet.
+    every send and close in order. `log` is shared by the two sockets of one relay, so it keeps
+    the order across both, each entry tagged with the socket's name.
+
+    `dropped = True` makes sends fail the way a lost connection does, without the relay having
+    seen a close yet. `stuck = True` makes every send and close wait until `unstick()`, the way
+    they do to a peer whose network dropped with the send buffer full: uvicorn's send waits for
+    the buffer to drain, which only happens once the kernel gives up on the connection.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, name: str = "", log: list | None = None) -> None:
+        self.name = name
+        self.log: list[tuple[str, str, object]] = [] if log is None else log
         self.incoming: asyncio.Queue[bytes | str | BaseException | None] = asyncio.Queue()
         self.sent: asyncio.Queue[bytes | str] = asyncio.Queue()
         self.actions: list[tuple[str, object]] = []
         self.closed = asyncio.Event()
         self.dropped = False
+        self.stuck = False
+        self._unstuck = asyncio.Event()
 
     async def recv(self) -> bytes | str | None:
         if self.closed.is_set():
@@ -76,21 +85,35 @@ class FakeSocket:
         return item
 
     async def send_bytes(self, b: bytes) -> None:
-        self._send(b)
+        await self._send(b)
 
     async def send_text(self, s: str) -> None:
-        self._send(s)
+        await self._send(s)
 
-    def _send(self, frame: bytes | str) -> None:
+    async def _send(self, frame: bytes | str) -> None:
+        await self._wait_while_stuck()
         if self.dropped or self.closed.is_set():
             raise SocketClosed
-        self.actions.append(("send", decode(frame)))
+        self._record("send", decode(frame))
         self.sent.put_nowait(frame)
 
     async def close(self, code: int = 1000) -> None:
-        self.actions.append(("close", code))
+        await self._wait_while_stuck()
+        self._record("close", code)
         self.closed.set()
         self.incoming.put_nowait(None)  # wakes a pending recv(), as closing a real socket does
+
+    def unstick(self) -> None:
+        self.stuck = False
+        self._unstuck.set()
+
+    async def _wait_while_stuck(self) -> None:
+        if self.stuck:
+            await self._unstuck.wait()
+
+    def _record(self, kind: str, what: object) -> None:
+        self.actions.append((kind, what))
+        self.log.append((self.name, kind, what))
 
     async def next_sent(self):
         return decode(await asyncio.wait_for(self.sent.get(), 1.0))
@@ -115,7 +138,8 @@ class EventLog:
 
 
 def make_relay(*, cap_s: float = 60.0, **kwargs) -> tuple[Relay, FakeSocket, FakeSocket]:
-    browser, vapi = FakeSocket(), FakeSocket()
+    log: list = []
+    browser, vapi = FakeSocket("browser", log), FakeSocket("vapi", log)
     return Relay(browser, vapi, cap_s=cap_s, **kwargs), browser, vapi
 
 
@@ -134,6 +158,14 @@ END_CALL = {"type": "end-call"}
 
 def ended(reason: str) -> dict:
     return {"type": "ended", "reason": reason}
+
+
+def assert_hung_up_in_order(log: list, reason: str) -> None:
+    """The whole hang-up, across both sockets: Vapi hears `end-call` before the browser hears
+    anything, because that is what stops the bill. Then the browser hears why, and both sockets
+    close. The two closes run side by side, so their order is not pinned."""
+    assert log[:2] == [("vapi", "send", END_CALL), ("browser", "send", ended(reason))]
+    assert sorted(log[2:]) == [("browser", "close", 1000), ("vapi", "close", 1000)]
 
 
 # --- Relaying ---
@@ -189,8 +221,7 @@ async def test_browser_end_message_ends_with_browser_closed():
     browser.incoming.put_nowait(frame(type="end"))
 
     assert await finished(task) == "browser_closed"
-    assert vapi.actions == [("send", END_CALL), ("close", 1000)]
-    assert browser.actions == [("send", ended("browser_closed")), ("close", 1000)]
+    assert_hung_up_in_order(vapi.log, "browser_closed")
 
 
 async def test_browser_gets_a_ping_every_ping_every_s():
@@ -218,8 +249,7 @@ async def test_cap_ends_call_and_tells_both_sides():
 
     assert reason == "cap"
     assert loop.time() - began >= 0.19  # not before the cap, with room for float rounding
-    assert vapi.actions == [("send", END_CALL), ("close", 1000)]
-    assert browser.actions == [("send", ended("cap")), ("close", 1000)]
+    assert_hung_up_in_order(vapi.log, "cap")
 
 
 async def test_browser_disconnect_ends_vapi_call_within_one_second():
@@ -235,6 +265,102 @@ async def test_browser_disconnect_ends_vapi_call_within_one_second():
     assert loop.time() - began < 1.0
     assert vapi.actions == [("send", END_CALL), ("close", 1000)]
     assert await finished(task) == "browser_closed"
+    assert_hung_up_in_order(vapi.log, "browser_closed")
+
+
+async def test_browser_disconnect_ends_vapi_call_within_one_second_while_browser_sends_hang():
+    # Review Focus 1 when the network has gone with the browser's send buffer full: a send to the
+    # browser then waits until the kernel gives up on the connection, which takes minutes. The
+    # Vapi side must not wait with it, however long each browser step is allowed to take.
+    relay, browser, vapi = make_relay(hang_up_timeout_s=30.0)
+    task = await start(relay)
+    loop = asyncio.get_running_loop()
+    began = loop.time()
+
+    browser.stuck = True
+    browser.incoming.put_nowait(None)
+
+    await asyncio.wait_for(vapi.closed.wait(), 1.0)
+    assert loop.time() - began < 1.0
+    assert vapi.actions == [("send", END_CALL), ("close", 1000)]
+    assert browser.actions == []  # the `ended` send is still waiting
+    browser.unstick()
+    assert await finished(task) == "browser_closed"
+    assert browser.actions == [("send", ended("browser_closed")), ("close", 1000)]
+
+
+async def test_browser_that_takes_nothing_cannot_hold_up_the_end(caplog):
+    # The same full buffer, but it never drains. Each browser step gives up after
+    # hang_up_timeout_s, so run() and every end() caller still return.
+    caplog.set_level(logging.INFO, logger="mockingbird.relay")
+    relay, browser, vapi = make_relay(hang_up_timeout_s=0.1)
+    task = await start(relay)
+    browser.stuck = True
+
+    # The route's own end(), as once the wrap-up line has been spoken.
+    await asyncio.wait_for(relay.end("plan_done"), 1.0)
+
+    assert await finished(task) == "plan_done"
+    assert vapi.actions == [("send", END_CALL), ("close", 1000)]
+    assert browser.actions == []
+    logged = [r.getMessage() for r in caplog.records]
+    assert "could not tell the browser the call ended: TimeoutError" in logged
+    assert "could not close the browser socket: TimeoutError" in logged
+
+
+@pytest.mark.parametrize("before", [[], [MIC_1, MIC_2]], ids=["from-the-start", "after-audio"])
+async def test_browser_going_quiet_ends_vapi_call(before):
+    # Review Focus 1 when the network drops with no FIN or RST: no close ever reaches the relay,
+    # and its sends to the browser only queue. But the browser streams mic frames every 20 ms
+    # from the moment its socket opens, silence included, so frames stopping is the signal.
+    relay, browser, vapi = make_relay(browser_timeout_s=0.2)
+    task = await start(relay)
+    for mic in before:
+        browser.incoming.put_nowait(mic)
+
+    await asyncio.wait_for(vapi.closed.wait(), 1.0)
+
+    assert vapi.actions == [*(("send", mic) for mic in before), ("send", END_CALL), ("close", 1000)]
+    assert await finished(task) == "browser_closed"
+
+
+async def test_steady_mic_frames_keep_the_call_up():
+    # The browser counts as gone only after browser_timeout_s with no frame at all, measured
+    # from its last frame, not from the start of the call.
+    relay, browser, vapi = make_relay(browser_timeout_s=0.2)
+    task = await start(relay)
+
+    for _ in range(8):  # 0.4 s in all, twice browser_timeout_s
+        browser.incoming.put_nowait(MIC_1)
+        await asyncio.sleep(0.05)
+
+    assert END_CALL not in vapi.frames()
+    await relay.end("plan_done")
+    assert await finished(task) == "plan_done"
+
+
+async def test_browser_that_stops_taking_frames_ends_vapi_call():
+    # The other half of a dead connection: the relay's sends to the browser stop completing.
+    # Mic frames keep arriving here, so the stuck send is the only thing that can end the call.
+    relay, browser, vapi = make_relay(browser_timeout_s=0.2, hang_up_timeout_s=0.1)
+    task = await start(relay)
+    browser.stuck = True
+
+    async def keep_talking() -> None:
+        while True:
+            browser.incoming.put_nowait(MIC_1)
+            await asyncio.sleep(0.02)
+
+    talking = asyncio.create_task(keep_talking())
+    vapi.incoming.put_nowait(VOICE_1)
+    try:
+        await asyncio.wait_for(vapi.closed.wait(), 1.0)
+    finally:
+        talking.cancel()
+
+    assert END_CALL in vapi.frames()
+    assert await finished(task) == "browser_closed"
+    assert browser.actions == []
 
 
 async def test_browser_dropping_mid_send_ends_vapi_call():
@@ -269,8 +395,7 @@ async def test_end_is_idempotent():
     assert await finished(task) == "plan_done"
     await relay.end("vapi_closed")
 
-    assert vapi.actions == [("send", END_CALL), ("close", 1000)]
-    assert browser.actions == [("send", ended("plan_done")), ("close", 1000)]
+    assert_hung_up_in_order(vapi.log, "plan_done")
 
 
 async def test_end_from_on_event_stops_the_relay():
@@ -286,8 +411,7 @@ async def test_end_from_on_event_stops_the_relay():
     vapi.incoming.put_nowait(ASSISTANT_STOPPED)
 
     assert await finished(task) == "plan_done"
-    assert vapi.actions == [("send", END_CALL), ("close", 1000)]
-    assert browser.actions == [("send", ended("plan_done")), ("close", 1000)]
+    assert_hung_up_in_order(vapi.log, "plan_done")
 
 
 async def test_end_cancels_an_on_event_that_is_stuck(caplog):
@@ -563,14 +687,28 @@ async def test_starlette_socket_close_sends_the_code_once():
         await socket.send_text('{"type": "ping"}')
 
 
+class FakeTransport:
+    def __init__(self) -> None:
+        self.aborted = False
+
+    def abort(self) -> None:
+        self.aborted = True
+
+
 class FakeConnection:
-    """Stands in for a websockets ClientConnection: the three methods the adapter calls."""
+    """Stands in for a websockets ClientConnection: the parts the adapter uses.
+
+    `close_hangs = True` makes `close()` wait for good, as it does while Vapi's side of the
+    closing handshake has not arrived.
+    """
 
     def __init__(self, *incoming: bytes | str | BaseException) -> None:
         self.incoming = list(incoming)
         self.sent: list[bytes | str] = []
         self.close_codes: list[int] = []
         self.send_error: BaseException | None = None
+        self.close_hangs = False
+        self.transport = FakeTransport()
 
     async def recv(self) -> bytes | str:
         item = self.incoming.pop(0)
@@ -585,6 +723,8 @@ class FakeConnection:
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
         self.close_codes.append(code)
+        if self.close_hangs:
+            await asyncio.Event().wait()  # never set
 
 
 # Vapi closes with no status code (1005) after a hangup. A network failure has no close frame.
@@ -631,3 +771,19 @@ async def test_websockets_socket_close_passes_the_code():
     await WebsocketsSocket(conn).close(1000)
 
     assert conn.close_codes == [1000]
+    assert not conn.transport.aborted
+
+
+async def test_websockets_socket_close_cut_short_drops_the_connection():
+    # The relay gives each hang-up step a time limit. A close cut short while it waits for Vapi's
+    # side of the closing handshake must not leave the connection open behind it.
+    conn = FakeConnection()
+    conn.close_hangs = True
+    socket = WebsocketsSocket(conn)
+
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.05):
+            await socket.close(1000)
+
+    assert conn.close_codes == [1000]
+    assert conn.transport.aborted
