@@ -21,6 +21,7 @@ together, in one synchronous step, once their reply has been spoken.
 
 import copy
 import logging
+import re
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Literal
@@ -156,6 +157,16 @@ FALLBACK_LINE: dict[MoveKind, str] = {
 
 # Wrap-up never calls Claude, so the last thing the candidate hears is always this.
 WRAP_UP_LINE = "Thanks, that's all the time we have. Your report will be ready in about a minute."
+
+
+# A word is a run of letters and digits. A hyphen inside one ("twenty-five") keeps it a single
+# word, because Vapi may rebuild that as "25". An apostrophe splits it, so "I'm" and "I am" both
+# count two. Punctuation, quotes, dashes and spacing are not words.
+_WORD = re.compile(r"\w+(?:-\w+)*")
+
+
+def _count_words(text: str) -> int:
+    return len(_WORD.findall(text))
 
 
 def _instruction(move: Move) -> str:
@@ -360,11 +371,12 @@ class Brain:
     def _finalize_committed(self, spoken_assistant_text: str | None) -> None:
         """Write the committed draft into the history and the turns, if there is one.
 
-        The line is what Vapi says it spoke when that is shorter than what was generated,
+        The line is what Vapi says it spoke when that has fewer words than what was generated,
         because the candidate talked over it. Vapi rebuilds the text from the words it said, so
-        its punctuation can differ from ours. Length is the only thing compared, and a text that
-        is not shorter is not trusted. A draft that was cut off while Claude was still writing
-        it counts as interrupted too.
+        its punctuation, dashes, quotes and spacing can differ from ours even for a line that
+        played to the end. Words are the only thing compared, and a text that does not have
+        fewer of them is not trusted. A draft that was cut off while Claude was still writing it
+        counts as interrupted too.
         """
         draft = self._committed
         if draft is None:
@@ -373,7 +385,8 @@ class Brain:
 
         generated = "".join(draft.chunks)
         spoken = spoken_assistant_text or ""
-        cut_short = bool(spoken.strip()) and len(spoken.strip()) < len(generated.strip())
+        spoken_words = _count_words(spoken)
+        cut_short = 0 < spoken_words < _count_words(generated)
         text = spoken if cut_short else generated
         if not text.strip():
             text = CUT_OFF_TEXT

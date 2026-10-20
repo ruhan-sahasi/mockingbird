@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import random
+import re
 from collections import Counter
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -456,8 +457,9 @@ async def test_an_interrupted_reply_is_recorded_as_the_words_that_were_spoken():
         "   ",
         "Understood. Thanks.",  # Vapi re-punctuates what it spoke, so this is the full reply
         "Understood. Thanks. Really.",  # and a rebuilt text can come out longer
+        "...",  # nothing but punctuation holds no words, so it says nothing about what was spoken
     ],
-    ids=["none", "empty", "blank", "same-length", "longer"],
+    ids=["none", "empty", "blank", "same-length", "longer", "no-words"],
 )
 async def test_a_spoken_text_that_is_not_shorter_leaves_the_generated_text(spoken):
     generated = "Understood, thanks."
@@ -468,6 +470,59 @@ async def test_a_spoken_text_that_is_not_shorter_leaves_the_generated_text(spoke
 
     assert brain.history[4] == {"role": "assistant", "content": generated}
     assert brain.turns[2] == Turn(2, "interviewer", generated, 0, interrupted=False)
+
+
+@pytest.mark.parametrize(
+    ("generated", "spoken"),
+    [
+        ("Got it — and what did you measure?", "Got it. And what did you measure?"),
+        ("Understood, thanks.", "Understood thanks"),
+        ('Walk me through the "rollout" plan.', "Walk me through the rollout plan."),
+        ("Tell me  more   about that.", "Tell me more about that."),
+        ("That is a twenty-five person team, right?", "That is a 25 person team right"),
+        ("I am glad you did that.", "I'm glad you did that."),
+    ],
+    ids=[
+        "dash-to-period",
+        "dropped-punctuation",
+        "quotes-removed",
+        "whitespace",
+        "number",
+        "contraction",
+    ],
+)
+async def test_a_rebuild_with_the_same_words_is_not_an_interruption(generated, spoken):
+    # Vapi rebuilds the text from the words it said and changes punctuation even for a reply
+    # that played to the end (docs/vapi-contract.md section 3). Each rebuild here has fewer
+    # characters than ours but every word, so it must not read as a cut-off.
+    assert len(spoken.strip()) < len(generated.strip())
+    streamer = FakeStreamer([generated], ["What was the result?"])
+    brain, _ = started(DEMO, streamer)
+    await say(brain, "I led the migration.")
+    await hear(brain, "We shipped it on time.", spoken)
+
+    assert brain.history[4] == {"role": "assistant", "content": generated}
+    assert brain.turns[2] == Turn(2, "interviewer", generated, 0, interrupted=False)
+
+
+@pytest.mark.parametrize(
+    ("generated", "spoken"),
+    [
+        ("Got it — and what did you measure?", "Got it. And what"),
+        ("Tell me more about that.", "Tell me"),
+        # Fewer words is what counts, even when the rebuild has more characters.
+        ("Tell me more about that.", "Extraordinarily interesting migration"),
+    ],
+    ids=["re-punctuated", "plain", "longer-words"],
+)
+async def test_a_rebuild_with_fewer_words_is_an_interruption(generated, spoken):
+    streamer = FakeStreamer([generated], ["What was the result?"])
+    brain, _ = started(DEMO, streamer)
+    await say(brain, "I led the migration.")
+    await hear(brain, "Sorry to cut in.", spoken)
+
+    assert brain.history[4] == {"role": "assistant", "content": spoken}
+    assert brain.turns[2] == Turn(2, "interviewer", spoken, 0, interrupted=True)
 
 
 async def test_a_spoken_text_with_no_committed_reply_is_ignored():
@@ -920,6 +975,12 @@ RANDOM_SCRIPTS = [
 RANDOM_ANSWERS = ["", "   ", "I led it.", LONG_ANSWER]
 
 
+def count_words(text: str) -> int:
+    """Words as the oracle counts them: runs of letters and digits, with a hyphen inside a word
+    ("twenty-five") joining it. Punctuation, quotes, dashes and spacing do not count."""
+    return len(re.findall(r"\w+(?:-\w+)*", text))
+
+
 def instruction_for(move: Move) -> str | None:
     if move.kind is MoveKind.WRAP_UP:
         return None
@@ -981,12 +1042,17 @@ class RandomSession:
         self.committed = None
         generated = "".join(draft.heard)
         produced = draft.task.done() and not draft.task.cancelled()
-        cut_short = bool(spoken and spoken.strip()) and len(spoken.strip()) < len(generated.strip())
+        spoken_words = count_words(spoken or "")
+        cut_short = 0 < spoken_words < count_words(generated)
         text = spoken if cut_short else generated
         if not text.strip():
             text = "(cut off)"
             self.stats["settled_as_cut_off"] += 1
         self.stats["settled_shorter"] += cut_short
+        # The case a length comparison got wrong: fewer characters, every word.
+        spoken_chars = len((spoken or "").strip())
+        if not cut_short and 0 < spoken_chars < len(generated.strip()):
+            self.stats["settled_same_words_fewer_characters"] += 1
         self.stats["settled_unfinished"] += not produced
         self.history.append(
             {"role": "user", "content": draft.text if draft.text.strip() else "(inaudible)"}
@@ -1136,6 +1202,7 @@ async def test_the_random_mixes_reach_every_interesting_case():
         "empty_drafts",
         "wrap_ups_spoken",
         "settled_shorter",
+        "settled_same_words_fewer_characters",
         "settled_unfinished",
         "settled_as_cut_off",
         "finalizes",
