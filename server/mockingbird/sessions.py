@@ -41,10 +41,10 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from mockingbird.brain import Brain
+from mockingbird.failures import describe
 from mockingbird.models import Interview
 from mockingbird.relay import Relay
 from mockingbird.store import Store
-from mockingbird.vapi_client import VapiError
 
 log = logging.getLogger(__name__)
 
@@ -193,14 +193,10 @@ async def purge_once(store: Store, vapi: CallDeleter) -> None:
     for call_id in await store.demo_calls_older_than(RETENTION_DAYS):
         try:
             await vapi.delete_call(call_id)
-        except VapiError as exc:
-            # Its message never holds the call id, a URL or the key (vapi_client.py).
-            log.warning("could not delete an old call at Vapi, kept for the next purge: %s", exc)
         except Exception as exc:
-            log.warning(
-                "could not delete an old call at Vapi, kept for the next purge: %s",
-                type(exc).__name__,
-            )
+            # A VapiError's message holds no call id, URL or key; anything else gives its type.
+            msg = "could not delete an old call at Vapi, kept for the next purge: %s"
+            log.warning(msg, describe(exc))
         else:
             deleted_at_vapi.append(call_id)
     deleted = await store.delete_demo_data_older_than(RETENTION_DAYS, vapi_deleted=deleted_at_vapi)
