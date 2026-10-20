@@ -4,6 +4,10 @@
 
 data "aws_availability_zones" "available" {
   state = "available"
+
+  # Fargate does not run ARM64 tasks in this us-east-1 zone (AWS's "task definitions for 64-bit
+  # ARM workloads" page). In any other region the filter matches nothing.
+  exclude_zone_ids = ["use1-az3"]
 }
 
 resource "aws_vpc" "main" {
