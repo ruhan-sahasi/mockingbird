@@ -1,22 +1,17 @@
 """The FastAPI app. `create_app` is the one place that wires routes to dependencies."""
 
-from typing import Any, Protocol
+from typing import Any
 
 from fastapi import FastAPI
 
 from mockingbird.config import Settings, get_settings
-
-
-class Pingable(Protocol):
-    """All /healthz needs from a store. Task 7 adds the real Store, which has ping()."""
-
-    async def ping(self) -> None: ...
+from mockingbird.store import Store
 
 
 def create_app(
     settings: Settings,
     *,
-    store: Pingable | None = None,
+    store: Store | None = None,
     vapi: Any | None = None,
     streamer_factory: Any | None = None,
     grader: Any | None = None,

@@ -3,6 +3,7 @@ from fastapi.testclient import TestClient
 
 from mockingbird.app import create_app
 from mockingbird.config import Settings
+from mockingbird.store import MemoryStore
 
 
 def test_settings() -> Settings:
@@ -27,6 +28,5 @@ def settings() -> Settings:
 
 @pytest.fixture
 def client(settings: Settings):
-    # Task 7 adds MemoryStore here. Until then there is no store.
-    with TestClient(create_app(settings, store=None)) as c:
+    with TestClient(create_app(settings, store=MemoryStore())) as c:
         yield c
