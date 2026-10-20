@@ -113,6 +113,19 @@ class Store(Protocol):
         this IP. One that matches on both counts once."""
         ...
 
+    async def attempts_today(self, visitor_hash: str, ip_hash: str) -> int:
+        """Demo interviews created today by this visitor or from this IP, whatever became of
+        them, abandoned ones included. One that matches on both counts once."""
+        ...
+
+    async def abandon_unstarted(self, *, created_before: datetime, keep: Collection[str]) -> int:
+        """Mark `abandoned` every interview still `created` that was created before
+        `created_before`, except those whose ids are in `keep`. Returns how many it marked.
+
+        The sweeper keeps the ones this process still holds a session for. The rest can never
+        start: their tokens lived only in the memory of a process that has stopped."""
+        ...
+
     async def ping(self) -> None:
         """Raises if the store cannot be reached."""
         ...
@@ -259,6 +272,27 @@ class MemoryStore:
             and start <= i.created_at < end
             and (i.visitor_hash == visitor_hash or i.ip_hash == ip_hash)
         )
+
+    async def attempts_today(self, visitor_hash: str, ip_hash: str) -> int:
+        start, end = _utc_day(self._clock())
+        return sum(
+            1
+            for i in self._interviews.values()
+            if i.mode == "demo"
+            and start <= i.created_at < end
+            and (i.visitor_hash == visitor_hash or i.ip_hash == ip_hash)
+        )
+
+    async def abandon_unstarted(self, *, created_before: datetime, keep: Collection[str]) -> int:
+        kept = set(keep)
+        stranded = [
+            i
+            for i in self._interviews.values()
+            if i.status == "created" and i.created_at < created_before and i.id not in kept
+        ]
+        for i in stranded:
+            i.status = "abandoned"
+        return len(stranded)
 
     async def ping(self) -> None:
         return None
@@ -478,6 +512,28 @@ class PostgresStore:
             visitor_hash,
             ip_hash,
         )
+
+    async def attempts_today(self, visitor_hash: str, ip_hash: str) -> int:
+        start, end = _utc_day(self._clock())
+        return await self._pool.fetchval(
+            "select count(*) from interviews"
+            " where mode = 'demo'"
+            "   and created_at >= $1 and created_at < $2"
+            "   and (visitor_hash = $3 or ip_hash = $4)",
+            start,
+            end,
+            visitor_hash,
+            ip_hash,
+        )
+
+    async def abandon_unstarted(self, *, created_before: datetime, keep: Collection[str]) -> int:
+        result = await self._pool.execute(
+            "update interviews set status = 'abandoned'"
+            " where status = 'created' and created_at < $1 and not (id = any($2::text[]))",
+            created_before,
+            list(keep),
+        )
+        return int(result.removeprefix("UPDATE "))
 
     async def ping(self) -> None:
         await self._pool.execute("select 1")

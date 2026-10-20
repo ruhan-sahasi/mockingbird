@@ -55,6 +55,7 @@ WEBHOOK_SECRET = "test-webhook-secret"
 LLM_PATH = f"/vapi/llm/{BRAIN_SECRET}/chat/completions"
 WEBHOOK_PATH = f"/vapi/webhook/{WEBHOOK_SECRET}"
 CALL_ID = "call_1"
+SITE = "https://mockingbird.test"  # public_base_url in conftest's settings
 SOCKET_URL = "ws://fake"
 ENDED_LINE = "Sorry, this interview has ended."
 DEFAULT_LINE = "Tell me more about that."
@@ -237,8 +238,9 @@ def app(settings, fakes):
 
 @pytest.fixture
 def client(app):
-    # https, so the client sends the Secure visitor cookie back.
-    with TestClient(app, base_url="https://testserver") as c:
+    # https, so the client sends the Secure visitor cookie back, and the Origin a browser on the
+    # site sends with a start (routes_api.py refuses a start without it).
+    with TestClient(app, base_url="https://testserver", headers={"origin": SITE}) as c:
         yield c
 
 
@@ -1078,6 +1080,39 @@ async def test_sweep_leaves_alone_an_interview_its_route_ended_after_the_sweep_l
 
     ended = await store.get_interview("i1")
     assert (ended.status, ended.ended_reason, ended.duration_s) == ("ended", "cap", 297)
+
+
+async def test_sweep_abandons_a_created_interview_that_a_restart_left_behind():
+    # Its session was in the memory of the process that stopped, so its token is gone and it can
+    # never start. Created, it held its visitor's demo and a cap of the budget all day.
+    store = MemoryStore()
+    registry = SessionRegistry()
+    now = time.time()
+
+    def created(id: str, age_s: float) -> Interview:
+        return Interview(
+            id=id,
+            mode="demo",
+            status="created",
+            visitor_hash=f"v-{id}",
+            ip_hash=f"ip-{id}",
+            cap_s=300,
+            questions=["Q"],
+            created_at=datetime.fromtimestamp(now - age_s, UTC),
+        )
+
+    orphan, young, opening = created("orphan", 61), created("young", 30), created("opening", 90)
+    for i in (orphan, young, opening):
+        await store.create_interview(i)
+    registry.add(make_session(opening))  # its token was used; its route is connecting the call
+
+    await sweep_once(registry, store, now)
+
+    assert (await store.get_interview("orphan")).status == "abandoned"
+    assert (await store.get_interview("young")).status == "created"
+    assert (await store.get_interview("opening")).status == "created"
+    assert await store.starts_today("v-orphan", "ip-orphan") == 0
+    assert await store.seconds_used_today() == 2 * 300
 
 
 async def test_sweep_leaves_a_session_whose_token_was_used_alone():

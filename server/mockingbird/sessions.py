@@ -14,6 +14,10 @@ session's repr, and nothing here logs either of them.
 `sweep_once` runs every minute from `run_sweeper`:
 - a session whose token ran out unused is removed, and its interview marked `abandoned`, which
   gives the visitor their demo back (abandoned interviews do not count as starts);
+- any interview the store still has as `created`, older than a token's life, that no session here
+  holds is marked `abandoned` too. Those are the starts a restart (every deploy is one) left
+  behind: their tokens were in the old process's memory, so they can never start, and as
+  `created` each would hold its visitor's demo and a cap of the day's budget until midnight;
 - any interview the store still has as `live` well past its cap is marked ended with the reason
   "stale" and its cap as its duration (ruling R23). That is mostly a call this process lost
   track of in a crash, and until it is ended the daily budget keeps counting its full cap. It
@@ -33,6 +37,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Protocol
 
 from mockingbird.brain import Brain
@@ -120,7 +125,8 @@ class SessionRegistry:
 
 
 async def sweep_once(registry: SessionRegistry, store: Store, now: float) -> None:
-    """Abandon the interviews whose token ran out unused, and end the stale live ones.
+    """Abandon the interviews whose token ran out unused or that nothing holds, and end the
+    stale live ones.
 
     `now` is in seconds since the epoch. Each write is tried on its own, so one that fails does
     not stop the rest; it is tried again on the next sweep.
@@ -133,6 +139,15 @@ async def sweep_once(registry: SessionRegistry, store: Store, now: float) -> Non
                 "abandon an unused interview",
                 store.update_interview(s.interview.id, status="abandoned"),
             )
+
+    # A start younger than a token's life may be one whose session is about to be added.
+    await _attempt(
+        "abandon the starts nothing holds",
+        store.abandon_unstarted(
+            created_before=datetime.fromtimestamp(now - TOKEN_TTL_S, UTC),
+            keep=[s.interview.id for s in registry.sessions()],
+        ),
+    )
 
     for i in await store.list_live_interviews():
         if i.created_at.timestamp() + i.cap_s + STALE_AFTER_CAP_S < now:

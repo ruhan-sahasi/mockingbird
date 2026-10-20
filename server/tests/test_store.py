@@ -435,6 +435,58 @@ async def test_starts_today_ignores_abandoned_other_days_and_full_mode(store):
     assert await store.starts_today("visitor-a", "ip-x") == 4
 
 
+async def test_attempts_today_counts_every_status_abandoned_included(store):
+    # starts_today gives an abandoned start back. attempts_today does not, so no-shows repeated
+    # from one visitor or IP still add up.
+    for id, status in [("a1", "abandoned"), ("a2", "abandoned"), ("e", "ended")]:
+        await store.create_interview(make_interview(id, status=status))
+    await store.create_interview(
+        make_interview("yesterday", status="abandoned", created_at=NOW - timedelta(days=1))
+    )
+    await store.create_interview(make_interview("full", mode="full", status="abandoned"))
+    await store.create_interview(
+        make_interview("elsewhere", visitor_hash="visitor-b", ip_hash="ip-y", status="abandoned")
+    )
+
+    assert await store.attempts_today("visitor-a", "ip-x") == 3
+    assert await store.attempts_today("visitor-a", "someone-else") == 3  # by the cookie alone
+    assert await store.attempts_today("someone-else", "ip-x") == 3  # by the IP alone
+    assert await store.attempts_today("visitor-a", "ip-y") == 4  # one of each
+    assert await store.starts_today("visitor-a", "ip-x") == 1
+
+
+async def test_abandon_unstarted_abandons_old_created_interviews_nobody_holds(store):
+    # After a restart nothing holds the tokens of the interviews created before it, so they can
+    # never start. Left as created, each would hold its cap in the day's budget and its visitor's
+    # demo for the rest of the day.
+    old = NOW - timedelta(minutes=5)
+    await store.create_interview(make_interview("orphan", created_at=old))
+    await store.create_interview(make_interview("held", created_at=old))  # its socket is opening
+    await store.create_interview(make_interview("young"))  # its token is still good
+    await store.create_interview(make_interview("live", status="live", created_at=old))
+    await store.create_interview(make_interview("orphan-full", mode="full", created_at=old))
+    assert await store.seconds_used_today() == 4 * 300
+
+    abandoned = await store.abandon_unstarted(
+        created_before=NOW - timedelta(minutes=1), keep=["held"]
+    )
+
+    assert abandoned == 2
+    statuses = {
+        id: (await store.get_interview(id)).status
+        for id in ("orphan", "held", "young", "live", "orphan-full")
+    }
+    assert statuses == {
+        "orphan": "abandoned",
+        "held": "created",
+        "young": "created",
+        "live": "live",
+        "orphan-full": "abandoned",
+    }
+    assert await store.seconds_used_today() == 3 * 300
+    assert await store.abandon_unstarted(created_before=NOW, keep=["held", "young"]) == 0
+
+
 # --- lookups for the sweeper and the webhook ---------------------------------------------------
 
 

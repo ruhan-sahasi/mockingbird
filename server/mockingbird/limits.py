@@ -4,6 +4,12 @@ A visitor is known two ways, so that clearing cookies or changing networks alone
 second demo: an anonymous `mb_visitor` cookie, and the IP address. Neither is stored as it is.
 Both are hashed with a salt from the settings, so the database never holds an IP address.
 
+A start that never became a call (its socket was never opened, or Vapi refused it) is abandoned
+and does not count as the visitor's demo, so an honest retry works. But a start holds a cap of
+the day's budget until it is abandoned, a minute or two later, so free retries would let one
+address hold the budget all day with one request every two minutes. So every start counts toward
+a second limit, MAX_ATTEMPTS_PER_DAY, abandoned or not.
+
 The owner key skips all of this. That rule lives in the start route, not here.
 """
 
@@ -21,6 +27,9 @@ COOKIE_MAX_AGE_S = 365 * 24 * 3600  # one year
 # CloudFront, so it is the visitor's real address; request.client is CloudFront's.
 VIEWER_ADDRESS_HEADER = "cloudfront-viewer-address"
 
+# Starts of any kind per visitor or IP per UTC day: the demo plus two that never became a call.
+MAX_ATTEMPTS_PER_DAY = 3
+
 StartCheck = Literal["ok", "visitor_limit", "daily_budget"]
 
 
@@ -30,6 +39,8 @@ async def check_can_start(
     """Whether a demo of `cap_s` seconds may start now. The visitor limit is checked first, so
     a visitor who has had their demo hears that, not that the budget ran out."""
     if await store.starts_today(visitor_hash, ip_hash) >= 1:
+        return "visitor_limit"
+    if await store.attempts_today(visitor_hash, ip_hash) >= MAX_ATTEMPTS_PER_DAY:
         return "visitor_limit"
     if await store.seconds_used_today() + cap_s > daily_demo_s:
         return "daily_budget"
