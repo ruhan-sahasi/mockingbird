@@ -61,6 +61,16 @@ class Store(Protocol):
 
     async def get_interview(self, id: str) -> Interview | None: ...
 
+    async def get_interview_by_call(self, call_id: str) -> Interview | None:
+        """The interview whose `vapi_call_id` is `call_id`. Vapi's end-of-call report names only
+        the call, and it can come after the live session is gone."""
+        ...
+
+    async def list_live_interviews(self) -> list[Interview]:
+        """Every interview whose status is `live`, of any mode and any day. One left live by a
+        crash shows up here, so the sweeper can end it."""
+        ...
+
     async def update_interview(self, id: str, **changes: Any) -> None:
         """Change fields of an interview. Raises ValueError for a field it does not have, for
         `id`, which never changes, or for a value that breaks a rule of the interviews table, as
@@ -166,6 +176,15 @@ class MemoryStore:
     async def get_interview(self, id: str) -> Interview | None:
         found = self._interviews.get(id)
         return None if found is None else copy.deepcopy(found)
+
+    async def get_interview_by_call(self, call_id: str) -> Interview | None:
+        for i in self._interviews.values():
+            if i.vapi_call_id == call_id:
+                return copy.deepcopy(i)
+        return None
+
+    async def list_live_interviews(self) -> list[Interview]:
+        return [copy.deepcopy(i) for i in self._interviews.values() if i.status == "live"]
 
     async def update_interview(self, id: str, **changes: Any) -> None:
         _check_fields(changes)
@@ -291,9 +310,19 @@ class PostgresStore:
         row = await self._pool.fetchrow(
             f"select {_INTERVIEW_COLUMNS} from interviews where id = $1", id
         )
-        if row is None:
-            return None
-        return Interview(**{**row, "questions": json.loads(row["questions"])})
+        return None if row is None else _interview(row)
+
+    async def get_interview_by_call(self, call_id: str) -> Interview | None:
+        row = await self._pool.fetchrow(
+            f"select {_INTERVIEW_COLUMNS} from interviews where vapi_call_id = $1", call_id
+        )
+        return None if row is None else _interview(row)
+
+    async def list_live_interviews(self) -> list[Interview]:
+        rows = await self._pool.fetch(
+            f"select {_INTERVIEW_COLUMNS} from interviews where status = 'live'"
+        )
+        return [_interview(row) for row in rows]
 
     async def update_interview(self, id: str, **changes: Any) -> None:
         _check_fields(changes)
@@ -427,6 +456,10 @@ class PostgresStore:
             " returning 1) select count(*) from gone",
             cutoff,
         )
+
+
+def _interview(row: asyncpg.Record) -> Interview:
+    return Interview(**{**row, "questions": json.loads(row["questions"])})
 
 
 def _score_rows(report: dict) -> list[tuple]:

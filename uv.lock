@@ -453,6 +453,7 @@ dependencies = [
     { name = "httpx" },
     { name = "pydantic-settings" },
     { name = "pyyaml" },
+    { name = "starlette" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "websockets" },
 ]
@@ -474,8 +475,9 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "pydantic-settings", specifier = ">=2.5" },
     { name = "pyyaml", specifier = ">=6" },
+    { name = "starlette", specifier = ">=1.7" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
-    { name = "websockets", specifier = ">=13" },
+    { name = "websockets", specifier = ">=14" },
 ]
 
 [package.metadata.requires-dev]
