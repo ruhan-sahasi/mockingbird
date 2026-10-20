@@ -10,8 +10,10 @@ A reply counts only once it is spoken. Vapi sends several requests while the can
 talking and speaks only the reply to the last one, so a request is not a turn. Each `draft()`
 works on a copy of the plan and changes nothing real. `commit_spoken()` makes the pending draft
 real when Vapi says it started speaking it, and the next `draft()` (or `finalize()` at the end
-of the call) writes it into the history, using the words Vapi says it actually spoke. A draft
-that is never spoken leaves no trace.
+of the call) writes it into the history, using the words Vapi says it actually spoke. A reply
+that is never spoken leaves no trace. The candidate's words are another matter: when the call
+ends before the interviewer replies to their newest answer, `finalize()` still records that
+answer, so it is graded with the rest.
 
 The history is append-only and always settles into a shape the Claude API accepts: it starts with
 a user message, and every system message sits right after a user message and right before an
@@ -220,6 +222,10 @@ class Brain:
         # then sits in `_committed` until the next draft() or finalize() writes it down.
         self._pending: _Draft | None = None
         self._committed: _Draft | None = None
+        # The newest draft whose answer no turn holds yet, cancelled or not. Vapi's requests carry
+        # the whole answer so far, so the newest one has all of it that Vapi heard. finalize()
+        # records it when the call ends before the interviewer replied to it.
+        self._unanswered: _Draft | None = None
 
     @property
     def history(self) -> list[dict]:
@@ -265,8 +271,10 @@ class Brain:
 
         # 1. A reply that was spoken is final now: Vapi's next request says how much of it.
         self._finalize_committed(spoken_assistant_text)
-        # 2. A reply that was never spoken is gone. Nothing was recorded for it.
+        # 2. A reply that was never spoken is gone. Nothing was recorded for it, and the answer it
+        #    replied to is in this request too, with whatever the candidate has said since.
         self._pending = None
+        self._unanswered = None
         # 3. The new draft's move comes from a copy of the plan, so the real plan stays put.
         plan = copy.deepcopy(self._plan)
         answering_idx = plan.current_question_idx  # read before next_move, which may advance it
@@ -284,6 +292,7 @@ class Brain:
             instruction=None if move.kind is MoveKind.WRAP_UP else _instruction(move),
         )
         self._pending = draft
+        self._unanswered = draft
         try:
             if draft.instruction is None:
                 draft.chunks.append(WRAP_UP_LINE)
@@ -358,15 +367,28 @@ class Brain:
         if draft is None:
             return False
         self._pending = None
+        self._unanswered = None  # the pending draft is the newest one, and its answer is a turn now
         self._plan = draft.plan
         self._committed = draft
         self._add_turn("candidate", draft.candidate_text, draft.answering_idx)
         return True
 
     def finalize(self) -> None:
-        """The call is over. Write down the last spoken reply and drop any unspoken draft."""
+        """The call is over. Write down the last spoken reply, then the candidate's newest answer
+        if the interviewer never replied to it, and drop any unspoken draft.
+
+        That answer is the newest request's text, even when its reply was cancelled: the End
+        button, the time cap or a dropped connection can end the call while the candidate is
+        still answering or the reply is still being written. It is recorded only as the
+        candidate's turn. The history is left alone and the plan does not move, since nothing
+        more will be said. A blank answer adds nothing.
+        """
         self._finalize_committed(None)
+        answer = self._unanswered
         self._pending = None
+        self._unanswered = None
+        if answer is not None and answer.candidate_text.strip():
+            self._add_turn("candidate", answer.candidate_text, answer.answering_idx)
 
     def _finalize_committed(self, spoken_assistant_text: str | None) -> None:
         """Write the committed draft into the history and the turns, if there is one.

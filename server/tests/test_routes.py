@@ -651,6 +651,38 @@ def test_speech_started_event_commits_draft(client, app, fakes):
     ]
 
 
+@pytest.mark.parametrize("reply", ["written", "still_streaming"])
+def test_an_answer_the_call_ends_on_is_saved_and_graded(client, app, fakes, reply):
+    # The visitor answers and presses End before the interviewer replies: Vapi has asked the
+    # brain for a reply, and never started speaking it. The answer must still be graded.
+    if reply == "still_streaming":
+        fakes.streamer.scripts = [["Tell me", HANG]]
+    body = start(client)
+    interview_id = body["interview_id"]
+    answer = f"{FakeGrader.QUOTE} and walked the team through it."
+
+    with client.websocket_connect(body["ws_path"]) as ws:
+        client.portal.call(fakes.vapi_socket.wait_reading)
+        if reply == "written":
+            assert said(ask(client, answer)) == DEFAULT_LINE
+        else:
+            thread, _ = in_background(lambda: ask(client, answer))
+            assert fakes.streamer.hanging.get(timeout=2) == 1
+        hang_up(app, ws, interview_id)
+    if reply == "still_streaming":
+        thread.join(2)
+        assert fakes.streamer.cancelled == 1
+
+    turns = client.portal.call(fakes.store.list_turns, interview_id)
+    assert [(t.speaker, t.text, t.question_idx) for t in turns][1:] == [("candidate", answer, 0)]
+    report_url = f"/api/interviews/{interview_id}/report"
+    wait_until(lambda: client.get(report_url).status_code == 200)
+    report = client.get(report_url).json()
+    assert report["status"] == "graded"
+    assert report["questions"][0]["items"][0]["quotes"] == [FakeGrader.QUOTE]
+    assert fakes.grader.calls == 1
+
+
 def test_assistant_stopped_after_committed_wrap_up_ends_call(client, app, fakes):
     body = start(client)
     interview_id = body["interview_id"]
