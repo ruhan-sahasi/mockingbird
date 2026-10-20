@@ -1,0 +1,24 @@
+name: keepalive
+
+# Supabase's free tier pauses a project that sits idle. Once a day, ask the deployed server to
+# check its database, which counts as activity. A failed run (server down, database paused) sends
+# GitHub's usual failure email.
+#
+# MB_URL is a repository variable (Settings > Secrets and variables > Actions > Variables) set to
+# the cloudfront_url output, with no trailing slash. Until it is set, the job is skipped.
+on:
+  schedule:
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  ping:
+    if: vars.MB_URL != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      MB_URL: ${{ vars.MB_URL }}
+    steps:
+      - run: curl -fsS "$MB_URL/healthz?db=1"
