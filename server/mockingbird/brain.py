@@ -91,8 +91,9 @@ Handling the unexpected
 If the candidate asks you to repeat or clarify the question, say it again in one short \
 sentence, in simpler words if that helps. If the candidate only says a short aside such as \
 sorry, go ahead, or give me a second, answer in a few words and then say the current question \
-again in one short sentence. If the transcript is garbled or empty, ask them to say that again \
-in one short sentence.
+again in one short sentence. If the transcript is garbled or empty, or the message is only \
+(inaudible), which the system writes when no words came through, ask them to say that again in \
+one short sentence.
 
 If the candidate asks how they are doing, or asks for feedback, tell them kindly that feedback \
 comes in the report after the call, and then return to the interview in the same line.
@@ -116,6 +117,10 @@ with at most one question, written as plain spoken words, and it gives no feedba
 """
 
 CONNECT_NOTE = "(The call has connected.)"
+# Sent to Claude in place of a blank transcript. The Messages API rejects an empty or
+# whitespace-only message, and the history is append-only, so a blank one would make every later
+# call fail. STABLE_SYSTEM tells Claude what to do when it sees this.
+NO_SPEECH_NOTE = "(inaudible)"
 CUT_OFF_TEXT = "(cut off)"  # stands in for a line that was cancelled before any text came out
 
 # What Claude is told for each kind of move. FOLLOW_UP depends on the plan's probe, so the key
@@ -223,8 +228,12 @@ class Brain:
             if move.kind is MoveKind.DONE:
                 return
 
+            # The turn keeps the candidate's text as it came in, blank or not, so a call where
+            # nothing was heard can still be told from one that was answered. Claude gets a
+            # note instead of a blank, which the Messages API would reject for good.
             self._add_turn("candidate", candidate_text, answering_idx)
-            self._history.append({"role": "user", "content": candidate_text})
+            heard = candidate_text if candidate_text.strip() else NO_SPEECH_NOTE
+            self._history.append({"role": "user", "content": heard})
 
             spoken: list[str] = []  # every chunk produced so far, including ones not yet delivered
             completed = False
@@ -248,12 +257,26 @@ class Brain:
                     )
                     failed = False
                     try:
-                        async for chunk in chunks:
+                        while True:
+                            # Only the wait for the next chunk is guarded. The `yield` below
+                            # is not, so an exception the consumer throws in is not mistaken
+                            # for a Claude failure and answered with a fallback line.
+                            try:
+                                chunk = await anext(chunks)
+                            except StopAsyncIteration:
+                                break
+                            except BrainError as exc:
+                                log.warning("Claude failed, speaking the fallback line: %s", exc)
+                                failed = True
+                                break
+                            except Exception:
+                                # A streamer should only raise BrainError. If one has a bug,
+                                # the turn still gets its fixed line and the call goes on.
+                                log.exception("Streamer broke, speaking the fallback line")
+                                failed = True
+                                break
                             spoken.append(chunk)
                             yield chunk
-                    except BrainError as exc:
-                        log.warning("Claude failed, speaking the fallback line: %s", exc)
-                        failed = True
                     finally:
                         await _close(chunks)
 

@@ -1,8 +1,10 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import anthropic
 import httpx
+import httpx2
 import pytest
 
 from mockingbird.brain import (
@@ -168,6 +170,34 @@ async def test_short_answer_gets_expand_and_long_answer_gets_weakest_part():
     )
 
 
+def words(n: int) -> str:
+    """n words that are each long, so the text is far over 25 characters even when n is small."""
+    return " ".join(["migration"] * n)
+
+
+@pytest.mark.parametrize(
+    ("answer", "probe"),
+    [
+        ("", "expand"),
+        ("a b c d e", "expand"),  # 5 words, 9 characters
+        (words(24), "expand"),  # 24 words but 239 characters: counting characters would say 25+
+        (words(25), "weakest_part"),  # exactly the threshold: the plan's check is a strict <
+        (words(26), "weakest_part"),
+        ("\n".join(["migration"] * 24), "expand"),  # newlines separate words like spaces do
+        ("  ".join(["migration"] * 24), "expand"),  # runs of spaces are not extra words
+    ],
+    ids=["empty", "five-short", "24-long", "25-long", "26-long", "24-newlines", "24-double-spaces"],
+)
+async def test_the_plan_gets_the_word_count_not_the_character_count(answer, probe):
+    streamer = FakeStreamer(["Go on."])
+    brain, _ = started(DEMO, streamer)
+    await say(brain, answer)
+    assert (
+        streamer.calls[0]["messages"][-1]["content"]
+        == (MOVE_INSTRUCTION[(MoveKind.FOLLOW_UP, probe)])
+    )
+
+
 async def test_ask_question_instruction_carries_the_question_text():
     streamer = FakeStreamer(["a"], ["b"], ["Thanks. Now, question number one."])
     brain, _ = started(FULL, streamer)
@@ -270,6 +300,71 @@ async def test_empty_completion_is_treated_as_a_failure():
     assert (await say(brain, "We shipped it."))[-1] == fallback  # whitespace only
     assert brain.history[-1]["content"].strip() == fallback
     assert_history_valid(brain.history)
+
+
+BLANKS = ["", "   ", "\n\t "]
+
+
+@pytest.mark.parametrize("blank", BLANKS, ids=["empty", "spaces", "whitespace-mix"])
+async def test_blank_candidate_text_never_puts_empty_content_in_the_history(blank):
+    streamer = FakeStreamer(["Sorry, could you say that again?"], ["What was the result?"])
+    brain, _ = started(DEMO, streamer)
+
+    assert await say(brain, blank) == ["Sorry, could you say that again?"]
+    assert_history_valid(brain.history)
+    first = streamer.calls[0]["messages"]
+    assert first[-2] == {"role": "user", "content": "(inaudible)"}
+    # No words came through, so the plan sees an answer of 0 words.
+    assert first[-1]["content"] == MOVE_INSTRUCTION[(MoveKind.FOLLOW_UP, "expand")]
+
+    # The interview carries on, and no later call carries an empty message either.
+    assert await say(brain, LONG_ANSWER) == ["What was the result?"]
+    assert_history_valid(brain.history)
+    for call in streamer.calls:
+        assert all(m["content"].strip() for m in call["messages"])
+
+    # The transcript keeps what the candidate side actually sent, so a silent call can still
+    # be told apart from an answered one.
+    assert brain.turns[1] == Turn(1, "candidate", blank, 0)
+
+
+async def test_blank_candidate_text_at_the_wrap_up_keeps_the_history_valid():
+    brain, clock = started(DEMO, FakeStreamer())
+    clock.advance(290)
+    assert await say(brain, "  ") == [WRAP_UP_LINE]
+    assert_history_valid(brain.history)
+    assert brain.history[-2] == {"role": "user", "content": "(inaudible)"}
+
+
+async def test_an_unexpected_streamer_exception_still_speaks_the_fallback():
+    # Whatever the streamer raises, the candidate hears the fixed line and the call goes on.
+    streamer = FakeStreamer(
+        ["So tell me", RuntimeError("bug in the streamer")], [ValueError("another")], ["Next."]
+    )
+    brain, _ = started(DEMO, streamer)
+    fallback = FALLBACK_LINE[MoveKind.FOLLOW_UP]
+
+    assert await say(brain, "I led the migration.") == ["So tell me", " " + fallback]
+    assert_history_valid(brain.history)
+    assert await say(brain, LONG_ANSWER) == [fallback]
+    assert_history_valid(brain.history)
+    assert not any(t.interrupted for t in brain.turns)
+    assert brain.history[-1] == {"role": "assistant", "content": fallback}
+
+
+async def test_an_exception_thrown_in_by_the_consumer_is_not_turned_into_a_fallback():
+    streamer = FakeStreamer(["Tell me", " more."])
+    brain, _ = started(DEMO, streamer)
+    chunks = brain.reply("I led the migration.")
+    assert await anext(chunks) == "Tell me"
+
+    with pytest.raises(ValueError, match="consumer failed"):
+        await chunks.athrow(ValueError("consumer failed"))
+
+    assert streamer.closed == 1
+    assert brain.history[-1] == {"role": "assistant", "content": "Tell me"}
+    assert_history_valid(brain.history)
+    assert brain.turns[-1].interrupted
 
 
 # --- wrap-up and done ---------------------------------------------------------
@@ -445,6 +540,9 @@ def test_stable_system_is_long_enough_to_cache_and_states_every_rule():
         assert rule in text
     for dash in ("—", "–"):  # em dash, en dash
         assert dash not in STABLE_SYSTEM
+    # The brain writes this where a blank transcript would have been, so the prompt must say
+    # what to do with it.
+    assert "(inaudible)" in STABLE_SYSTEM
 
 
 def test_fixed_lines_have_no_dashes_and_fallbacks_match_the_spec():
@@ -538,6 +636,9 @@ def _http_error(cls):
     return cls(request=request)
 
 
+# The three SDK error classes, raised by a fake stream. The real SDK only raises
+# APIStatusError mid-stream (from an `error` event); a stalled or dropped body comes out as the
+# HTTP library's own error, which the real-SDK tests below cover.
 @pytest.mark.parametrize(
     "error_class",
     [anthropic.APIStatusError, anthropic.APIConnectionError, anthropic.APITimeoutError],
@@ -559,6 +660,144 @@ async def test_anthropic_errors_become_brain_error(error_class, when):
     assert got == (["Tell"] if when == "mid_stream" else [])
     assert client.entered == 1
     assert client.exited == (1 if when == "mid_stream" else 0)  # never entered, so never exited
+
+
+def sse(event: str, data: dict) -> bytes:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
+
+
+def sse_start(text: str) -> list[bytes]:
+    """The events of a stream up to and including its first text chunk."""
+    message = {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-haiku-5-5",
+        "content": [],
+        "stop_reason": None,
+        "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+    return [
+        sse("message_start", {"type": "message_start", "message": message}),
+        sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+        ),
+        sse(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text},
+            },
+        ),
+    ]
+
+
+def sse_finish(stop_reason: str) -> list[bytes]:
+    return [
+        sse("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        sse(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": {"output_tokens": 2},
+            },
+        ),
+        sse("message_stop", {"type": "message_stop"}),
+    ]
+
+
+class Body(httpx2.AsyncByteStream):
+    """A response body that sends some bytes and then, if given an error, fails. That is what a
+    stalled or dropped connection looks like after the response headers have arrived."""
+
+    def __init__(self, parts: list[bytes], error: Exception | None = None) -> None:
+        self._parts = parts
+        self._error = error
+
+    async def __aiter__(self):
+        for part in self._parts:
+            yield part
+        if self._error is not None:
+            raise self._error
+
+
+def real_sdk_streamer(body: Body) -> tuple[AnthropicStreamer, list[httpx2.Request]]:
+    """An AnthropicStreamer on the real SDK, whose HTTP layer answers every request with
+    `body`. The SDK's own error handling is real: only the network is replaced."""
+    requests: list[httpx2.Request] = []
+
+    def answer(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, stream=body)
+
+    client = anthropic.AsyncAnthropic(
+        api_key="test-key",
+        max_retries=0,
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(answer)),
+    )
+    return AnthropicStreamer(client), requests
+
+
+async def test_real_sdk_streamer_sends_the_request_and_yields_the_text():
+    streamer, requests = real_sdk_streamer(Body(sse_start("Tell me") + sse_finish("end_turn")))
+    system = [{"type": "text", "text": "rules", "cache_control": {"type": "ephemeral"}}]
+    messages = [{"role": "user", "content": "hi"}]
+
+    assert [c async for c in streamer.stream(system=system, messages=messages)] == ["Tell me"]
+
+    body = json.loads(requests[0].content)
+    assert body["model"] == "claude-haiku-5-5"
+    assert body["max_tokens"] == 200
+    assert body["thinking"] == {"type": "disabled"}
+    assert body["output_config"] == {"effort": "low"}
+    assert body["stream"] is True
+    assert body["system"] == system
+    assert body["messages"] == messages
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx2.ReadTimeout("no bytes for 10 s"),
+        httpx2.RemoteProtocolError("peer closed the connection mid-body"),
+        httpx2.ReadError("connection reset"),
+    ],
+    ids=lambda error: type(error).__name__,
+)
+async def test_real_sdk_connection_failure_after_the_headers_becomes_brain_error(error):
+    # The SDK wraps errors only while it sends the request. Once the headers are in, a stalled
+    # or dropped body reaches the caller as the raw HTTP-library error, so the streamer has to
+    # map it. Without that mapping the brain never gets a BrainError and never speaks the
+    # fallback line (Review Focus 3).
+    streamer, _ = real_sdk_streamer(Body(sse_start("Tell me"), error))
+
+    got: list[str] = []
+    with pytest.raises(BrainError) as raised:
+        async for chunk in streamer.stream(system=[], messages=[]):
+            got.append(chunk)
+
+    assert got == ["Tell me"]
+    assert raised.value.__cause__ is error
+
+
+async def test_brain_speaks_the_fallback_when_the_real_sdk_connection_drops_mid_reply():
+    streamer, _ = real_sdk_streamer(
+        Body(sse_start("So tell me"), httpx2.ReadTimeout("no bytes for 10 s"))
+    )
+    brain, _ = started(DEMO, streamer)
+
+    out = await say(brain, "I led the migration.")
+
+    assert out == ["So tell me", " " + FALLBACK_LINE[MoveKind.FOLLOW_UP]]
+    assert_history_valid(brain.history)
 
 
 async def test_anthropic_refusal_becomes_brain_error():

@@ -4,6 +4,12 @@ The brain only knows the `ClaudeStreamer` protocol, so tests can drive it with a
 `AnthropicStreamer` is the real one. It turns every way the call can go wrong (an API error, a
 timeout, a dropped connection, a refusal) into a single `BrainError`, which the brain answers
 with a fixed line instead of dead air.
+
+The SDK only wraps errors that happen while it sends the request. Once the response headers are
+in, a read timeout or a dropped connection comes out of the stream as the HTTP library's own
+exception, not an `anthropic` one. So the streamer catches every `Exception` from the call, not
+just the SDK's error classes. `CancelledError` and `GeneratorExit` are not `Exception`s, so
+cancelling a reply or closing the stream early still works.
 """
 
 from collections.abc import AsyncIterator
@@ -53,11 +59,9 @@ class AnthropicStreamer:
                 async for text in stream.text_stream:
                     yield text
                 final = await stream.get_final_message()
-        except (
-            anthropic.APIStatusError,
-            anthropic.APIConnectionError,
-            anthropic.APITimeoutError,
-        ) as exc:
+        except Exception as exc:
+            # Opening the request, reading the stream and reading the final message all land
+            # here: an API error, a timeout, a dropped connection, or a malformed event.
             raise BrainError(f"Claude request failed: {type(exc).__name__}") from exc
         # Haiku 5.5 has no server-side refusal fallback, so a refusal reaches us as a normal
         # end of stream with this stop reason. Treat it like any other failure.
