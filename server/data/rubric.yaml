@@ -1,0 +1,54 @@
+# The rubric the grader scores every answer against: six items, each scored 1 to 4.
+# `asks` is the question the item answers. `scores` says what each score looks like in a
+# spoken answer. The grader reads these words, so keep them concrete and keep the four
+# descriptors of an item in the same voice.
+#
+# The item names and their order must match the `item` choices in report.py's ItemGrade.
+
+situation:
+  asks: "Did the candidate set the scene: what was going on, and where and when?"
+  scores:
+    1: "No situation given, or so vague the listener cannot picture it, such as 'at work'."
+    2: "A situation is named but thin, so the listener has to guess the team, the project or the stakes."
+    3: "A clear situation: what the project or team was and what was going on."
+    4: "A clear situation with the context that makes the rest make sense: the setting, the scale and what was at stake."
+
+task:
+  asks: "Did the candidate say what they were responsible for or trying to achieve?"
+  scores:
+    1: "No goal or responsibility is stated."
+    2: "A goal is implied, but it is the team's goal, or it is unclear which part was the candidate's."
+    3: "The goal or the candidate's responsibility is stated clearly."
+    4: "The goal and why it fell to the candidate are clear, along with the constraint or stakes that made it hard."
+
+action:
+  asks: "Did the candidate describe the steps they took?"
+  scores:
+    1: "No actions are described, or only 'we handled it'."
+    2: "The actions are generic, such as 'I worked hard' or 'I talked to people', with no detail on how."
+    3: "Several concrete steps in a sensible order, and it is clear which ones the candidate did."
+    4: "Concrete steps and the reasoning behind the key choices, including what the candidate weighed or turned down."
+
+result:
+  asks: "Did the candidate say what happened because of what they did?"
+  scores:
+    1: "No outcome is given, or the story stops before the end."
+    2: "An outcome is stated but vague, such as 'it went well'."
+    3: "A clear outcome that follows from the candidate's actions."
+    4: "A clear outcome backed by a number or a named effect, or by what the candidate learned or would change."
+
+specificity:
+  asks: "Is the answer made of concrete details, such as names, numbers, tools and dates, or of general claims?"
+  scores:
+    1: "General claims only, with no concrete detail."
+    2: "One or two concrete details inside an otherwise general answer."
+    3: "Mostly concrete: named tools, the roles of the people involved, rough numbers or time frames."
+    4: "Concrete throughout. The details could be checked, and none of it is filler."
+
+ownership:
+  asks: "Is it clear what the candidate personally did, as opposed to what the team did?"
+  scores:
+    1: "'We' all the way through, so the candidate's own part cannot be told."
+    2: "The candidate's part is mentioned but blurred, or credit and blame go to others."
+    3: "The candidate's own contributions are clear, and others are credited where fair."
+    4: "The candidate's decisions and mistakes are clearly their own, and others are credited for what they actually did."
