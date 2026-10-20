@@ -93,9 +93,11 @@ Evidence: `llm_request_paths.json` (`path`, `appended_to_model_url`,
   trusted.
 
 The user message is cumulative for the turn: it holds everything the user has
-said so far in that turn, not a delta. When a request ends with several user
-messages, joining the user messages after the last `assistant` message (Task 4's
-rule) gives the right text.
+said so far in that turn, not a delta. So the newest answer is the content of the
+last `user` message alone, which is what `parse_llm_request` takes (Amendment 1).
+An earlier draft of this document said to join every `user` message after the
+last `assistant` message; that was Task 4's original rule, and Amendment 1
+replaced it.
 
 Evidence: `llm_request_turn1.json`, `llm_request_n4.json`,
 `llm_request_after_interrupt.json`, `llm_request_n6.json`.
