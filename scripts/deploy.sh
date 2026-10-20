@@ -42,8 +42,23 @@ fi
 npm --prefix "$root/web" run build
 
 echo "==> Publishing the web app"
-aws s3 sync "$root/web/dist" "s3://$bucket" --delete --region "$region"
-aws cloudfront create-invalidation --distribution-id "$distribution_id" --paths "/*" >/dev/null
+dist="$root/web/dist"
+# The hashed files first, so the new page never names one that is not there yet. A file's name
+# changes whenever its content does, so a browser may keep it for a year without asking again.
+aws s3 sync "$dist/assets" "s3://$bucket/assets" --region "$region" \
+  --cache-control "public, max-age=31536000, immutable"
+# The page names the hashed files, so a browser must check it on every visit. Without a
+# Cache-Control header it would guess a freshness from the file's age and keep an old page,
+# which names files that the last step below deletes.
+aws s3 cp "$dist/index.html" "s3://$bucket/index.html" --region "$region" \
+  --cache-control "no-cache"
+invalidation="$(aws cloudfront create-invalidation --distribution-id "$distribution_id" \
+  --paths "/" "/index.html" --query Invalidation.Id --output text)"
+echo "==> Waiting for CloudFront to drop the old page"
+aws cloudfront wait invalidation-completed --distribution-id "$distribution_id" \
+  --id "$invalidation"
+# Only now does nothing serve a page that names the old hashed files, so they can go.
+aws s3 sync "$dist" "s3://$bucket" --delete --region "$region"
 
 echo "==> Done. ECS is replacing the task now, so the API is down for a minute or two."
 echo "    Check it with: curl -fsS '$site_url/healthz?db=1'"
