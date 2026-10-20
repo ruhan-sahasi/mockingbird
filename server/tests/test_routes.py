@@ -411,6 +411,50 @@ def test_an_owner_start_is_a_full_interview_with_three_questions(client, fakes, 
     assert len(set(interview.questions)) == 3
 
 
+# --- the time caps -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("owner", "cap_s", "minutes"), [(False, 120, 2), (True, 90, 1)], ids=["demo", "full"]
+)
+def test_the_cap_from_the_settings_reaches_the_relay_vapi_and_the_plan(
+    settings, fakes, monkeypatch, owner, cap_s, minutes
+):
+    # The three cost controls for one call: the relay ends it at the cap, Vapi's own limit is the
+    # backstop 30 s later, and the plan's clock wraps up before the cap. Each must follow
+    # DEMO_CAP_S or FULL_CAP_S, not the default 300 or 1200.
+    relays: list[float] = []
+
+    def recording_relay(*args, **kwargs):
+        relays.append(kwargs["cap_s"])
+        return Relay(*args, browser_timeout_s=30.0, **kwargs)
+
+    monkeypatch.setattr(routes_ws, "Relay", recording_relay)
+    capped = settings.model_copy(update={"demo_cap_s": 120, "full_cap_s": 90})
+    app = create_app(
+        capped,
+        store=fakes.store,
+        vapi=fakes.vapi,
+        streamer_factory=lambda: fakes.streamer,
+        grader=fakes.grader,
+    )
+    headers = {"X-Owner-Key": settings.owner_key} if owner else {}
+
+    with TestClient(app, base_url="https://testserver", headers={"origin": SITE}) as client:
+        body = start(client, **headers)
+        assert body["cap_s"] == cap_s
+        assert get(client, fakes.store, body["interview_id"]).cap_s == cap_s
+
+        with client.websocket_connect(body["ws_path"]) as ws:
+            client.portal.call(fakes.vapi_socket.wait_reading)
+            [assistant] = fakes.vapi.assistants
+            assert assistant["maxDurationSeconds"] == cap_s + 30
+            # The opening line states the plan's clock, which is the cap.
+            assert f"This is a {minutes} minute behavioral interview" in assistant["firstMessage"]
+            assert relays == [cap_s]
+            hang_up(app, ws, body["interview_id"])
+
+
 # --- WS /ws/interview/{id} ---------------------------------------------------------------------
 
 
