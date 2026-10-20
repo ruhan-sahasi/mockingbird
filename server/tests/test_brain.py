@@ -1436,6 +1436,28 @@ async def test_anthropic_errors_become_brain_error(error_class, when):
     assert client.exited == (1 if when == "mid_stream" else 0)  # never entered, so never exited
 
 
+async def test_an_api_error_becomes_a_brain_error_that_names_its_status_type_and_request():
+    # The first live run is where failures show up, so the log line has to say which: the HTTP
+    # status, the error type the API names and the request id. Its free text is left out.
+    response = httpx2.Response(
+        529,
+        headers={"request-id": "req_011CU123"},
+        request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages"),
+    )
+    body = {"type": "error", "error": {"type": "overloaded_error", "message": "free text here"}}
+    error = anthropic.APIStatusError("free text here", response=response, body=body)
+    client = FakeAnthropicClient(open_error=error)
+
+    with pytest.raises(BrainError) as raised:
+        async for _ in AnthropicStreamer(client).stream(system=[], messages=[]):
+            pass
+
+    message = str(raised.value)
+    assert message == (
+        "Claude request failed: APIStatusError (HTTP 529, overloaded_error, request req_011CU123)"
+    )
+
+
 def sse(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
 

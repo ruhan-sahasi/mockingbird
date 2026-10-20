@@ -308,6 +308,36 @@ async def test_browser_that_takes_nothing_cannot_hold_up_the_end(caplog):
     assert "could not close the browser socket: TimeoutError" in logged
 
 
+async def test_a_failed_end_call_is_logged_as_a_warning(caplog):
+    # The only sign a Vapi call may still be running, and billing, until its own limit. Under
+    # uvicorn an app logger's INFO lines are dropped, so this must be a WARNING to be seen.
+    caplog.set_level(logging.DEBUG, logger="mockingbird.relay")
+    relay, browser, vapi = make_relay(hang_up_timeout_s=0.1)
+    task = await start(relay)
+    vapi.dropped = True  # Vapi's connection is gone, and nothing has noticed yet
+
+    await asyncio.wait_for(relay.end("cap"), 1.0)
+
+    assert await finished(task) == "cap"
+    [failed] = [r for r in caplog.records if "end-call" in r.getMessage()]
+    assert failed.getMessage() == "could not send end-call to Vapi: SocketClosed"
+    assert failed.levelno == logging.WARNING
+
+
+async def test_a_browser_that_is_gone_at_the_end_is_logged_at_info(caplog):
+    # Routine: the browser closing is often why the call ended.
+    caplog.set_level(logging.DEBUG, logger="mockingbird.relay")
+    relay, browser, _ = make_relay(hang_up_timeout_s=0.1)
+    task = await start(relay)
+    browser.dropped = True
+
+    await asyncio.wait_for(relay.end("cap"), 1.0)
+
+    await finished(task)
+    [told] = [r for r in caplog.records if "tell the browser" in r.getMessage()]
+    assert told.levelno == logging.INFO
+
+
 @pytest.mark.parametrize("before", [[], [MIC_1, MIC_2]], ids=["from-the-start", "after-audio"])
 async def test_browser_going_quiet_ends_vapi_call(before):
     # Review Focus 1 when the network drops with no FIN or RST: no close ever reaches the relay,

@@ -590,6 +590,8 @@ def test_a_call_that_cannot_be_created_closes_the_socket_and_frees_the_visitor(
 
     interview = get(client, fakes.store, body["interview_id"])
     assert (interview.status, interview.ended_reason) == ("abandoned", "error")
+    # Vapi's reason is already scrubbed of secrets, and it is what a first deploy needs to see.
+    assert "failed: VapiError: Vapi returned 500: try again" in caplog.text
     # No call ran, so the visitor's demo for today is not spent.
     fakes.vapi.error = None
     assert client.post("/api/interviews").status_code == 201

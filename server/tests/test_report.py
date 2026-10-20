@@ -554,6 +554,25 @@ async def test_any_other_failure_saves_failed_status_and_logs_only_its_type(capl
     assert all(record.exc_info is None for record in caplog.records)
 
 
+async def test_an_api_failure_logs_its_status_type_and_request_but_not_its_text(caplog):
+    caplog.set_level(logging.DEBUG)
+    secret = "I led the migration for Acme"
+    response = httpx2.Response(
+        500,
+        headers={"request-id": "req_011CU456"},
+        request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages"),
+    )
+    body = {"type": "error", "error": {"type": "api_error", "message": secret}}
+    error = anthropic.InternalServerError(secret, response=response, body=body)
+    store = await stored_interview(TURNS)
+
+    await build_report(store, FakeGrader(error=error), INTERVIEW_ID)
+
+    assert await store.get_report(INTERVIEW_ID) == {"status": "grading_failed", "questions": []}
+    assert "InternalServerError (HTTP 500, api_error, request req_011CU456)" in caplog.text
+    assert secret not in caplog.text
+
+
 class StrictStore(MemoryStore):
     """A MemoryStore whose save_report refuses reports the way PostgresStore does."""
 

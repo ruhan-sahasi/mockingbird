@@ -22,7 +22,8 @@ A call that never went live (Vapi refused it, or its socket would not connect) i
 spent. The browser's socket is closed with 1011.
 
 The Vapi call id and its socket URL are credentials (ruling R19). They go to Vapi, the registry
-and the store, never to the browser, and the logs here name only exception types.
+and the store, never to the browser, and the logs here name only exception types, plus the
+details failures.py knows to be safe (Vapi's scrubbed reason for refusing a call).
 """
 
 import asyncio
@@ -34,6 +35,7 @@ from typing import Any
 import websockets
 from fastapi import APIRouter, WebSocket
 
+from mockingbird.failures import describe
 from mockingbird.models import Turn
 from mockingbird.relay import LiveEvent, OnEvent, Relay, StarletteSocket, WebsocketsSocket
 from mockingbird.report import build_report
@@ -124,8 +126,8 @@ async def _run_call(websocket: WebSocket, session: LiveSession) -> None:
         ending.live_since = time.monotonic()
         reason = await session.relay.run()
     except Exception as exc:
-        # The type only: a library's message can hold the socket URL, which holds the call id.
-        log.error("the call for interview %s failed: %s", interview.id, type(exc).__name__)
+        # Mostly the type: a library's message can hold the socket URL, which holds the call id.
+        log.error("the call for interview %s failed: %s", interview.id, describe(exc))
     finally:
         await _clean_up(websocket, session, reason=reason, ending=ending)
 

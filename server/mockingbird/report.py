@@ -36,6 +36,7 @@ import yaml
 from anthropic.types.beta.parsed_beta_message import ParsedBetaMessage
 from pydantic import BaseModel, Field, ValidationError
 
+from mockingbird.failures import describe
 from mockingbird.models import Turn
 from mockingbird.store import Store
 
@@ -289,7 +290,8 @@ async def build_report(store: Store, grader: TurnGrader, interview_id: str) -> N
     The interview is marked only once a report is saved, whichever kind it is: the report's own
     `status` says whether grading worked. Never raises, because it runs in the background and
     nobody is waiting to hear about it. What reaches the log is the type of an unexpected error,
-    never its message, since that could hold the candidate's words.
+    never its message, since that could hold the candidate's words. An API error also gives its
+    status, error type and request id (failures.py).
     """
     try:
         report = await _make_report(store, grader, interview_id)
@@ -297,7 +299,7 @@ async def build_report(store: Store, grader: TurnGrader, interview_id: str) -> N
         log.warning("Grading interview %s failed: %s", interview_id, exc)
         report = _empty_report("grading_failed")
     except Exception as exc:
-        log.error("Grading interview %s failed: %s", interview_id, type(exc).__name__)
+        log.error("Grading interview %s failed: %s", interview_id, describe(exc))
         report = _empty_report("grading_failed")
     try:
         await _save(store, interview_id, report)
