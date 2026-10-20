@@ -83,32 +83,49 @@ describe('FloatRing', () => {
   })
 
   it('matches a plain queue through many mixed writes and reads', () => {
-    const ring = new FloatRing(37)
+    const capacity = 37
+    const ring = new FloatRing(capacity)
     const model: number[] = []
     let s = 12345
+    // A seeded LCG. The low bit of a power-of-two LCG strictly alternates, so the draw uses the
+    // high bits (the fraction of the 32-bit range), which behave like a fair coin.
     const next = (max: number) => {
       s = (s * 1664525 + 1013904223) % 4294967296
-      return s % (max + 1)
+      return Math.floor((s / 4294967296) * (max + 1))
     }
     let counter = 1
+    let readTotal = 0 // the ring's head is always this modulo the capacity
+    const seen = { writes: 0, reads: 0, full: 0, empty: 0, truncated: 0, wrappedWrites: 0, wrappedReads: 0 }
     for (let step = 0; step < 2000; step++) {
       if (next(1) === 0) {
+        seen.writes++
         const chunk = new Float32Array(next(20))
         for (let i = 0; i < chunk.length; i++) chunk[i] = counter++
+        const start = (readTotal + model.length) % capacity
         const accepted = ring.write(chunk)
-        expect(accepted).toBe(Math.min(chunk.length, 37 - model.length))
+        expect(accepted).toBe(Math.min(chunk.length, capacity - model.length))
+        if (accepted < chunk.length) seen.truncated++
+        if (accepted > 0 && start + accepted > capacity) seen.wrappedWrites++
         model.push(...chunk.subarray(0, accepted))
         // Samples that were refused are gone for good, so the next ones continue the count.
       } else {
+        seen.reads++
         const out = new Float32Array(next(20))
+        const head = readTotal % capacity
         const got = ring.read(out)
         const expected = model.splice(0, out.length)
         expect(got).toBe(expected.length)
         expect(Array.from(out.subarray(0, got))).toEqual(expected)
         expect(Array.from(out.subarray(got))).toEqual(new Array(out.length - got).fill(0))
+        if (head + got > capacity) seen.wrappedReads++
+        readTotal += got
       }
       expect(ring.available).toBe(model.length)
+      if (model.length === capacity) seen.full++
+      if (model.length === 0) seen.empty++
     }
+    // A generator that never reads, never fills or never empties would make this test vacuous.
+    for (const [what, n] of Object.entries(seen)) expect(n, what).toBeGreaterThan(0)
   })
 
   it('rejects a capacity that is not a positive whole number', () => {
