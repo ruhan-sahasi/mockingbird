@@ -11,7 +11,10 @@ Two rules every store follows:
   it was created, because the record keeps no separate end time. One that crosses midnight is
   charged to the day it started.
 - `Interview.vapi_call_id` is a credential while a call is live. Nothing here logs it, and it is
-  left out of every error message.
+  left out of every error message. That takes work on Postgres: when a write breaks a rule, the
+  database quotes the whole failing row in its error, and an `interviews` row holds the call id.
+  So PostgresStore turns those errors into a ValueError that names the rule and nothing else, and
+  does not chain it to the driver's error, whose traceback would print the row.
 """
 
 import copy
@@ -19,11 +22,11 @@ import json
 from collections.abc import Callable
 from dataclasses import fields, replace
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, Protocol, get_args
 
 import asyncpg
 
-from mockingbird.models import Interview, Turn
+from mockingbird.models import Interview, Mode, Status, Turn
 
 Clock = Callable[[], datetime]
 
@@ -51,14 +54,17 @@ class Store(Protocol):
     """
 
     async def create_interview(self, i: Interview) -> None:
-        """Raises ValueError if the id is taken, or if `created_at` has no timezone."""
+        """Raises ValueError if the id is taken, if `created_at` has no timezone, or if a value
+        breaks a rule of the interviews table (an unknown mode or status, a missing hash). The
+        message names the rule, never the value."""
         ...
 
     async def get_interview(self, id: str) -> Interview | None: ...
 
     async def update_interview(self, id: str, **changes: Any) -> None:
-        """Change fields of an interview. Raises ValueError for a field it does not have, or for
-        `id`, which never changes."""
+        """Change fields of an interview. Raises ValueError for a field it does not have, for
+        `id`, which never changes, or for a value that breaks a rule of the interviews table, as
+        in create_interview."""
         ...
 
     async def add_turn(self, interview_id: str, t: Turn) -> None:
@@ -71,7 +77,10 @@ class Store(Protocol):
         ...
 
     async def save_report(self, interview_id: str, report: dict) -> None:
-        """Keep the report, replacing any earlier one."""
+        """Keep the report, replacing any earlier one. A repeated item is kept as it is: the
+        grader's output is not trusted to be free of repeats. Raises ValueError for a report whose
+        items lack a key or hold a value the scores and quotes tables cannot store, and then the
+        earlier report stays."""
         ...
 
     async def get_report(self, interview_id: str) -> dict | None: ...
@@ -102,6 +111,28 @@ def _utc_day(now: datetime) -> tuple[datetime, datetime]:
     return start, start + timedelta(days=1)
 
 
+def _check_values(values: dict[str, Any]) -> None:
+    """MemoryStore's version of the check constraints on `mode` and `status`, so that it refuses
+    what the database refuses. It names the field, not the value."""
+    for name, allowed in (("mode", get_args(Mode)), ("status", get_args(Status))):
+        if name in values and values[name] not in allowed:
+            raise ValueError(f"{name} must be one of {', '.join(allowed)}")
+
+
+def _refusal(subject: str, exc: asyncpg.PostgresError) -> ValueError:
+    """A ValueError saying that the database refused `subject`, and which rule it broke.
+
+    This is all it says. Postgres writes the whole failing row into the error text, and asyncpg
+    writes the offending value, so neither may reach a message that a caller will log: an
+    `interviews` row holds the Vapi call id. Raise it `from None` as well, so a traceback does not
+    print the driver's error as the cause.
+    """
+    rule = getattr(exc, "constraint_name", None) or getattr(exc, "column_name", None)
+    if rule:
+        return ValueError(f"{subject} was refused by the database: {rule}")
+    return ValueError(f"{subject} has a value the database cannot hold")
+
+
 def _check_new(i: Interview) -> None:
     # A time without a timezone could land on the wrong UTC day, so refuse it up front.
     if i.created_at.tzinfo is None:
@@ -127,6 +158,7 @@ class MemoryStore:
 
     async def create_interview(self, i: Interview) -> None:
         _check_new(i)
+        _check_values({"mode": i.mode, "status": i.status})
         if i.id in self._interviews:
             raise ValueError(f"interview {i.id} already exists")
         self._interviews[i.id] = copy.deepcopy(i)
@@ -141,6 +173,7 @@ class MemoryStore:
             return
         if id not in self._interviews:
             raise KeyError(id)
+        _check_values(changes)
         for name, value in changes.items():
             setattr(self._interviews[id], name, copy.deepcopy(value))
 
@@ -249,8 +282,10 @@ class PostgresStore:
                 i.ended_reason,
                 i.duration_s,
             )
-        except asyncpg.UniqueViolationError as exc:
-            raise ValueError(f"interview {i.id} already exists") from exc
+        except asyncpg.UniqueViolationError:
+            raise ValueError(f"interview {i.id} already exists") from None
+        except (asyncpg.IntegrityConstraintViolationError, asyncpg.DataError) as exc:
+            raise _refusal(f"interview {i.id}", exc) from None
 
     async def get_interview(self, id: str) -> Interview | None:
         row = await self._pool.fetchrow(
@@ -274,9 +309,12 @@ class PostgresStore:
             else:
                 assignments.append(f"{name} = ${n}")
                 values.append(value)
-        result = await self._pool.execute(
-            f"update interviews set {', '.join(assignments)} where id = $1", id, *values
-        )
+        try:
+            result = await self._pool.execute(
+                f"update interviews set {', '.join(assignments)} where id = $1", id, *values
+            )
+        except (asyncpg.IntegrityConstraintViolationError, asyncpg.DataError) as exc:
+            raise _refusal(f"update of interview {id}", exc) from None
         if result == "UPDATE 0":
             raise KeyError(id)
 
@@ -309,34 +347,41 @@ class PostgresStore:
 
     async def save_report(self, interview_id: str, report: dict) -> None:
         """Keep the report as jsonb, and copy its scores and quotes into their own tables. All
-        or nothing: a report that cannot be saved leaves the earlier one in place."""
+        or nothing: a report that cannot be saved leaves the earlier one in place.
+
+        The tables hold no uniqueness rule, because they are copies of the report and the report
+        can repeat an item. Whatever the grader returns that is shaped like a report is saved.
+        """
         score_rows = _score_rows(report)
-        async with self._pool.acquire() as conn, conn.transaction():
-            result = await conn.execute(
-                "update interviews set report = $2::jsonb where id = $1",
-                interview_id,
-                json.dumps(report),
-            )
-            if result == "UPDATE 0":
-                raise KeyError(interview_id)
-            # Deleting the scores deletes their quotes too (on delete cascade).
-            await conn.execute("delete from scores where interview_id = $1", interview_id)
-            for question_idx, item, score, rationale, status, quotes in score_rows:
-                score_id = await conn.fetchval(
-                    "insert into scores"
-                    " (interview_id, question_idx, item, score, rationale, status)"
-                    " values ($1, $2, $3, $4, $5, $6) returning id",
+        try:
+            async with self._pool.acquire() as conn, conn.transaction():
+                result = await conn.execute(
+                    "update interviews set report = $2::jsonb where id = $1",
                     interview_id,
-                    question_idx,
-                    item,
-                    score,
-                    rationale,
-                    status,
+                    json.dumps(report),
                 )
-                await conn.executemany(
-                    "insert into quotes (score_id, text, verified) values ($1, $2, $3)",
-                    [(score_id, text, verified) for text, verified in quotes],
-                )
+                if result == "UPDATE 0":
+                    raise KeyError(interview_id)
+                # Deleting the scores deletes their quotes too (on delete cascade).
+                await conn.execute("delete from scores where interview_id = $1", interview_id)
+                for question_idx, item, score, rationale, status, quotes in score_rows:
+                    score_id = await conn.fetchval(
+                        "insert into scores"
+                        " (interview_id, question_idx, item, score, rationale, status)"
+                        " values ($1, $2, $3, $4, $5, $6) returning id",
+                        interview_id,
+                        question_idx,
+                        item,
+                        score,
+                        rationale,
+                        status,
+                    )
+                    await conn.executemany(
+                        "insert into quotes (score_id, text, verified) values ($1, $2, $3)",
+                        [(score_id, text, verified) for text, verified in quotes],
+                    )
+        except (asyncpg.IntegrityConstraintViolationError, asyncpg.DataError) as exc:
+            raise _refusal(f"report for interview {interview_id}", exc) from None
 
     async def get_report(self, interview_id: str) -> dict | None:
         report = await self._pool.fetchval(

@@ -33,8 +33,9 @@ create table scores (
     item          text not null,
     score         integer,                  -- null when there was not enough evidence to score
     rationale     text not null,
-    status        text not null,
-    unique (interview_id, question_idx, item)
+    status        text not null
+    -- No unique (interview_id, question_idx, item): this table is a copy of the report, and the
+    -- grader can repeat an item. A rule here would stop a valid report from being saved at all.
 );
 
 create table quotes (

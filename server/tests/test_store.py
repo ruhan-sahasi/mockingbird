@@ -10,6 +10,7 @@ with a session-level SET, which a transaction pooler would not keep from one que
 
 import asyncio
 import os
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta, timezone
@@ -298,6 +299,30 @@ async def test_report_round_trip_and_replace(store):
     assert await store.get_report("i1") == replacement
 
 
+async def test_a_report_that_repeats_an_item_is_still_saved(store):
+    # Nothing stops the grader repeating an item, or a whole question. The report is the
+    # authoritative copy, so such a report must be kept as it is, never refused.
+    answer = {"item": "action", "rationale": "r", "quotes": ["q"], "status": "scored"}
+    repeated = {
+        "status": "graded",
+        "questions": [
+            {
+                "question_idx": 0,
+                "question_text": QUESTIONS[0],
+                "items": [dict(answer, score=1), dict(answer, score=2)],  # one item twice
+            },
+            {
+                "question_idx": 0,  # the same question again
+                "question_text": QUESTIONS[0],
+                "items": [dict(answer, score=3)],
+            },
+        ],
+    }
+    await store.create_interview(make_interview())
+    await store.save_report("i1", repeated)
+    assert await store.get_report("i1") == repeated
+
+
 async def test_get_report_for_an_unknown_interview_is_none(store):
     assert await store.get_report("nope") is None
 
@@ -457,6 +482,7 @@ def test_the_vapi_call_id_stays_out_of_an_interviews_repr():
 
 
 async def test_the_store_never_logs_the_vapi_call_id(store, caplog):
+    # The store has no logger today, so this only guards the day someone adds one.
     caplog.set_level("DEBUG")
     await store.create_interview(make_interview())
     await store.update_interview("i1", status="live", vapi_call_id=CALL_ID)
@@ -464,6 +490,97 @@ async def test_the_store_never_logs_the_vapi_call_id(store, caplog):
     await store.seconds_used_today()
     await store.delete_demo_data_older_than(7)
     assert CALL_ID not in caplog.text
+
+
+def assert_call_id_not_shown(exc: BaseException, caplog) -> None:
+    """The call id appears nowhere a caller could put a failure: not in its text, its repr, the
+    traceback a logger would write (which includes whatever it was chained to), or the log."""
+    shown = "".join(traceback.format_exception(exc))
+    for text in (str(exc), repr(exc), shown, caplog.text):
+        assert CALL_ID not in text
+
+
+# Writes the store must refuse, on a database where another interview already holds the id "ok"
+# with a live call. Postgres quotes the whole failing row in its error when a check constraint
+# fails, and that row holds the call id.
+REFUSED_WRITES = {
+    "create-unknown-status": (
+        lambda s: s.create_interview(
+            make_interview("new", status="exploded", vapi_call_id=CALL_ID)
+        ),
+        "status",
+    ),
+    "create-unknown-mode": (
+        lambda s: s.create_interview(make_interview("new", mode="trial", vapi_call_id=CALL_ID)),
+        "mode",
+    ),
+    "create-id-taken": (
+        lambda s: s.create_interview(make_interview("ok", vapi_call_id=CALL_ID)),
+        "already exists",
+    ),
+    "update-to-unknown-status": (lambda s: s.update_interview("ok", status="exploded"), "status"),
+    "update-to-unknown-mode": (lambda s: s.update_interview("ok", mode="trial"), "mode"),
+}
+
+
+@pytest.mark.parametrize("write, names", REFUSED_WRITES.values(), ids=REFUSED_WRITES.keys())
+async def test_a_refused_write_never_shows_the_vapi_call_id(store, caplog, write, names):
+    caplog.set_level("DEBUG")
+    live = make_interview("ok", status="live", vapi_call_id=CALL_ID)
+    await store.create_interview(live)
+
+    with pytest.raises(ValueError, match=names) as refused:
+        await write(store)
+
+    assert_call_id_not_shown(refused.value, caplog)
+    assert await store.get_interview("ok") == live  # and nothing changed
+
+
+class NotAString:
+    """Not text, so Postgres cannot take it. asyncpg's error for that quotes the value's repr."""
+
+    def __repr__(self) -> str:
+        return f"NotAString({CALL_ID})"
+
+
+# What only a real database can refuse: a column that must not be null, and a value of a type it
+# cannot hold. Each of these makes Postgres or asyncpg quote the row or the value in its error.
+DATABASE_REFUSED_WRITES = {
+    "create-null-visitor": (
+        lambda s: s.create_interview(
+            make_interview("new", visitor_hash=None, vapi_call_id=CALL_ID)
+        ),
+        "visitor_hash",
+    ),
+    "update-null-visitor": (lambda s: s.update_interview("ok", visitor_hash=None), "visitor_hash"),
+    "create-call-id-of-the-wrong-type": (
+        lambda s: s.create_interview(make_interview("new", vapi_call_id=NotAString())),
+        "cannot hold",
+    ),
+    "update-call-id-to-the-wrong-type": (
+        lambda s: s.update_interview("ok", vapi_call_id=NotAString()),
+        "cannot hold",
+    ),
+}
+
+
+@needs_postgres
+@pytest.mark.parametrize(
+    "write, names", DATABASE_REFUSED_WRITES.values(), ids=DATABASE_REFUSED_WRITES.keys()
+)
+async def test_a_write_the_database_refuses_never_shows_the_vapi_call_id(
+    pg_pool, clock, caplog, write, names
+):
+    caplog.set_level("DEBUG")
+    store = PostgresStore(pg_pool, clock=clock)
+    live = make_interview("ok", status="live", vapi_call_id=CALL_ID)
+    await store.create_interview(live)
+
+    with pytest.raises(ValueError, match=names) as refused:
+        await write(store)
+
+    assert_call_id_not_shown(refused.value, caplog)
+    assert await store.get_interview("ok") == live
 
 
 # --- pools and connections ---------------------------------------------------------------------
@@ -549,25 +666,59 @@ async def test_saving_a_report_again_replaces_its_scores_and_quotes(pg_pool, clo
 
 
 @needs_postgres
-async def test_a_report_that_fails_to_save_leaves_the_old_one_in_place(pg_pool, clock):
+async def test_a_repeated_item_becomes_a_row_for_each_copy(pg_pool, clock):
+    # scores and quotes are copies of the report, so they hold what it holds, repeats included.
+    store = PostgresStore(pg_pool, clock=clock)
+    await store.create_interview(make_interview())
+    item = {"item": "action", "rationale": "r", "status": "scored"}
+    await store.save_report(
+        "i1",
+        {
+            "status": "graded",
+            "questions": [
+                {
+                    "question_idx": 0,
+                    "items": [
+                        dict(item, score=1, quotes=["one"]),
+                        dict(item, score=2, quotes=["two", "three"]),
+                    ],
+                },
+                {"question_idx": 0, "items": [dict(item, score=3, quotes=[])]},
+            ],
+        },
+    )
+
+    rows = await pg_pool.fetch("select score, question_idx, item from scores order by score")
+    assert [tuple(r) for r in rows] == [(1, 0, "action"), (2, 0, "action"), (3, 0, "action")]
+    quotes = await pg_pool.fetch(
+        "select s.score, q.text from quotes q join scores s on s.id = q.score_id order by q.text"
+    )
+    assert [tuple(r) for r in quotes] == [(1, "one"), (2, "three"), (2, "two")]
+
+
+BAD_ITEM = {"item": "action", "score": 1, "rationale": "r", "quotes": [], "status": "scored"}
+UNSTORABLE_REPORTS = {
+    "score-is-not-a-number": dict(BAD_ITEM, score="high"),  # asyncpg refuses it
+    "rationale-is-null": dict(BAD_ITEM, rationale=None),  # a not null column refuses it
+    "no-rationale-key": {k: v for k, v in BAD_ITEM.items() if k != "rationale"},  # caught early
+}
+
+
+@needs_postgres
+@pytest.mark.parametrize("bad_item", UNSTORABLE_REPORTS.values(), ids=UNSTORABLE_REPORTS.keys())
+async def test_a_report_that_cannot_be_copied_into_the_tables_leaves_the_old_one_in_place(
+    pg_pool, clock, bad_item
+):
+    # A report is all or nothing. This also pins that the refusal is a ValueError, not a driver
+    # error, the same as every other refused write.
     store = PostgresStore(pg_pool, clock=clock)
     await store.create_interview(make_interview())
     await store.save_report("i1", REPORT)
 
-    twice = {
-        "status": "graded",
-        "questions": [
-            {
-                "question_idx": 0,
-                "items": [
-                    {"item": "action", "score": 1, "rationale": "a", "quotes": [], "status": "s"},
-                    {"item": "action", "score": 2, "rationale": "b", "quotes": [], "status": "s"},
-                ],
-            }
-        ],
-    }
-    with pytest.raises(asyncpg.UniqueViolationError):
-        await store.save_report("i1", twice)
+    with pytest.raises(ValueError, match="report"):
+        await store.save_report(
+            "i1", {"status": "graded", "questions": [{"question_idx": 0, "items": [bad_item]}]}
+        )
 
     assert await store.get_report("i1") == REPORT
     assert await pg_pool.fetchval("select count(*) from scores") == 3
@@ -594,12 +745,9 @@ async def test_deleting_old_demo_data_also_deletes_its_scores_and_quotes(pg_pool
 
 
 @needs_postgres
-async def test_the_database_refuses_values_the_models_do_not_allow(pg_pool, clock):
+async def test_the_database_refuses_a_turn_from_a_speaker_the_models_do_not_allow(pg_pool, clock):
+    # The interview tables' own check constraints are covered by test_a_refused_write_never_...
     store = PostgresStore(pg_pool, clock=clock)
-    with pytest.raises(asyncpg.CheckViolationError):
-        await store.create_interview(make_interview(status="exploded"))
-    with pytest.raises(asyncpg.CheckViolationError):
-        await store.create_interview(make_interview(mode="trial"))
     await store.create_interview(make_interview())
     with pytest.raises(asyncpg.CheckViolationError):
         await store.add_turn("i1", make_turn(0, speaker="narrator"))
