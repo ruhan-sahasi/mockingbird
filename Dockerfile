@@ -42,5 +42,7 @@ EXPOSE 8000
 
 # The entrypoint applies migrations when DATABASE_URL is set, then runs CMD.
 # --no-access-log: the access log would record the Vapi paths' secrets and the socket's token.
+# --timeout-keep-alive 310: must stay above the ALB idle timeout (300 s, infra/alb.tf), or uvicorn
+# closes a connection the ALB still means to reuse, and the next request through it gets a 502.
 ENTRYPOINT ["/app/scripts/entrypoint.sh"]
-CMD ["uv", "run", "uvicorn", "mockingbird.app:app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+CMD ["uv", "run", "uvicorn", "mockingbird.app:app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--timeout-keep-alive", "310"]

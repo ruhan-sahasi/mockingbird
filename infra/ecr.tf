@@ -4,6 +4,9 @@ resource "aws_ecr_repository" "app" {
   name                 = local.name
   image_tag_mutability = "MUTABLE"
 
+  # Without this, terraform destroy fails once images have been pushed.
+  force_delete = true
+
   image_scanning_configuration {
     scan_on_push = true
   }

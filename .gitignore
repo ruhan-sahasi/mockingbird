@@ -12,3 +12,6 @@ web/dist/
 infra/.terraform/
 *.tfstate*
 *.tfvars
+# Saved plans (terraform plan -out) can embed sensitive values too.
+*.tfplan
+infra/*.plan

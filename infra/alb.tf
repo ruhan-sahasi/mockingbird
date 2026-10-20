@@ -40,6 +40,8 @@ resource "aws_lb" "main" {
 
   # The default 60 s would drop an interview's WebSocket during a long pause. The relay also
   # pings the browser every 20 s, and the browser sends mic frames the whole time.
+  # Keep uvicorn's --timeout-keep-alive (310, in the Dockerfile) above this value, or uvicorn
+  # closes idle connections the ALB still reuses, and those requests fail with a 502.
   idle_timeout = 300
 
   drop_invalid_header_fields = true
