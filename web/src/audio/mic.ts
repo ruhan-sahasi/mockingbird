@@ -32,21 +32,30 @@ export async function startMic(onFrame: (pcm: Int16Array<ArrayBuffer>) => void):
     throw error
   }
 
-  const source = ctx.createMediaStreamSource(stream)
-  const node = new AudioWorkletNode(ctx, 'capture', {
-    numberOfInputs: 1,
-    numberOfOutputs: 1,
-    outputChannelCount: [1],
-    channelCount: 1,
-    channelCountMode: 'explicit',
-  })
-  // A posted frame always arrives on an ArrayBuffer of its own, never a shared one.
-  node.port.onmessage = (event: MessageEvent<Int16Array<ArrayBuffer>>) => onFrame(event.data)
-  // If the worklet throws, frames stop, and the server ends the call 2 s later. Say why here.
-  node.onprocessorerror = () => console.error('the mic worklet stopped with an error')
-  source.connect(node)
-  // The worklet writes nothing to its output. It is connected so the context keeps running it.
-  node.connect(ctx.destination)
+  let source: MediaStreamAudioSourceNode
+  let node: AudioWorkletNode
+  try {
+    source = ctx.createMediaStreamSource(stream)
+    node = new AudioWorkletNode(ctx, 'capture', {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+      channelCount: 1,
+      channelCountMode: 'explicit',
+    })
+    // A posted frame always arrives on an ArrayBuffer of its own, never a shared one.
+    node.port.onmessage = (event: MessageEvent<Int16Array<ArrayBuffer>>) => onFrame(event.data)
+    // If the worklet throws, frames stop, and the server ends the call 2 s later. Say why here.
+    node.onprocessorerror = () => console.error('the mic worklet stopped with an error')
+    source.connect(node)
+    // The worklet writes nothing to its output. It is connected so the context keeps running it.
+    node.connect(ctx.destination)
+  } catch (error) {
+    // Let go of the mic, or the browser shows it recording after the page has said it failed.
+    stopTracks()
+    void ctx.close()
+    throw error
+  }
 
   return {
     stop() {

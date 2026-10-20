@@ -18,16 +18,22 @@ export type Player = {
  */
 export async function createPlayer(onSpeaking?: (speaking: boolean) => void): Promise<Player> {
   const ctx = await openWorkletContext(playbackUrl)
-  const node = new AudioWorkletNode(ctx, 'playback', {
-    numberOfInputs: 0,
-    numberOfOutputs: 1,
-    outputChannelCount: [1],
-  })
-  node.port.onmessage = (event: MessageEvent<PlaybackEvent>) => {
-    if (event.data.type === 'speaking') onSpeaking?.(event.data.speaking)
+  let node: AudioWorkletNode
+  try {
+    node = new AudioWorkletNode(ctx, 'playback', {
+      numberOfInputs: 0,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+    })
+    node.port.onmessage = (event: MessageEvent<PlaybackEvent>) => {
+      if (event.data.type === 'speaking') onSpeaking?.(event.data.speaking)
+    }
+    node.onprocessorerror = () => console.error('the playback worklet stopped with an error')
+    node.connect(ctx.destination)
+  } catch (error) {
+    void ctx.close() // a context left open keeps the audio device busy
+    throw error
   }
-  node.onprocessorerror = () => console.error('the playback worklet stopped with an error')
-  node.connect(ctx.destination)
 
   const send = (command: PlaybackCommand) => node.port.postMessage(command)
   return {
