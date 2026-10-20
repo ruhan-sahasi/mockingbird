@@ -298,7 +298,11 @@ def test_system_prompt_states_the_grading_rules():
 
 
 async def test_grader_raises_grading_error_on_a_refusal():
-    client = FakeBetaClient(SimpleNamespace(stop_reason="refusal", parsed_output=None))
+    # The refusal comes with a result that parses. Only the stop reason says it is a refusal, so
+    # this fails if the stop reason is not checked. A missing result would not prove that, since
+    # an empty reply raises GradingError anyway.
+    partial = grade_result_for(question_with(0, ["I led the migration"]))
+    client = FakeBetaClient(SimpleNamespace(stop_reason="refusal", parsed_output=partial))
 
     with pytest.raises(GradingError):
         await Grader(client, load_rubric()).grade(TURNS, QUESTIONS)
@@ -366,7 +370,10 @@ async def test_real_sdk_sends_fallback_beta_and_schema_and_parses_the_reply():
 
 
 async def test_real_sdk_refusal_becomes_grading_error():
-    grader, _ = real_sdk_grader(message_reply(stop_reason="refusal"))
+    # A refusal whose text is a complete, valid grade. The SDK parses it, so only the stop reason
+    # separates it from a real grade.
+    graded = grade_result_for(question_with(0, ["I led the migration"]))
+    grader, _ = real_sdk_grader(message_reply(text=graded.model_dump_json(), stop_reason="refusal"))
 
     with pytest.raises(GradingError):
         await grader.grade(TURNS, QUESTIONS)
