@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars (gitignored) and fill in. The repo is public, so the real file never
+# gets committed.
+
+alert_email = "you@example.com"
+
+# Optional; these are the defaults.
+# region             = "us-east-1"
+# monthly_budget_usd = 50
