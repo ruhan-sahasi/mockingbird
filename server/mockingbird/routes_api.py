@@ -61,8 +61,10 @@ async def start_interview(request: Request) -> JSONResponse:
         questions=[q.text for q in questions],
         created_at=datetime.now(UTC),
     )
-    # The check and the create go together, so two requests at once from one visitor cannot
-    # both pass the check before either one is counted.
+    # The check and the create go together, so two requests at once cannot both pass the check
+    # before either one is counted: not two from one visitor, and not two from different
+    # visitors when one demo's worth of budget is left. A created demo holds its cap in the
+    # budget until its call ends or it is abandoned (Store.seconds_used_today).
     async with state.start_lock:
         if not owner:
             verdict = await check_can_start(
@@ -98,18 +100,19 @@ async def start_interview(request: Request) -> JSONResponse:
 
 @router.get("/api/interviews/{interview_id}/report")
 async def get_report(interview_id: str, request: Request) -> JSONResponse:
-    """200 with the report once one is saved, whatever its status; 202 while it is on its way;
-    404 when there is no such interview, or it never ran a call, so no report will come.
+    """200 with the report once one is saved, whatever its status; 202 while it is on its way,
+    which is once the interview has ended; 404 otherwise: no such interview, one that never ran
+    a call, or one still live.
 
-    A live interview counts as on its way. The relay tells the browser the call ended before the
-    route has marked the interview ended, and the report page may ask in between.
+    The browser asks as soon as it hears the call ended, and the interview is marked ended
+    before it hears that (routes_ws.py), so that first ask already gets 202.
     """
     store = request.app.state.store
     report = await store.get_report(interview_id)
     if report is not None:
         return JSONResponse(report)
     interview = await store.get_interview(interview_id)
-    if interview is not None and interview.status in ("live", "ended"):
+    if interview is not None and interview.status == "ended":
         return JSONResponse({"status": "grading"}, status_code=202)
     raise HTTPException(status_code=404)
 

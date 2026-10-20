@@ -14,9 +14,13 @@ session's repr, and nothing here logs either of them.
 `sweep_once` runs every minute from `run_sweeper`:
 - a session whose token ran out unused is removed, and its interview marked `abandoned`, which
   gives the visitor their demo back (abandoned interviews do not count as starts);
-- an interview the store still has as `live` well past its cap is marked ended with the reason
-  "stale" (ruling R23). That is a call this process lost track of, most likely in a crash, and
-  until it is ended the daily budget keeps counting its full cap.
+- any interview the store still has as `live` well past its cap is marked ended with the reason
+  "stale" and its cap as its duration (ruling R23). That is mostly a call this process lost
+  track of in a crash, and until it is ended the daily budget keeps counting its full cap. It
+  can also be a call this process is still running: one whose socket opened near the end of
+  its token's minute goes live a little over a minute after it was created, so its last few
+  seconds can pass the stale line. That call's route marks it ended again when it does end,
+  with the real reason and duration, so the stale mark only stands for a call nobody ends.
 `run_sweeper` also deletes demo data older than RETENTION_DAYS, once an hour.
 """
 
@@ -35,8 +39,8 @@ from mockingbird.store import Store
 log = logging.getLogger(__name__)
 
 TOKEN_TTL_S = 60.0  # how long the socket token from POST /api/interviews stays good
-# A live interview older than its cap plus this is stale. The relay ends every call at its cap,
-# so a call still live this long after it was created is one nobody is running.
+# A live interview older than its cap plus this is stale (ruling R23). The relay ends every call
+# at its cap, and a call goes live at most about TOKEN_TTL_S after it was created.
 STALE_AFTER_CAP_S = 60
 SWEEP_EVERY_S = 60.0
 PURGE_EVERY_S = 3600.0
@@ -120,16 +124,17 @@ async def sweep_once(registry: SessionRegistry, store: Store, now: float) -> Non
             )
 
     for i in await store.list_live_interviews():
-        # A session in the registry is a call this process is running. Its route ends it.
-        if registry.by_interview(i.id) is not None:
-            continue
         if i.created_at.timestamp() + i.cap_s + STALE_AFTER_CAP_S < now:
-            await _attempt(
-                "end a stale interview",
-                store.update_interview(
-                    i.id, status="ended", ended_reason="stale", duration_s=i.cap_s
-                ),
-            )
+            await _attempt("end a stale interview", _end_stale(store, i))
+
+
+async def _end_stale(store: Store, i: Interview) -> None:
+    # Read again first: its route may have ended it since the list was read, and its reason and
+    # duration are the real ones.
+    current = await store.get_interview(i.id)
+    if current is None or current.status != "live":
+        return
+    await store.update_interview(i.id, status="ended", ended_reason="stale", duration_s=i.cap_s)
 
 
 async def run_sweeper(
@@ -139,9 +144,11 @@ async def run_sweeper(
     clock: Callable[[], float] = time.time,
     every_s: float = SWEEP_EVERY_S,
     purge_every_s: float = PURGE_EVERY_S,
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
 ) -> None:
     """Sweep every `every_s`, and delete old demo data at start and then every `purge_every_s`.
-    Runs until cancelled. A failure is logged and the loop goes on."""
+    Runs until cancelled. A failure is logged and the loop goes on. `clock` and `sleep` are
+    there for tests."""
     last_purge: float | None = None
     while True:
         now = clock()
@@ -149,7 +156,7 @@ async def run_sweeper(
         if last_purge is None or now - last_purge >= purge_every_s:
             last_purge = now
             await _attempt("delete old demo data", _purge(store))
-        await asyncio.sleep(every_s)
+        await sleep(every_s)
 
 
 async def _purge(store: Store) -> None:

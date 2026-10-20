@@ -46,6 +46,7 @@ def create_app(
         async with AsyncExitStack() as built:
             await _build_missing(state, settings, built)
             sweeper = asyncio.create_task(run_sweeper(state.registry, state.store))
+            state.sweeper = sweeper
             try:
                 yield
             finally:

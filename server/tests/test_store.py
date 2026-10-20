@@ -342,32 +342,35 @@ async def test_seconds_used_today_is_zero_for_an_empty_store(store):
     assert await store.seconds_used_today() == 0
 
 
-async def test_seconds_used_today_counts_live_at_cap_and_ended_at_duration(store):
+async def test_seconds_used_today_counts_live_and_created_at_cap_and_ended_at_duration(store):
     demos = [
-        ("live-demo", "live", None),  # counts its cap_s: 300
-        ("ended-demo", "ended", 95),
-        ("graded-demo", "graded", 40),  # grading does not give the seconds back
-        ("ended-without-duration", "ended", None),  # counts nothing
-        ("created-demo", "created", None),  # not started yet
-        ("abandoned-demo", "abandoned", 77),
+        ("live-demo", "live", None, 300),  # counts its cap_s
+        ("created-demo", "created", None, 250),  # its call is about to start: counts its cap_s
+        ("ended-demo", "ended", 95, 300),
+        ("graded-demo", "graded", 40, 300),  # grading does not give the seconds back
+        ("ended-without-duration", "ended", None, 300),  # counts nothing
+        ("abandoned-demo", "abandoned", 77, 300),  # gives its place back
     ]
-    for id, status, duration_s in demos:
-        await store.create_interview(make_interview(id, status=status, duration_s=duration_s))
+    for id, status, duration_s, cap_s in demos:
+        await store.create_interview(
+            make_interview(id, status=status, duration_s=duration_s, cap_s=cap_s)
+        )
     # Full mode has its own cap and is never limited.
     await store.create_interview(
         make_interview("full-live", mode="full", status="live", cap_s=1200)
     )
+    await store.create_interview(make_interview("full-created", mode="full", cap_s=1200))
     await store.create_interview(
         make_interview("full-ended", mode="full", status="ended", duration_s=500)
     )
-    # Ended on an earlier day: not today's.
+    # Ended, or left created, on an earlier day: not today's.
+    yesterday = NOW - timedelta(days=1)
     await store.create_interview(
-        make_interview(
-            "ended-yesterday", status="ended", duration_s=111, created_at=NOW - timedelta(days=1)
-        )
+        make_interview("ended-yesterday", status="ended", duration_s=111, created_at=yesterday)
     )
+    await store.create_interview(make_interview("created-yesterday", created_at=yesterday))
 
-    assert await store.seconds_used_today() == 300 + 95 + 40
+    assert await store.seconds_used_today() == 300 + 250 + 95 + 40
 
 
 async def test_a_live_demo_counts_at_its_own_cap(store):

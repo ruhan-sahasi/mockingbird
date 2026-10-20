@@ -27,6 +27,7 @@ import pytest
 import websockets
 import yaml
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketState
 from websockets.exceptions import ConnectionClosedOK
 
 from mockingbird import routes_vapi, routes_ws
@@ -37,7 +38,7 @@ from mockingbird.plan import DEMO, InterviewPlan, Question
 from mockingbird.relay import Relay
 from mockingbird.report import GradeResult, ItemGrade, QuestionGrade
 from mockingbird.routes_api import QUESTIONS_PATH
-from mockingbird.sessions import LiveSession, SessionRegistry, sweep_once
+from mockingbird.sessions import LiveSession, SessionRegistry, run_sweeper, sweep_once
 from mockingbird.sse import SSE_DONE
 from mockingbird.store import MemoryStore
 from mockingbird.vapi_client import VapiCall, VapiError
@@ -110,12 +111,15 @@ class FakeVapi:
 
 
 class FakeVapiConnection:
-    """Stands in for the `websockets` connection to Vapi's audio socket."""
+    """Stands in for the `websockets` connection to Vapi's audio socket. An exception put into
+    `incoming` is raised from `recv()`, like a bug in the library. `close_delay` makes closing
+    take that long, like a slow closing handshake."""
 
     def __init__(self) -> None:
-        self.incoming: asyncio.Queue[bytes | str | None] = asyncio.Queue()
+        self.incoming: asyncio.Queue[bytes | str | BaseException | None] = asyncio.Queue()
         self.sent: list[bytes | str] = []
         self.closed = False
+        self.close_delay = 0.0
         self.transport = SimpleNamespace(abort=lambda: None)
         self._reading = asyncio.Event()
 
@@ -125,6 +129,8 @@ class FakeVapiConnection:
         item = await self.incoming.get()
         if item is None:
             raise ConnectionClosedOK(None, None)
+        if isinstance(item, BaseException):
+            raise item
         return item
 
     async def send(self, message: bytes | str) -> None:
@@ -133,6 +139,8 @@ class FakeVapiConnection:
         self.sent.append(message)
 
     async def close(self, code: int = 1000) -> None:
+        if self.close_delay:
+            await asyncio.sleep(self.close_delay)
         if not self.closed:
             self.closed = True
             self.incoming.put_nowait(None)
@@ -303,12 +311,12 @@ def assert_history_valid(history: list[dict]) -> None:
             assert history[i + 1]["role"] == "assistant"
 
 
-def make_interview_record(id: str) -> Interview:
+def make_interview_record(id: str, status: str = "live") -> Interview:
     """An interview put straight into a store or a session, for tests below the routes."""
     return Interview(
         id=id,
         mode="demo",
-        status="live",
+        status=status,
         visitor_hash="v",
         ip_hash="ip",
         cap_s=300,
@@ -317,11 +325,35 @@ def make_interview_record(id: str) -> Interview:
     )
 
 
-def make_session(interview: Interview) -> LiveSession:
-    """A session whose token was used, for a sweeper or brain-route test with no socket."""
+def make_session(interview: Interview, streamer: FakeStreamer | None = None) -> LiveSession:
+    """A session whose token was used, for a test below the routes."""
     plan = InterviewPlan(DEMO, [Question("q0", "Tell me about a time.", "ownership")])
-    brain = Brain(plan, FakeStreamer(), time.monotonic)
+    brain = Brain(plan, streamer or FakeStreamer(), time.monotonic)
     return LiveSession(interview, brain, token="", token_expires_at=0.0)
+
+
+class FakeBrowserSocket:
+    """Just enough of a Starlette WebSocket, already accepted, to run a call's route straight
+    from a test: what StarletteSocket uses, and the app. The browser sends nothing."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+        self.client_state = WebSocketState.CONNECTED
+        self.sent: list[dict] = []
+        self.closed_with: int | None = None
+
+    async def receive(self) -> dict:
+        await asyncio.Event().wait()  # never set
+        raise AssertionError("unreachable")
+
+    async def send(self, message: dict) -> None:
+        self.sent.append(message)
+
+    async def close(self, code: int = 1000) -> None:
+        self.closed_with = code
+
+    def text_sent(self) -> list[dict]:
+        return [json.loads(m["text"]) for m in self.sent if m.get("text") is not None]
 
 
 async def collect(events) -> list[str]:
@@ -385,10 +417,8 @@ def test_ws_runs_the_call_and_cleans_up_after_it(client, app, fakes):
         assert assistant["firstMessage"].endswith(live.questions[0])
         assert fakes.connects == [(SOCKET_URL, {"close_timeout": 2.0})]
 
-        # The relay tells the browser the call ended a moment before the route marks it ended,
-        # and the report page may ask in that moment. It must hear "on its way", not 404.
-        report = client.get(f"/api/interviews/{interview_id}/report")
-        assert (report.status_code, report.json()) == (202, {"status": "grading"})
+        # A live interview has no report on its way yet: only an ended one does.
+        assert client.get(f"/api/interviews/{interview_id}/report").status_code == 404
 
         # Audio goes through both ways.
         ws.send_bytes(MIC)
@@ -418,6 +448,32 @@ def test_ws_runs_the_call_and_cleans_up_after_it(client, app, fakes):
 
     # Vapi asking the brain about the call now gets the fixed line (Review Focus 2).
     assert said(ask(client, "Are you still there?")) == ENDED_LINE
+
+
+def test_the_interview_is_ended_before_the_browser_hears_the_call_ended(client, app, fakes):
+    # The browser asks for the report as soon as it hears the call ended, and only an ended
+    # interview has one on its way. A slow close of Vapi's socket holds the rest of the clean-up
+    # back, so the ask lands before it.
+    fakes.vapi_socket.close_delay = 0.8
+    body = start(client)
+    interview_id = body["interview_id"]
+
+    with client.websocket_connect(body["ws_path"]) as ws:
+        client.portal.call(fakes.vapi_socket.wait_reading)
+
+        ws.send_json({"type": "end"})
+        assert ws.receive_json() == {"type": "ended", "reason": "browser_closed"}
+        report = client.get(f"/api/interviews/{interview_id}/report")
+        assert app.state.registry.by_interview(interview_id) is not None  # clean-up still to come
+
+        assert (report.status_code, report.json()) == (202, {"status": "grading"})
+        ended = get(client, fakes.store, interview_id)
+        assert (ended.status, ended.ended_reason, ended.duration_s) == (
+            "ended",
+            "browser_closed",
+            0,
+        )
+        wait_cleaned_up(app, interview_id)
 
 
 def test_ws_token_reuse_closes_4401(client, app, fakes):
@@ -493,6 +549,74 @@ def test_a_failed_connect_to_vapi_logs_no_url(client, app, fakes, monkeypatch, c
     assert get(client, fakes.store, body["interview_id"]).status == "abandoned"
     assert SOCKET_URL not in caplog.text
     assert CALL_ID not in caplog.text
+
+
+def test_a_relay_that_fails_mid_call_still_ends_saves_and_grades_the_interview(
+    client, app, fakes, caplog
+):
+    # run() raises an ExceptionGroup when one of its tasks fails. The interview must still end,
+    # keep its turns and get its report.
+    caplog.set_level(logging.DEBUG)
+    body = start(client)
+    interview_id = body["interview_id"]
+    answer = "I wrote the migration plan and walked the team through it."
+
+    with client.websocket_connect(body["ws_path"]) as ws:
+        client.portal.call(fakes.vapi_socket.wait_reading)
+        said(ask(client, answer))
+        client.portal.call(fakes.vapi_socket.deliver, ASSISTANT_STARTED)
+
+        client.portal.call(fakes.vapi_socket.push, RuntimeError("a bug in the socket library"))
+
+        assert ws.receive_json() == {"type": "ended", "reason": "error"}
+        wait_cleaned_up(app, interview_id)
+
+    assert "failed: ExceptionGroup" in caplog.text
+    assert fakes.vapi_socket.text_sent()[-1] == {"type": "end-call"}
+    ended = get(client, fakes.store, interview_id)
+    assert ended.status in ("ended", "graded")
+    assert ended.ended_reason == "error"
+    turns = client.portal.call(fakes.store.list_turns, interview_id)
+    assert [(t.speaker, t.text) for t in turns][1:] == [
+        ("candidate", answer),
+        ("interviewer", DEFAULT_LINE),
+    ]
+    report_url = f"/api/interviews/{interview_id}/report"
+    wait_until(lambda: client.get(report_url).status_code == 200)
+    assert client.get(report_url).json()["status"] == "graded"
+    assert fakes.grader.calls == 1
+
+
+async def test_a_call_cancelled_mid_relay_is_still_cleaned_up(app, fakes):
+    # A server shutdown cancels the route while relay.run() is running. CancelledError is not an
+    # Exception, so only a `finally` still ends the interview, saves its turns and grades it.
+    store = fakes.store
+    interview = make_interview_record("i1", status="created")
+    await store.create_interview(interview)
+    session = make_session(interview, fakes.streamer)
+    app.state.registry.add(session)
+    browser = FakeBrowserSocket(app)
+
+    call = asyncio.create_task(routes_ws._run_call(browser, session))
+    await fakes.vapi_socket.wait_reading()
+    assert (await store.get_interview("i1")).status == "live"
+
+    call.cancel()
+    await asyncio.wait({call}, timeout=2.0)
+
+    assert call.cancelled()
+    assert fakes.vapi_socket.text_sent()[-1] == {"type": "end-call"}
+    assert browser.text_sent()[-1] == {"type": "ended", "reason": "error"}
+    ended = await store.get_interview("i1")
+    assert ended.status in ("ended", "graded")
+    assert (ended.ended_reason, ended.duration_s) == ("error", 0)
+    assert [t.speaker for t in await store.list_turns("i1")] == ["interviewer"]  # the opening
+    assert app.state.registry.by_interview("i1") is None
+    for _ in range(100):  # the report is graded in the background
+        if await store.get_report("i1") is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert (await store.get_report("i1"))["status"] == "no_answers"
 
 
 # --- the relay's live events -------------------------------------------------------------------
@@ -858,18 +982,55 @@ async def test_sweep_ends_a_live_interview_that_outlived_its_cap_as_stale():
 
     crashed = live("crashed", 300 + 61)
     young = live("young", 300 + 59)
-    running = live("running", 300 + 61)  # still in this process's registry: its route ends it
+    running = live("running", 300 + 61)  # still in this process's registry
     for i in (crashed, young, running):
         await store.create_interview(i)
     registry.add(make_session(running))
 
     await sweep_once(registry, store, now)
 
-    stale = await store.get_interview("crashed")
-    assert (stale.status, stale.ended_reason, stale.duration_s) == ("ended", "stale", 300)
+    for id in ("crashed", "running"):
+        stale = await store.get_interview(id)
+        assert (stale.status, stale.ended_reason, stale.duration_s) == ("ended", "stale", 300)
     assert (await store.get_interview("young")).status == "live"
-    assert (await store.get_interview("running")).status == "live"
+    # The session is its route's to remove, once the call ends.
     assert registry.by_interview("running") is not None
+
+
+def test_a_call_marked_stale_while_it_runs_gets_its_real_end_from_its_route(client, app, fakes):
+    # A socket opened near the end of its token's minute goes live late, so the sweeper can mark
+    # the call stale in its last seconds. The route has the last word when the call ends.
+    body = start(client)
+    interview_id = body["interview_id"]
+
+    with client.websocket_connect(body["ws_path"]) as ws:
+        client.portal.call(fakes.vapi_socket.wait_reading)
+        created = get(client, fakes.store, interview_id).created_at.timestamp()
+        client.portal.call(sweep_once, app.state.registry, fakes.store, created + 300 + 61)
+        assert get(client, fakes.store, interview_id).ended_reason == "stale"
+
+        hang_up(app, ws, interview_id)
+
+    ended = get(client, fakes.store, interview_id)
+    assert ended.status in ("ended", "graded")
+    assert (ended.ended_reason, ended.duration_s) == ("browser_closed", 0)
+
+
+async def test_sweep_leaves_alone_an_interview_its_route_ended_after_the_sweep_listed_it():
+    class EndedMeanwhile(MemoryStore):
+        async def list_live_interviews(self) -> list[Interview]:
+            listed = await super().list_live_interviews()
+            # The call's route ends it between the sweeper's read and its write.
+            await self.update_interview("i1", status="ended", ended_reason="cap", duration_s=297)
+            return listed
+
+    store = EndedMeanwhile()
+    await store.create_interview(make_interview_record("i1"))
+
+    await sweep_once(SessionRegistry(), store, time.time() + 300 + 61)
+
+    ended = await store.get_interview("i1")
+    assert (ended.status, ended.ended_reason, ended.duration_s) == ("ended", "cap", 297)
 
 
 async def test_sweep_leaves_a_session_whose_token_was_used_alone():
@@ -892,6 +1053,136 @@ async def test_sweep_leaves_a_session_whose_token_was_used_alone():
 
     assert (await store.get_interview("i1")).status == "created"
     assert registry.by_interview("i1") is not None
+
+
+class SweptStore(MemoryStore):
+    """A MemoryStore that counts sweeps (each one lists the live interviews once) and records
+    each purge as (days, the sweep it came after). It can be told to fail the next few."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sweeps = 0
+        self.purges: list[tuple[int, int]] = []
+        self.failing_sweeps = 0
+        self.failing_purges = 0
+
+    async def list_live_interviews(self) -> list[Interview]:
+        self.sweeps += 1
+        if self.failing_sweeps:
+            self.failing_sweeps -= 1
+            raise RuntimeError(f"the database is down, call {CALL_ID}")
+        return await super().list_live_interviews()
+
+    async def delete_demo_data_older_than(self, days: int) -> int:
+        self.purges.append((days, self.sweeps))
+        if self.failing_purges:
+            self.failing_purges -= 1
+            raise RuntimeError(f"the database is down, call {CALL_ID}")
+        return await super().delete_demo_data_older_than(days)
+
+
+T0 = 1_800_000_000.0  # some time in 2027, in seconds since the epoch
+
+
+def scripted_clock(*seconds: float):
+    """A clock that reads T0 plus each of `seconds` in turn, then stays at the last."""
+    readings = iter(seconds)
+    return lambda: T0 + next(readings, seconds[-1])
+
+
+async def no_wait(seconds: float) -> None:
+    await asyncio.sleep(0)
+
+
+async def until(condition, timeout: float = 2.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not condition():
+        assert loop.time() < deadline, "timed out waiting"
+        await asyncio.sleep(0)
+
+
+async def stop(task: asyncio.Task) -> None:
+    task.cancel()
+    await asyncio.wait({task}, timeout=1.0)
+    assert task.cancelled()
+
+
+async def test_the_sweeper_sweeps_every_minute_and_deletes_week_old_demo_data_hourly():
+    store = SweptStore()
+    waits: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        waits.append(seconds)
+        await asyncio.sleep(0)
+
+    clock = scripted_clock(0, 60, 3599, 3600, 3660, 7199, 7200)  # one reading per sweep
+    sweeper = asyncio.create_task(run_sweeper(SessionRegistry(), store, clock=clock, sleep=sleep))
+    await until(lambda: store.sweeps >= 9)
+    await stop(sweeper)
+
+    # At start, then on the first sweep an hour or more after the last purge: 3600 and 7200.
+    assert store.purges == [(7, 1), (7, 4), (7, 7)]
+    assert set(waits) == {60.0}
+
+
+async def test_a_failing_sweep_or_purge_is_logged_and_the_sweeper_goes_on(caplog):
+    store = SweptStore()
+    store.failing_sweeps = 2
+    store.failing_purges = 1
+    clock = scripted_clock(0, 60, 120, 3600)
+    sweeper = asyncio.create_task(run_sweeper(SessionRegistry(), store, clock=clock, sleep=no_wait))
+    await until(lambda: store.sweeps >= 5)
+    await stop(sweeper)
+
+    # The failed sweep did not skip the purge, and the failed purge is tried again an hour on.
+    assert store.purges == [(7, 1), (7, 4)]
+    failures = sorted(r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)
+    assert failures == [
+        "could not delete old demo data: RuntimeError",
+        "could not sweep the sessions: RuntimeError",
+        "could not sweep the sessions: RuntimeError",
+    ]
+    assert CALL_ID not in caplog.text
+
+
+@pytest.mark.parametrize("when", ["mid_sweep", "between_sweeps"])
+async def test_cancelling_the_sweeper_stops_it_whatever_it_is_doing(when):
+    class Store(SweptStore):
+        async def list_live_interviews(self) -> list[Interview]:
+            listed = await super().list_live_interviews()
+            if when == "mid_sweep":
+                await asyncio.Event().wait()  # a query that never comes back
+            return listed
+
+    store = Store()
+    sweeper = asyncio.create_task(run_sweeper(SessionRegistry(), store))
+    if when == "mid_sweep":
+        await until(lambda: store.sweeps == 1)
+    else:
+        await until(lambda: store.purges)  # then it waits a minute for the next sweep
+        await asyncio.sleep(0)
+
+    await stop(sweeper)
+
+
+def test_the_app_runs_the_sweeper_from_start_up_to_shutdown(settings, fakes):
+    store = SweptStore()
+    app = create_app(
+        settings,
+        store=store,
+        vapi=fakes.vapi,
+        streamer_factory=lambda: fakes.streamer,
+        grader=fakes.grader,
+    )
+
+    with TestClient(app):
+        wait_until(lambda: store.purges)
+        assert (store.sweeps, store.purges) == (1, [(7, 1)])
+        sweeper = app.state.sweeper
+        assert not sweeper.done()
+
+    assert sweeper.cancelled()
 
 
 # --- ruling R19 --------------------------------------------------------------------------------

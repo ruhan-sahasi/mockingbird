@@ -33,6 +33,10 @@ Clock = Callable[[], datetime]
 # A finished interview. A graded one still counts toward the day's seconds: grading the report
 # does not give the call time back.
 _FINISHED = ("ended", "graded")
+# Today's demos that count toward the day's seconds: a created one at its cap, as it holds a
+# place for a call about to start, and a finished one at how long it ran. A live one counts at
+# its cap on any day.
+_COUNTED_TODAY = ("created", *_FINISHED)
 # What update_interview may change: any field of an Interview except its id. This is also what
 # makes it safe to put the field names into the SQL.
 _UPDATABLE = frozenset(f.name for f in fields(Interview)) - {"id"}
@@ -96,8 +100,12 @@ class Store(Protocol):
     async def get_report(self, interview_id: str) -> dict | None: ...
 
     async def seconds_used_today(self) -> int:
-        """Demo seconds spent today: `duration_s` of each finished demo interview, plus `cap_s`
-        of each demo that is live right now. Full-mode and abandoned interviews are ignored."""
+        """Demo seconds spent or promised today: `duration_s` of each finished demo interview,
+        plus `cap_s` of each demo that is live right now, plus `cap_s` of each demo created today
+        whose call has not started yet. That last part holds a place in the budget for a start
+        that was let through, so the next start is checked against it and the budget cannot be
+        overshot while calls are still connecting. An abandoned interview gives its place back.
+        Full-mode and abandoned interviews are ignored."""
         ...
 
     async def starts_today(self, visitor_hash: str, ip_hash: str) -> int:
@@ -226,8 +234,8 @@ class MemoryStore:
                 continue
             if i.status == "live":
                 total += i.cap_s
-            elif i.status in _FINISHED and start <= i.created_at < end:
-                total += i.duration_s or 0
+            elif i.status in _COUNTED_TODAY and start <= i.created_at < end:
+                total += i.cap_s if i.status == "created" else i.duration_s or 0
         return total
 
     async def starts_today(self, visitor_hash: str, ip_hash: str) -> int:
@@ -421,13 +429,13 @@ class PostgresStore:
     async def seconds_used_today(self) -> int:
         start, end = _utc_day(self._clock())
         return await self._pool.fetchval(
-            "select coalesce(sum(case when status = 'live' then cap_s"
+            "select coalesce(sum(case when status in ('created', 'live') then cap_s"
             "                         else coalesce(duration_s, 0) end), 0)"
             " from interviews"
             " where mode = 'demo'"
             "   and (status = 'live'"
             "        or (status = any($1::text[]) and created_at >= $2 and created_at < $3))",
-            list(_FINISHED),
+            list(_COUNTED_TODAY),
             start,
             end,
         )

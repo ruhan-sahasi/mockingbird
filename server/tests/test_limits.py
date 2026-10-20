@@ -72,10 +72,19 @@ async def test_a_600_s_budget_with_one_live_300_s_demo_allows_one_more_start_the
     # 300 used + 300 for the new one = 600, which is not over a 600 s budget.
     assert await can_start(store, "visitor-b", "ip-b", daily_demo_s=600) == "ok"
 
-    await store.create_interview(
-        interview("b", visitor_hash="visitor-b", ip_hash="ip-b", status="live")
-    )
+    # The start that was let through, as the route makes it: created, its call not yet started.
+    await store.create_interview(interview("b", visitor_hash="visitor-b", ip_hash="ip-b"))
     assert await can_start(store, "visitor-c", "ip-c", daily_demo_s=600) == "daily_budget"
+
+
+async def test_an_abandoned_start_gives_its_place_in_the_budget_back():
+    store = MemoryStore()
+    await store.create_interview(interview("a", visitor_hash="visitor-a", ip_hash="ip-a"))
+    assert await can_start(store, "visitor-b", "ip-b", daily_demo_s=300) == "daily_budget"
+
+    await store.update_interview("a", status="abandoned")  # its token ran out unused
+
+    assert await can_start(store, "visitor-b", "ip-b", daily_demo_s=300) == "ok"
 
 
 async def test_the_visitor_limit_is_reported_before_the_daily_budget():
@@ -209,6 +218,22 @@ def test_the_route_refuses_a_new_cookie_from_the_same_ip(make_client):
     assert second.status_code == 429
     assert second.json() == {"error": "visitor_limit"}
     assert second.headers["set-cookie"].startswith("mb_visitor=")  # a new visitor all the same
+
+
+def test_the_route_holds_a_place_in_the_budget_for_a_start_whose_call_has_not_begun(
+    make_client,
+):
+    client = make_client(daily_demo_minutes=10)  # 600 s: two 300 s demos
+    store = client.app.state.store
+    live = interview("a", visitor_hash="visitor-a", ip_hash="ip-a", status="live")
+    client.portal.call(store.create_interview, live)
+
+    assert post(client, "198.51.100.1").status_code == 201  # 300 live + 300 = 600
+    client.cookies.clear()
+    refused = post(client, "198.51.100.2")  # a new visitor, while the first call connects
+
+    assert refused.status_code == 429
+    assert refused.json() == {"error": "daily_budget"}
 
 
 def test_the_route_refuses_a_demo_when_the_daily_budget_is_spent(make_client):

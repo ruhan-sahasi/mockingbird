@@ -9,10 +9,13 @@ While the call runs, the relay hands the route Vapi's live events (Amendment 1):
 - the interviewer started speaking: the brain commits the reply Vapi is speaking;
 - the interviewer stopped speaking after the wrap-up was committed: the call ends, "plan_done".
 
-When the call ends, however it ends, the clean-up runs in a `finally`: `run()` can also raise
-(an ExceptionGroup when a relay task failed, CancelledError on shutdown), and the interview must
-not be left live. The interview is marked ended with how long it ran and why, its turns are
-saved, the session is removed and the report is graded in the background.
+When the call ends, the interview is marked ended with how long it ran and why. That happens in
+the relay's hang-up, before the browser is told the call ended, because the browser's next step
+is to ask for the report, and a report is only "on its way" for an ended interview. The rest of
+the clean-up runs in a `finally`, as does the ended mark if the hang-up could not write it:
+`run()` can also raise (an ExceptionGroup when a relay task failed, CancelledError on shutdown),
+and the interview must not be left live. Its turns are saved, the session is removed and the
+report is graded in the background.
 
 A call that never went live (Vapi refused it, or its socket would not connect) is marked
 `abandoned` instead and gets no report: nobody was interviewed, so the visitor's demo is not
@@ -65,12 +68,35 @@ async def interview_socket(websocket: WebSocket, interview_id: str, token: str =
     await _run_call(websocket, session)
 
 
+class _Ending:
+    """Marks the interview ended, once, with how long its call ran and why. The relay's hang-up
+    does it before the browser hears the call ended; the clean-up does it if that did not."""
+
+    def __init__(self, store: Store, interview_id: str) -> None:
+        self._store = store
+        self._interview_id = interview_id
+        self.live_since: float | None = None  # by time.monotonic, once the interview is live
+        self.recorded = False
+
+    async def record(self, reason: str) -> None:
+        # A call that never went live is abandoned instead, by the clean-up.
+        if self.live_since is None or self.recorded:
+            return
+        await self._store.update_interview(
+            self._interview_id,
+            status="ended",
+            duration_s=round(time.monotonic() - self.live_since),
+            ended_reason=reason,
+        )
+        self.recorded = True
+
+
 async def _run_call(websocket: WebSocket, session: LiveSession) -> None:
     state = websocket.app.state
     settings = state.settings
     interview = session.interview
     reason = ERROR
-    live_since: float | None = None
+    ending = _Ending(state.store, interview.id)
     try:
         opening = session.brain.start()
         base = settings.public_base_url.rstrip("/")
@@ -92,15 +118,16 @@ async def _run_call(websocket: WebSocket, session: LiveSession) -> None:
             WebsocketsSocket(connection),
             cap_s=interview.cap_s,
             on_event=_live_events(session),
+            on_end=ending.record,
         )
         await state.store.update_interview(interview.id, status="live")
-        live_since = time.monotonic()
+        ending.live_since = time.monotonic()
         reason = await session.relay.run()
     except Exception as exc:
         # The type only: a library's message can hold the socket URL, which holds the call id.
         log.error("the call for interview %s failed: %s", interview.id, type(exc).__name__)
     finally:
-        await _clean_up(websocket, session, reason=reason, live_since=live_since)
+        await _clean_up(websocket, session, reason=reason, ending=ending)
 
 
 def _live_events(session: LiveSession) -> OnEvent:
@@ -119,7 +146,7 @@ def _live_events(session: LiveSession) -> OnEvent:
 
 
 async def _clean_up(
-    websocket: WebSocket, session: LiveSession, *, reason: str, live_since: float | None
+    websocket: WebSocket, session: LiveSession, *, reason: str, ending: _Ending
 ) -> None:
     state = websocket.app.state
     store = state.store
@@ -134,7 +161,7 @@ async def _clean_up(
     await _stop_reply(session)
     session.brain.finalize()
 
-    if live_since is None:
+    if ending.live_since is None:
         await _attempt(
             "mark the interview abandoned",
             store.update_interview(interview_id, status="abandoned", ended_reason=ERROR),
@@ -142,15 +169,8 @@ async def _clean_up(
         state.registry.remove(interview_id)
         return
 
-    await _attempt(
-        "mark the interview ended",
-        store.update_interview(
-            interview_id,
-            status="ended",
-            duration_s=round(time.monotonic() - live_since),
-            ended_reason=reason,
-        ),
-    )
+    # Normally the hang-up has marked it ended already, and this does nothing.
+    await _attempt("mark the interview ended", ending.record(reason))
     await _attempt("save the turns", _save_turns(store, interview_id, session.brain.turns))
     state.registry.remove(interview_id)
     _in_background(state, build_report(store, state.grader, interview_id))
