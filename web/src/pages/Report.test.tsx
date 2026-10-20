@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
-import type { ItemReport, Report, ReportResult } from '../api'
-import { ReportView } from './Report'
+import type { ItemReport, Report } from '../api'
+import { ReportView, type Shown } from './Report'
 
 const QUESTION = 'Tell me about a time you got feedback you did not agree with.'
 
@@ -29,7 +29,7 @@ function graded(...items: ItemReport[]): Report {
 }
 
 // The text a reader sees: the markup with its tags taken out and its spacing collapsed.
-function render(result: ReportResult | null): { html: string; text: string } {
+function render(result: Shown | null): { html: string; text: string } {
   const html = renderToStaticMarkup(<ReportView result={result} />)
   const text = html
     .replace(/<[^>]+>/g, ' ')
@@ -119,5 +119,16 @@ describe('ReportView', () => {
   it('says there is no report for an interview the server does not know', () => {
     const { text } = render({ status: 'not_found' })
     expect(text).toContain('There is no report for this interview.')
+  })
+
+  it('says it is still looking, not that there is no report, while 404s are within the grace', () => {
+    const { text } = render({ status: 'not_yet' })
+    expect(text).toContain("Looking for this interview's report.")
+    expect(text).not.toContain('There is no report')
+  })
+
+  it('says a check failed while it is still looking', () => {
+    const html = renderToStaticMarkup(<ReportView result={{ status: 'not_yet' }} retrying />)
+    expect(html).toContain('Still trying.')
   })
 })

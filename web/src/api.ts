@@ -40,7 +40,8 @@ export type Report =
   | { status: 'no_answers' | 'grading_failed'; questions: QuestionReport[] }
 
 // What asking for a report can give: the report, "grading" while it is on its way, or
-// "not_found" for an interview that does not exist, never ran a call, or is still live.
+// "not_found" for an interview that does not exist, never ran a call, or is not marked ended
+// yet (pollReport waits a while before it believes that one).
 export type ReportResult = Report | { status: 'grading' } | { status: 'not_found' }
 
 /** The server answered with a status or body this client does not expect. */
@@ -83,29 +84,61 @@ export async function getReport(id: string, signal?: AbortSignal): Promise<Repor
   throw new ApiError(res.status, `unexpected answer to asking for a report: ${res.status}`)
 }
 
+/**
+ * How long, from the first ask, a 404 is read as "not ended yet" and asked again.
+ *
+ * The server answers 404 for an interview it has not marked ended yet (routes_api.py), and the
+ * page can ask before that mark: after End when "ended" never came, from the link shown after a
+ * dropped connection, or when the server's write of the mark is slow. The longest such wait is
+ * End pressed while the server is still creating the Vapi call. The create has a 3 s connect
+ * and a 10 s read limit (vapi_client.py's CREATE_CALL_TIMEOUT), and the audio socket's connect
+ * up to 10 s more (websockets' open_timeout). The page leaves 5 s after End, and the hang-up
+ * adds up to about 3 s. That is about 21 s from the page's first ask, so 30 s leaves room for
+ * the store write.
+ */
+export const NOT_FOUND_GRACE_MS = 30_000
+
 export type PollOptions = {
   /** Called each time the server answers that the report is still being graded. */
   onGrading?: () => void
+  /** Called each time the server answers 404 within the grace: the call may not have ended yet. */
+  onNotYet?: () => void
   /** Called with the error each time a request fails. */
   onRetry?: (error: unknown) => void
   everyMs?: number
+  /** How long a 404 is asked again, from the first ask (NOT_FOUND_GRACE_MS by default). */
+  notFoundGraceMs?: number
 }
 
 /**
  * Ask for the report every `everyMs` (2 s by default) until it is no longer grading, and give
  * what came back. A request that fails is asked again on the same schedule, since the report is
- * still on its way. Rejects once `signal` aborts.
+ * still on its way. A 404 is asked again too until `notFoundGraceMs` has passed since the first
+ * ask, and only a 404 after that gives "not_found". Rejects once `signal` aborts.
  */
 export async function pollReport(
   id: string,
   signal: AbortSignal,
-  { onGrading, onRetry, everyMs = 2000 }: PollOptions = {},
+  {
+    onGrading,
+    onNotYet,
+    onRetry,
+    everyMs = 2000,
+    notFoundGraceMs = NOT_FOUND_GRACE_MS,
+  }: PollOptions = {},
 ): Promise<Report | { status: 'not_found' }> {
+  const firstAskedAt = performance.now()
   for (;;) {
     try {
       const result = await getReport(id, signal)
-      if (result.status !== 'grading') return result
-      onGrading?.()
+      if (result.status === 'grading') {
+        onGrading?.()
+      } else if (result.status === 'not_found') {
+        if (performance.now() - firstAskedAt >= notFoundGraceMs) return result
+        onNotYet?.()
+      } else {
+        return result
+      }
     } catch (error) {
       if (signal.aborted) throw signal.reason
       onRetry?.(error)

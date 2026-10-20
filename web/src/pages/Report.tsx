@@ -1,13 +1,20 @@
 // One interview's report. The page asks for it every 2 s until grading is done, then shows each
 // question with a score, a rationale and the candidate's own words for every rubric item.
+//
+// The page can be opened before the server has marked the interview ended, and until then the
+// server says 404. pollReport keeps asking through those for a while (NOT_FOUND_GRACE_MS), and
+// the page says it is still looking rather than that there is no report.
 
 import { useEffect, useState } from 'react'
 import { pollReport, type ItemReport, type QuestionReport, type ReportResult } from '../api'
 import { LANDING_HASH } from '../route'
 
+/** What the page shows: an answer from the server, or "not_yet" for a 404 within the grace. */
+export type Shown = ReportResult | { status: 'not_yet' }
+
 export default function Report({ id }: { id: string }) {
   // null until the server first answers. App keys this page by id, so another report starts over.
-  const [result, setResult] = useState<ReportResult | null>(null)
+  const [result, setResult] = useState<Shown | null>(null)
   const [retrying, setRetrying] = useState(false)
 
   useEffect(() => {
@@ -15,6 +22,10 @@ export default function Report({ id }: { id: string }) {
     pollReport(id, controller.signal, {
       onGrading: () => {
         setResult({ status: 'grading' })
+        setRetrying(false)
+      },
+      onNotYet: () => {
+        setResult({ status: 'not_yet' })
         setRetrying(false)
       },
       onRetry: () => setRetrying(true),
@@ -55,7 +66,7 @@ export function ReportView({
   result,
   retrying = false,
 }: {
-  result: ReportResult | null
+  result: Shown | null
   retrying?: boolean
 }) {
   return (
@@ -76,7 +87,9 @@ export function ReportView({
       ) : (
         <div className="notice" role="status">
           <p>{STATUS_SENTENCES[result.status]}</p>
-          {result.status === 'grading' && retrying && <p className="hint">{RETRYING}</p>}
+          {(result.status === 'grading' || result.status === 'not_yet') && retrying && (
+            <p className="hint">{RETRYING}</p>
+          )}
         </div>
       )}
     </>
@@ -86,6 +99,7 @@ export function ReportView({
 const RETRYING = 'The server did not answer the last check. Still trying.'
 
 const STATUS_SENTENCES = {
+  not_yet: "Looking for this interview's report. This page updates by itself.",
   grading: 'Grading your answers. This page updates by itself when the report is ready.',
   not_found: 'There is no report for this interview.',
   no_answers: 'No answer was recorded, so there was nothing to grade.',

@@ -11,6 +11,7 @@ import { createPlayer, type Player } from '../audio/player'
 import { formatCountdown, secondsLeft } from '../countdown'
 import { parseServerMessage } from '../protocol'
 import { LANDING_HASH, reportHash } from '../route'
+import { sendFrame } from '../socket'
 
 type Props = {
   onLimit(reason: LimitReason): void
@@ -70,13 +71,12 @@ export default function Interview({ onLimit, onEnded }: Props) {
       stopAll()
       if (!cancelled) go()
     }
-    const sendFrame = (pcm: Int16Array<ArrayBuffer>) => {
-      if (socket?.readyState === WebSocket.OPEN) socket.send(pcm)
-    }
+    // Reads `socket` as each frame comes, so frames go out from the moment it opens.
+    const onFrame = (pcm: Int16Array<ArrayBuffer>) => sendFrame(socket, pcm)
 
     async function run() {
       try {
-        mic = await startMic(sendFrame)
+        mic = await startMic(onFrame)
       } catch (error) {
         fail(micProblem(error))
         return
