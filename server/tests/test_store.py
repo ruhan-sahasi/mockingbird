@@ -9,6 +9,7 @@ with a session-level SET, which a transaction pooler would not keep from one que
 """
 
 import asyncio
+import json
 import os
 import traceback
 import uuid
@@ -22,7 +23,8 @@ import pytest
 from mockingbird.migrate import MIGRATIONS_DIR, apply_migrations
 from mockingbird.migrate import migrate as run_migrate
 from mockingbird.models import Interview, Turn
-from mockingbird.store import MemoryStore, PostgresStore, create_pool
+from mockingbird.report import GradeResult, ItemGrade, QuestionGrade, _empty_report, verify_quotes
+from mockingbird.store import MemoryStore, PostgresStore, _score_rows, create_pool
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 needs_postgres = pytest.mark.skipif(
@@ -108,6 +110,47 @@ def make_interview(id: str = "i1", **overrides) -> Interview:
 def make_turn(idx: int, **overrides) -> Turn:
     fields = {"idx": idx, "speaker": "candidate", "text": f"line {idx}", "question_idx": 0}
     return Turn(**{**fields, **overrides})
+
+
+# --- the report as the scores and quotes tables hold it (no database needed) -------------------
+
+
+def test_a_report_from_verify_quotes_flattens_into_score_and_quote_rows():
+    # report.py writes the report and PostgresStore._score_rows reads it, with nothing between
+    # them but key names. This pins that contract where CI always runs, Postgres or not.
+    result = GradeResult(
+        questions=[
+            QuestionGrade(
+                question_idx=0,
+                items=[
+                    ItemGrade(
+                        item="action",
+                        score=3,
+                        rationale="Named the steps.",
+                        quotes=["I wrote the migration plan", "we saved a million dollars"],
+                    ),
+                    ItemGrade(
+                        item="result", score=2, rationale="No outcome.", quotes=["it shipped"]
+                    ),
+                ],
+            )
+        ]
+    )
+    report = verify_quotes(result, {0: "I wrote the migration plan and ran it."}, QUESTIONS)
+
+    # A dropped quote is kept with verified False, so the share that verify can be measured.
+    action_quotes = [("I wrote the migration plan", True), ("we saved a million dollars", False)]
+    rows = [
+        (0, "action", 3, "Named the steps.", "scored", action_quotes),
+        (0, "result", None, "No outcome.", "not_enough_evidence", [("it shipped", False)]),
+    ]
+    assert _score_rows(report) == rows
+    assert _score_rows(json.loads(json.dumps(report))) == rows  # as it comes back from jsonb
+
+
+@pytest.mark.parametrize("status", ["no_answers", "grading_failed"])
+def test_a_report_with_no_grade_has_no_score_rows(status):
+    assert _score_rows(_empty_report(status)) == []
 
 
 # --- a throwaway Postgres schema ---------------------------------------------------------------
