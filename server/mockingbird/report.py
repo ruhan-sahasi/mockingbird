@@ -20,6 +20,9 @@ The grader request, for the record. Opus 5.5 thinks adaptively on its own and re
 `thinking={"type": "disabled"}`, so `thinking` is left out. `fallbacks="default"` with the
 server-side-fallback beta lets the API retry a refused request on another model by itself. A
 refusal that still gets through shows as `stop_reason == "refusal"` and becomes a GradingError.
+The request is streamed, as the SDK advises for one with this much output: unstreamed, nothing
+comes back until the whole grade is written, so the client's read timeout would have to cover
+the entire generation, and a request cut off that way is retried and billed again.
 """
 
 import logging
@@ -30,7 +33,8 @@ from typing import Literal, Protocol
 
 import anthropic
 import yaml
-from pydantic import BaseModel, Field
+from anthropic.types.beta.parsed_beta_message import ParsedBetaMessage
+from pydantic import BaseModel, Field, ValidationError
 
 from mockingbird.models import Turn
 from mockingbird.store import Store
@@ -200,13 +204,27 @@ class Grader:
         self._rubric_text = _render_rubric(rubric)
 
     async def grade(self, turns: list[Turn], questions: list[str]) -> GradeResult:
-        """Raises GradingError if Claude refuses or returns no complete result. Anything else
-        that goes wrong (the network, the API, a reply that is not valid) is the SDK's own
-        exception, left as it is."""
+        """Raises GradingError if Claude refuses or returns no complete result, a reply cut off
+        at max_tokens included. Anything else that goes wrong (the network, the API) is the
+        SDK's own exception, left as it is."""
         transcript_text = (
             f"RUBRIC\n\n{self._rubric_text}\n\nTRANSCRIPT\n\n{_transcript(turns, questions)}"
         )
-        response = await self._client.beta.messages.parse(
+        # The stream helper parses the text against GradeResult as it completes, like parse().
+        # A text cut off at max_tokens is not valid JSON, so it fails that check. Its message
+        # quotes the text, which holds the candidate's words, so only a fixed one goes on.
+        try:
+            response = await self._stream_grade(transcript_text)
+        except ValidationError:
+            raise GradingError("Claude did not return a complete grade") from None
+        if response.stop_reason == "refusal":
+            raise GradingError("Claude refused to grade this interview")
+        if response.parsed_output is None:
+            raise GradingError("Claude did not return a complete grade")
+        return response.parsed_output
+
+    async def _stream_grade(self, transcript_text: str) -> ParsedBetaMessage[GradeResult]:
+        async with self._client.beta.messages.stream(
             model=MODEL,
             max_tokens=MAX_TOKENS,
             betas=[FALLBACK_BETA],
@@ -215,12 +233,8 @@ class Grader:
             system=GRADER_SYSTEM,
             messages=[{"role": "user", "content": transcript_text}],
             output_format=GradeResult,
-        )
-        if response.stop_reason == "refusal":
-            raise GradingError("Claude refused to grade this interview")
-        if response.parsed_output is None:
-            raise GradingError("Claude did not return a complete grade")
-        return response.parsed_output
+        ) as stream:
+            return await stream.get_final_message()
 
 
 class TurnGrader(Protocol):

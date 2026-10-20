@@ -92,9 +92,11 @@ def test_create_app_builds_the_grader_its_own_slow_client_and_one_live_client(se
         state = c.app.state
         assert isinstance(state.grader, Grader)
         grading = state.grader._client
-        # Grading with adaptive thinking takes a while, and nobody is waiting on the line.
-        assert grading.timeout == anthropic.Timeout(120.0, connect=5.0)
-        assert grading.max_retries == 2
+        # Grading with adaptive thinking takes a while, and nobody is waiting on the line. 600 s
+        # is the SDK's own limit for a request this size; one retry at most, so a grade that
+        # fails at the start is not paid for three times.
+        assert grading.timeout == anthropic.Timeout(600.0, connect=5.0)
+        assert grading.max_retries == 1
         assert grading.api_key == settings.anthropic_api_key
 
         one, two = state.streamer_factory(), state.streamer_factory()

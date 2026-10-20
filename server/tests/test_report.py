@@ -221,17 +221,35 @@ def test_rubric_loads_the_same_from_any_working_directory(tmp_path, monkeypatch)
 
 
 class FakeBetaClient:
-    """Stands in for AsyncAnthropic. Records the kwargs of beta.messages.parse(**kwargs) and
-    answers with a prepared response."""
+    """Stands in for AsyncAnthropic. Records the kwargs of beta.messages.stream(**kwargs) and
+    answers with a prepared final message. It has no `parse`: the grade is streamed, because a
+    request this long would otherwise wait on one HTTP response for the whole generation."""
 
     def __init__(self, response):
         self.requests: list[dict] = []
+        self.closed = 0
         self._response = response
-        self.beta = SimpleNamespace(messages=SimpleNamespace(parse=self._parse))
+        self.beta = SimpleNamespace(messages=SimpleNamespace(stream=self._stream))
 
-    async def _parse(self, **kwargs):
+    def _stream(self, **kwargs):
         self.requests.append(kwargs)
-        return self._response
+        return FakeStream(self)
+
+
+class FakeStream:
+    """The async context manager beta.messages.stream returns, holding the final message."""
+
+    def __init__(self, client: FakeBetaClient) -> None:
+        self._client = client
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        self._client.closed += 1
+
+    async def get_final_message(self):
+        return self._client._response
 
 
 async def test_grader_request_shape():
@@ -242,6 +260,7 @@ async def test_grader_request_shape():
     result = await Grader(client, load_rubric()).grade(turns, QUESTIONS)
 
     assert result is graded
+    assert client.closed == 1  # the stream is shut once the final message is in
     [request] = client.requests
     [message] = request.pop("messages")
     assert message["role"] == "user"
@@ -333,12 +352,37 @@ def message_reply(text: str = "", stop_reason: str = "end_turn") -> dict:
     }
 
 
+def sse(reply: dict) -> str:
+    """`reply` as the event stream the API sends for a streamed request."""
+    message = {**reply, "content": [], "stop_reason": None}
+    events = [{"type": "message_start", "message": message}]
+    for index, block in enumerate(reply["content"]):
+        events += [
+            {"type": "content_block_start", "index": index, "content_block": {**block, "text": ""}},
+            {
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "text_delta", "text": block["text"]},
+            },
+            {"type": "content_block_stop", "index": index},
+        ]
+    events += [
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": reply["stop_reason"], "stop_sequence": None},
+            "usage": {"output_tokens": 10},
+        },
+        {"type": "message_stop"},
+    ]
+    return "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events)
+
+
 def real_sdk_grader(reply: dict) -> tuple[Grader, list[httpx2.Request]]:
     requests: list[httpx2.Request] = []
 
     def answer(request: httpx2.Request) -> httpx2.Response:
         requests.append(request)
-        return httpx2.Response(200, json=reply)
+        return httpx2.Response(200, text=sse(reply), headers={"content-type": "text/event-stream"})
 
     client = anthropic.AsyncAnthropic(
         api_key="test-key",
@@ -359,6 +403,7 @@ async def test_real_sdk_sends_fallback_beta_and_schema_and_parses_the_reply():
     assert request.url.path == "/v1/messages"
     assert "server-side-fallback-2026-07-01" in request.headers["anthropic-beta"]
     body = json.loads(request.content)
+    assert body["stream"] is True
     assert body["model"] == "claude-opus-5-5"
     assert body["fallbacks"] == "default"
     assert body["max_tokens"] == 16000
@@ -377,6 +422,19 @@ async def test_real_sdk_refusal_becomes_grading_error():
 
     with pytest.raises(GradingError):
         await grader.grade(TURNS, QUESTIONS)
+
+
+async def test_real_sdk_reply_cut_off_at_max_tokens_becomes_grading_error():
+    # The streamed text stops partway through the JSON. The SDK's parse fails, and that error's
+    # message quotes the text, so only a fixed message may come out of the grader.
+    cut = '{"questions": [{"question_idx": 0, "items": [{"item": "action", "rationale": "I led'
+    grader, _ = real_sdk_grader(message_reply(text=cut, stop_reason="max_tokens"))
+
+    with pytest.raises(GradingError) as raised:
+        await grader.grade(TURNS, QUESTIONS)
+
+    assert "I led" not in str(raised.value)
+    assert raised.value.__cause__ is None and raised.value.__suppress_context__
 
 
 # build_report
