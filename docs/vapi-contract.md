@@ -7,6 +7,11 @@ calls over a `vapi.websocket` transport, about $0.05 each. The fixtures in
 (`01a1568c-1ec2-700b-a8a3-19354850c60b`) found the same behaviour; the second
 only changed the fake brain so it could show which request Vapi speaks.
 
+Both calls have ended (`GET /call/{id}` said `ended` after each; the committed
+`get_call_after.json` is the second call's), and that is the only reason their ids
+may sit in a public repo. While a call is live its id is a credential: see
+Surprise 5 before using `call.id` in any log line, response or error message.
+
 This document is the authority where it disagrees with the plan. Tasks 4, 5, 6,
 8, 9 and 11 follow it. The disagreements are listed under "What changes in the
 plan" near the end.
@@ -26,7 +31,9 @@ plan" near the end.
   answer 2, short reply, `{"type": "end-call"}` text frame.
 - Fixtures are scrubbed: API key, Bearer tokens, capability URLs
   (`websocketCallUrl`, `listenUrl`, `controlUrl`), presigned storage URLs, the
-  org id, and the ngrok host (shown as `tunnel.example`).
+  org id, and the ngrok host (shown as `tunnel.example`). The scrubber does not
+  touch the bare `call.id`, so the real ids of the two ended calls stay in the
+  fixtures. That is safe only because the calls are over (Surprise 5).
 
 Fixture index:
 
@@ -70,6 +77,8 @@ Evidence: `llm_request_paths.json` (`path`, `appended_to_model_url`,
 
 - Call id: `body["call"]["id"]` (a UUID). `body["call"]` is the whole call object
   (`id`, `orgId`, `type`, `status`, `transport`, `assistant`, `monitor`, ...).
+  Treat it as a secret while the call is live: the call's capability URLs are
+  just the shard host plus this id (Surprise 5).
 - Newest user utterance: the last element of `body["messages"]`, a plain
   `{"role": "user", "content": "<string>"}`. Message objects have only `role` and
   `content`.
@@ -260,11 +269,54 @@ Evidence: `ws_text_frames.jsonl` (last three frames), `call_summary.json`
    assume `history == what we generated`.
 4. **`llm_request_turn1.json` is a partial utterance** (question 2). Task 4's test
    for "the spoken answer's transcript" should use `llm_request_n4.json`.
-5. **Capability URLs travel in every request and webhook.** The `call` object in
-   LLM requests and webhooks has `monitor.listenUrl` and `monitor.controlUrl`, and
-   `transport.websocketCallUrl`. Anyone holding them can listen to or control the
-   call. Do not log full request bodies in the deployed server, and keep them out
-   of fixtures (the scrubber replaces them).
+5. **While a call is live, `call.id` is a capability, because the capability URLs
+   are built from it.** The `call` object in LLM requests and webhooks has
+   `monitor.listenUrl`, `monitor.controlUrl` and `transport.websocketCallUrl`
+   (and the create-call response has the last one). In the raw captures all three
+   are exactly the Vapi shard host plus `/<call.id>/<suffix>`, with no token, no
+   signature and no query string:
+
+   ```
+   wss://<shard host>/<call.id>/transport     transport.websocketCallUrl
+   wss://<shard host>/<call.id>/listen        monitor.listenUrl
+   https://<shard host>/<call.id>/control     monitor.controlUrl
+   ```
+
+   The shard host is the same for every call on that shard
+   (`phone-call-websocket.aws-us-west-2-backend-production1.vapi.ai`), so it is not
+   a secret and the id is the only part that is. Anyone who learns `call.id` can
+   rebuild all three URLs. What we checked: the spike opens the `transport` socket
+   with no headers (`websockets.connect(ws_url, ...)` in `scripts/spike_vapi.py`)
+   and Vapi accepts it, so the URL alone is the credential there. What we did not
+   check: connecting to `listen` or `control`, which would touch a live call. From
+   their names and Vapi's call-monitoring docs, `listen` streams the call's audio
+   and `control` accepts commands such as ending the call, so assume that holding
+   the id lets a stranger hear a candidate's interview or cut it off.
+
+   Rules for the tasks that handle a live call (Tasks 8, 9, 11, 13):
+   - Never send `call.id` or any of the three URLs to the browser: not in a
+     response body, a WebSocket message, a redirect, a cookie or an error. The
+     browser gets our own interview id. `LiveSession.call_id`,
+     `VapiCall.id` and `VapiCall.websocket_url` stay server-side.
+   - Never log them in plain text on the deployed server. A normal correlation
+     line such as `llm request for call <call.id>` leaks the credential to anyone
+     who can read the logs. Log our interview id, or a short hash of the call id
+     (for example the first 8 hex characters of its SHA-256).
+   - Keep them out of exception and error text too (`VapiError`, relay errors,
+     the "Sorry" line streamed back to Vapi, anything that echoes a URL).
+   - Do not log full request bodies in the deployed server: each carries the id
+     and all three URLs. The text frames on the audio socket do not carry the id
+     (it does not occur in `ws_text_frames.jsonl`), so Task 9 may log those.
+   - Keep the URLs out of fixtures (the scrubber replaces them). Tasks 9 and 11
+     should pin the log rule with a test: feed the recorded id through the code
+     under `caplog` and assert it appears in no log record.
+
+   Why the committed fixtures are still fine: both recorded calls have ended
+   (`get_call_after.json`: `status: "ended"`; the first call's uncommitted raw
+   capture says the same), and an ended call's id opens nothing. When re-recording, run `fixtures` and commit only after
+   `GET /call/{id}` says `ended`. For a call that is still live, or whose end is
+   unconfirmed, replace the id with one fixed fake UUID everywhere (in every file,
+   consistently) before committing.
 6. **Defaults Vapi filled in** because the assistant did not set them: the system
    prompt "You are an assistant.", transcriber Deepgram `nova-2`, voice provider
    `vapi` voice `Elliot` model `vapi-v2`, and the end-of-call analysis. None were
