@@ -10,6 +10,7 @@ error message.
 """
 
 import json
+import time
 import traceback
 from pathlib import Path
 
@@ -157,6 +158,44 @@ async def test_a_long_reason_is_cut_short(vapi: VapiClient, respx_mock):
         await vapi.create_call(assistant())
 
     assert len(str(excinfo.value)) < 250
+
+
+# A hostile or echoing Vapi can send a reason of any size, and the server holds other live
+# interviews on the same event loop. The old URL pattern re-scanned a long unbroken run from every
+# start position, so cost grew with the square of the length: 50,000 characters took about 7 s and
+# 200,000 about 107 s. Scrubbing must stay linear.
+UNBROKEN_REASONS = {
+    "one long token": "x" * 200_000,
+    "a run of near-URLs": ":/" * 100_000,
+}
+
+
+@pytest.mark.parametrize("reason", UNBROKEN_REASONS.values(), ids=UNBROKEN_REASONS.keys())
+async def test_a_huge_unbroken_reason_is_scrubbed_in_linear_time(
+    reason, vapi: VapiClient, respx_mock
+):
+    respx_mock.post(CREATE_CALL_URL).respond(400, json={"message": reason})
+
+    started = time.perf_counter()
+    with pytest.raises(VapiError) as excinfo:
+        await vapi.create_call(assistant())
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 1.0
+    assert len(str(excinfo.value)) < 250
+
+
+async def test_a_key_that_straddles_the_size_bound_is_still_scrubbed(vapi: VapiClient, respx_mock):
+    """The key is blanked before the message is cut down, so the cut cannot leave half a key."""
+    # The key starts 10 characters before the 1000-character bound, and the spaces collapse away.
+    reason = " " * 990 + API_KEY + " tail"
+    respx_mock.post(CREATE_CALL_URL).respond(400, json={"message": reason})
+
+    with pytest.raises(VapiError) as excinfo:
+        await vapi.create_call(assistant())
+
+    assert "vapi-key" not in str(excinfo.value)
+    assert str(excinfo.value) == "Vapi returned 400: [key] tail"
 
 
 async def test_create_call_does_not_follow_a_redirect(respx_mock):

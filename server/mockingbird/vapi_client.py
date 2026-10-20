@@ -25,7 +25,14 @@ CREATE_CALL_TIMEOUT = httpx.Timeout(10.0, connect=3.0)
 # Vapi's reason is a short sentence, or a short list of them for a validation error. Anything past
 # this many characters is not a reason any more, and could be a body or a long echo of our request.
 _MAX_REASON_CHARS = 200
-_URL = re.compile(r"\S*://\S*")
+# The reply has no size limit, and the scrubbing below runs on the event loop that carries every
+# live interview. So the scrubbing works on at most this many characters. That is well above the
+# 200 that survive, which leaves room for runs of spaces that collapse away before the final cut.
+_MAX_SCRUBBED_CHARS = 1000
+# Starts only at the front of a run of non-space characters. Without the lookbehind, a long run
+# with no "://" in it was re-scanned from every character, so the cost grew with the square of the
+# run length (200,000 characters took minutes). A match still takes the whole run around the "://".
+_URL = re.compile(r"(?<!\S)\S*://\S*")
 
 
 class VapiError(Exception):
@@ -106,9 +113,10 @@ class VapiClient:
             message = "; ".join(m for m in message if isinstance(m, str))
         if not isinstance(message, str):
             return ""
-        message = _URL.sub("[url]", message)
+        # The key goes first and over the whole message, so the cut below cannot leave half of it.
         if self._api_key:
             message = message.replace(self._api_key, "[key]")
+        message = _URL.sub("[url]", message[:_MAX_SCRUBBED_CHARS])
         return " ".join(message.split())[:_MAX_REASON_CHARS]
 
     @staticmethod
