@@ -441,6 +441,120 @@ def test_the_printer_hides_every_secret_it_is_given_from_every_line():
     assert "started with" in lines[0]
 
 
+# --- waiting for the report ----------------------------------------------------------------------
+
+
+class FakeReportHttp:
+    """Stands in for the httpx client: answers each ask with the next scripted answer, the last
+    one for every ask after that. An answer is a status code, or an exception to raise."""
+
+    def __init__(self, *answers) -> None:
+        self.answers = list(answers)
+        self.asked = 0
+
+    async def get(self, url: str):
+        assert url.endswith("/api/interviews/iv-1/report")
+        answer = self.answers[min(self.asked, len(self.answers) - 1)]
+        self.asked += 1
+        if isinstance(answer, Exception):
+            raise answer
+        if answer == 200:
+            return httpx.Response(200, json={"status": "graded", "questions": []})
+        return httpx.Response(answer, json={"detail": "not yet"})
+
+
+async def wait_for_report(*answers):
+    """Run the client's wait for the report on a clock that moves only when it sleeps, so the
+    120 s it may wait costs no time. Returns what it recorded, how long it waited (clock time) and
+    how many times it asked."""
+    clock = FakeClock()
+    http = FakeReportHttp(*answers)
+    config = smoke.Config(
+        base="http://localhost:8000", owner_key="k", answer1=b"", answer2=b""
+    )  # the brief's 2 s poll and 120 s limit, as the defaults
+    outcome = smoke.Outcome()
+    out = smoke.Printer([], write=lambda line: None)
+    await smoke.fetch_report(http, "iv-1", config, out, outcome, clock=clock, sleep=clock.sleep)
+    return outcome, clock.now - 100.0, http.asked
+
+
+async def test_the_report_is_asked_for_again_after_a_404_from_an_interview_not_yet_ended():
+    outcome, waited, asked = await wait_for_report(404, 404, 200)
+    assert (outcome.report_http, outcome.report_status) == (200, "graded")
+    assert outcome.problems == []
+    assert (asked, waited) == (3, pytest.approx(4.0))  # every 2 s
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+async def test_the_report_is_asked_for_again_after_a_server_error(status):
+    outcome, waited, asked = await wait_for_report(status, 200)
+    assert (outcome.report_http, outcome.report_status) == (200, "graded")
+    assert outcome.problems == []
+    assert (asked, waited) == (2, pytest.approx(2.0))
+
+
+@pytest.mark.parametrize("status", [408, 425, 429])
+async def test_the_report_is_asked_for_again_when_the_server_says_try_again(status):
+    outcome, _, asked = await wait_for_report(status, 200)
+    assert outcome.report_status == "graded" and asked == 2
+
+
+async def test_the_report_is_asked_for_again_after_a_dropped_connection_or_a_timeout():
+    hiccups = (httpx.ConnectError("refused"), httpx.ReadTimeout("slow"))
+    outcome, _, asked = await wait_for_report(*hiccups, 200)
+    assert outcome.report_status == "graded" and asked == 3
+
+
+async def test_a_mix_of_202_404_and_500_is_waited_out_until_the_report_is_there():
+    outcome, waited, asked = await wait_for_report(404, 500, 202, 202, httpx.ReadTimeout("x"), 200)
+    assert (outcome.report_http, outcome.report_status, outcome.problems) == (200, "graded", [])
+    assert (asked, waited) == (6, pytest.approx(10.0))
+
+
+async def test_a_report_that_stays_202_is_asked_for_every_2_s_until_120_s_have_passed():
+    outcome, waited, asked = await wait_for_report(202)
+    assert outcome.problems == ["no report after 120 s (the last answer was HTTP 202)"]
+    assert outcome.report_http == 202 and outcome.report_status is None
+    # Asks at 0, 2, ... and 120 s: the one at the limit is the last.
+    assert (asked, waited) == (61, pytest.approx(120.0))
+
+
+@pytest.mark.parametrize("status", [404, 500, 503])
+async def test_a_report_that_stays_404_or_5xx_is_asked_for_the_whole_120_s_and_says_which(status):
+    outcome, waited, asked = await wait_for_report(status)
+    assert outcome.problems == [f"no report after 120 s (the last answer was HTTP {status})"]
+    assert outcome.report_http == status
+    assert (asked, waited) == (61, pytest.approx(120.0))
+
+
+async def test_a_server_that_never_answers_is_asked_until_120_s_and_the_problem_says_so():
+    outcome, waited, asked = await wait_for_report(httpx.ConnectError("refused"))
+    assert outcome.problems == ["no report after 120 s (the last ask got no answer)"]
+    assert outcome.report_http is None
+    assert (asked, waited) == (61, pytest.approx(120.0))
+
+
+async def test_an_answer_that_lost_its_status_to_a_hiccup_is_still_reported_by_its_last_status():
+    outcome, _, _ = await wait_for_report(404, httpx.ReadTimeout("slow"))
+    assert outcome.report_http == 404  # the last status the server gave
+    assert outcome.problems == ["no report after 120 s (the last ask got no answer)"]
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 405, 422])
+async def test_an_answer_that_cannot_turn_into_a_report_stops_the_wait_at_once(status):
+    outcome, waited, asked = await wait_for_report(status, 200)
+    assert outcome.problems == [f"the report answered HTTP {status}"]
+    assert outcome.report_http == status and not smoke.report_ok(outcome)
+    assert (asked, waited) == (1, 0.0)
+
+
+def test_only_an_answer_that_can_still_change_is_asked_for_again():
+    again = [202, 404, 408, 425, 429, 500, 502, 503, 504, 599]
+    stop = [100, 201, 204, 301, 302, 400, 401, 403, 405, 410, 422, 499]
+    assert [s for s in again if not smoke.report_may_change(s)] == []
+    assert [s for s in stop if smoke.report_may_change(s)] == []
+
+
 # --- the whole flow, against the real app --------------------------------------------------------
 
 OPENING_S, FIRST_REPLY_S, SECOND_REPLY_S = 0.4, 1.0, 0.5

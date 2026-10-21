@@ -8,10 +8,11 @@ It acts like the browser. It starts a full interview with the owner key, opens t
 socket, and streams 16 kHz microphone frames from the moment the socket opens (silence when
 nothing is being said, because the server ends a call that hears nothing for 2 s). It waits for
 the interviewer's opening line, answers it, talks over the reply, ends the call, and waits for
-the graded report. It prints each step as it passes or fails, and exits 0 only if the pieces
-worked: the opening line was heard, a reply to answer 1 was heard, a flush arrived after the
-interruption, the server said the call ended, and the report came back that was not
-"grading_failed". Exit 1 means a step failed, 2 means it could not get started.
+the graded report, asking every 2 s for up to 120 s (a 404, a 5xx or a dropped request in that
+time is asked again, not a failure). It prints each step as it passes or fails, and exits 0
+only if the pieces worked: the opening line was heard, a reply to answer 1 was heard, a flush
+arrived after the interruption, the server said the call ended, and the report came back that
+was not "grading_failed". Exit 1 means a step failed, 2 means it could not get started.
 
 It never prints the owner key, the socket token (the whole socket path), a Vapi call id or any
 .env value. Everything it prints goes through one `Printer` that blanks those out, and the
@@ -62,6 +63,11 @@ ENDED_WAIT_S = 10.0
 SEND_SLACK_S = 10.0  # time allowed to send an answer, on top of its length
 REPORT_POLL_S = 2.0
 REPORT_WAIT_S = 120.0
+# Answers to the report request that can still turn into a 200 if it is asked again: 202 is
+# "grading", 404 is an interview the server has not marked ended yet (it writes the mark with a
+# 1 s limit, so this can last a moment), and 408, 425 and 429 mean "try again". Any 5xx is a
+# server or proxy hiccup. Everything else (400, 401, 403, a redirect) will not change.
+REPORT_RETRY_STATUSES = frozenset({202, 404, 408, 425, 429})
 HTTP_TIMEOUT_S = 15.0
 
 HIDDEN = "[hidden]"
@@ -250,6 +256,11 @@ class Outcome:
     scored_items: int = 0
     verified_quotes: int = 0
     problems: list[str] = field(default_factory=list)
+
+
+def report_may_change(status: int) -> bool:
+    """Whether a report request that got `status` is worth asking again."""
+    return status in REPORT_RETRY_STATUSES or status >= 500
 
 
 def report_ok(outcome: Outcome) -> bool:
@@ -591,19 +602,34 @@ async def drive_call(config: Config, url: str, out: Printer, outcome: Outcome) -
 
 
 async def fetch_report(
-    http: httpx.AsyncClient, interview_id: str, config: Config, out: Printer, outcome: Outcome
+    http: httpx.AsyncClient,
+    interview_id: str,
+    config: Config,
+    out: Printer,
+    outcome: Outcome,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> None:
-    """Ask for the report until it is there: 202 means it is on its way, 200 is the report."""
+    """Ask for the report every `poll_every_s` until it is a 200, for up to `report_wait_s`.
+
+    Anything that can still become a report is asked again: 202 (being graded), 404 (the server
+    has not yet marked the interview ended, which routes_api.py documents and the browser's
+    pollReport allows for), a 5xx, or no answer at all. The wait gives up only at the time
+    limit, and says what the last answer was. A status that cannot recover, such as a 400 or
+    403, stops it at once.
+    """
     out.note("waiting for the report")
-    deadline = time.monotonic() + config.report_wait_s
+    deadline = clock() + config.report_wait_s
     while True:
-        status = response = None
+        response = None
         try:
             response = await http.get(f"/api/interviews/{interview_id}/report")
-            status = response.status_code
         except httpx.HTTPError:
-            pass  # a hiccup: ask again until the time is up
-        outcome.report_http = status
+            pass  # no answer this time: ask again until the time is up
+        status = response.status_code if response is not None else None
+        if status is not None:
+            outcome.report_http = status  # a hiccup later does not erase the last status seen
         if status == 200:
             try:
                 report = response.json()
@@ -614,13 +640,18 @@ async def fetch_report(
             outcome.scored_items, outcome.verified_quotes = count_report(report)
             out.note(f"report ready: {outcome.report_status}")
             return
-        if status is not None and status != 202:
+        if status is not None and not report_may_change(status):
             outcome.problems.append(f"the report answered HTTP {status}")
             return
-        if time.monotonic() >= deadline:
-            outcome.problems.append(f"no report after {config.report_wait_s:g} s")
+        if clock() >= deadline:
+            last = (
+                f"the last answer was HTTP {status}"
+                if status is not None
+                else "the last ask got no answer"
+            )
+            outcome.problems.append(f"no report after {config.report_wait_s:g} s ({last})")
             return
-        await asyncio.sleep(config.poll_every_s)
+        await sleep(config.poll_every_s)
 
 
 async def run_smoke(config: Config, out: Printer) -> Outcome:
