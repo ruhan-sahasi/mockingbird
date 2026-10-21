@@ -250,8 +250,11 @@ class Relay:
         await self._send_browser(FLUSH)
 
     async def _hang_up(self, reason: str) -> None:
-        # Vapi first: end-call is what stops the call, and the bill.
-        await self._attempt("send end-call to Vapi", self._vapi.send_text(END_CALL))
+        # Vapi first: end-call is what stops the call, and the bill. If it fails, the call may run
+        # on until Vapi's own limit, so that is a warning: uvicorn drops an app logger's INFO.
+        await self._attempt(
+            "send end-call to Vapi", self._vapi.send_text(END_CALL), level=logging.WARNING
+        )
         # Then the two sides at once, so a browser that has stopped reading cannot hold up the
         # Vapi close, and a slow closing handshake with Vapi cannot hold up the browser.
         await asyncio.gather(
@@ -268,15 +271,16 @@ class Relay:
         await self._attempt("tell the browser the call ended", self._browser.send_text(ended))
         await self._attempt("close the browser socket", self._browser.close())
 
-    async def _attempt(self, what: str, step: Awaitable[None]) -> None:
+    async def _attempt(self, what: str, step: Awaitable[None], level: int = logging.INFO) -> None:
         """Await one hang-up step for at most hang_up_timeout_s. A failure, running out of time
-        included, is logged and the hang-up goes on to the next step."""
+        included, is logged at `level` and the hang-up goes on to the next step. Most failures
+        are routine (the browser is gone, which is often why the call is ending)."""
         try:
             async with asyncio.timeout(self._hang_up_timeout_s):
                 await step
         except Exception as exc:
             # Only the type: a library's message could hold a URL (ruling R19).
-            log.info("could not %s: %s", what, type(exc).__name__)
+            log.log(level, "could not %s: %s", what, type(exc).__name__)
 
     async def _stop_when_ending(self) -> None:
         await self._stopping.wait()

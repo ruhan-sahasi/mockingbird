@@ -65,6 +65,12 @@ def test_build_assistant_exact():
         "startSpeakingPlan": {"waitSeconds": 0.4},
         "stopSpeakingPlan": {"numWords": 0, "voiceSeconds": 0.2, "backoffSeconds": 1},
         "artifactPlan": {"recordingEnabled": False},
+        # Vapi's default end-of-call analysis would send each transcript to one more model, which
+        # the consent does not name, and store a summary of the answers at Vapi.
+        "analysisPlan": {
+            "summaryPlan": {"enabled": False},
+            "successEvaluationPlan": {"enabled": False},
+        },
     }
 
 
@@ -273,3 +279,86 @@ async def test_error_says_what_failed_for_a_network_timeout(vapi: VapiClient, re
 
     with pytest.raises(VapiError, match="ReadTimeout"):
         await vapi.create_call(assistant())
+
+
+# --- deleting a call's data at Vapi (the 7-day retention) ---------------------------------------
+
+DELETE_CALL_URL = f"https://api.vapi.ai/call/{CALL_ID}"
+
+
+async def test_delete_call_deletes_the_call_at_vapi(vapi: VapiClient, respx_mock):
+    route = respx_mock.delete(DELETE_CALL_URL).respond(200, json={"id": CALL_ID})
+
+    await vapi.delete_call(CALL_ID)
+
+    request = route.calls.last.request
+    assert request.headers["authorization"] == f"Bearer {API_KEY}"
+
+
+async def test_delete_call_quotes_the_id_into_one_path_segment(vapi: VapiClient, respx_mock):
+    # The id comes from our own database, but it must never be able to reach another path.
+    route = respx_mock.delete("https://api.vapi.ai/call/a%2F..%2Fassistant").respond(200)
+
+    await vapi.delete_call("a/../assistant")
+
+    assert route.called
+
+
+async def test_delete_call_counts_a_call_vapi_no_longer_has_as_deleted(
+    vapi: VapiClient, respx_mock
+):
+    respx_mock.delete(DELETE_CALL_URL).respond(404, json={"message": "Not Found"})
+
+    await vapi.delete_call(CALL_ID)  # no error: there is nothing left to delete
+
+
+async def test_delete_call_has_its_own_timeout(respx_mock):
+    route = respx_mock.delete(DELETE_CALL_URL).respond(200)
+
+    async with httpx.AsyncClient(timeout=None) as client_without_timeout:
+        await VapiClient(API_KEY, client_without_timeout).delete_call(CALL_ID)
+
+    timeout = route.calls.last.request.extensions["timeout"]
+    assert all(seconds is not None and seconds <= 15 for seconds in timeout.values())
+
+
+async def test_delete_call_does_not_follow_a_redirect(respx_mock):
+    respx_mock.delete(DELETE_CALL_URL).respond(307, headers={"location": "https://elsewhere.test/"})
+    elsewhere = respx_mock.delete("https://elsewhere.test/").respond(200)
+
+    async with httpx.AsyncClient(follow_redirects=True) as following_client:
+        with pytest.raises(VapiError, match="307"):
+            await VapiClient(API_KEY, following_client).delete_call(CALL_ID)
+
+    assert not elsewhere.called
+
+
+LEAKY_DELETE_FAILURES = {
+    "500 whose message echoes the id, the url and the key": lambda respx_mock: respx_mock.delete(
+        DELETE_CALL_URL
+    ).respond(
+        500, json={"message": f"could not delete {CALL_ID} at {DELETE_CALL_URL} for {API_KEY}"}
+    ),
+    "a network timeout": lambda respx_mock: respx_mock.delete(DELETE_CALL_URL).mock(
+        side_effect=httpx.ReadTimeout(f"timed out on {DELETE_CALL_URL} with {API_KEY}")
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "arrange", LEAKY_DELETE_FAILURES.values(), ids=LEAKY_DELETE_FAILURES.keys()
+)
+async def test_a_failed_delete_raises_an_error_with_no_id_url_or_key(
+    arrange, vapi: VapiClient, respx_mock
+):
+    arrange(respx_mock)
+
+    with pytest.raises(VapiError) as excinfo:
+        await vapi.delete_call(CALL_ID)
+
+    error = excinfo.value
+    for text in (str(error), repr(error), "".join(traceback.format_exception(error))):
+        assert "://" not in text
+        assert API_KEY not in text
+        assert CALL_ID not in text
+    assert str(error).startswith(("Vapi returned 500", "Vapi request failed: ReadTimeout"))

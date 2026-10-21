@@ -20,6 +20,7 @@ import queue
 import threading
 import time
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs
 
@@ -38,7 +39,13 @@ from mockingbird.plan import DEMO, InterviewPlan, Question
 from mockingbird.relay import Relay
 from mockingbird.report import GradeResult, ItemGrade, QuestionGrade
 from mockingbird.routes_api import QUESTIONS_PATH
-from mockingbird.sessions import LiveSession, SessionRegistry, run_sweeper, sweep_once
+from mockingbird.sessions import (
+    LiveSession,
+    SessionRegistry,
+    purge_once,
+    run_sweeper,
+    sweep_once,
+)
 from mockingbird.sse import SSE_DONE
 from mockingbird.store import MemoryStore
 from mockingbird.vapi_client import VapiCall, VapiError
@@ -49,6 +56,7 @@ WEBHOOK_SECRET = "test-webhook-secret"
 LLM_PATH = f"/vapi/llm/{BRAIN_SECRET}/chat/completions"
 WEBHOOK_PATH = f"/vapi/webhook/{WEBHOOK_SECRET}"
 CALL_ID = "call_1"
+SITE = "https://mockingbird.test"  # public_base_url in conftest's settings
 SOCKET_URL = "ws://fake"
 ENDED_LINE = "Sorry, this interview has ended."
 DEFAULT_LINE = "Tell me more about that."
@@ -98,16 +106,25 @@ class FakeStreamer:
 
 
 class FakeVapi:
+    """Vapi's REST API. `delete_errors` makes delete_call fail for the calls named in it."""
+
     def __init__(self) -> None:
         self.call_id = CALL_ID
         self.assistants: list[dict] = []
         self.error: Exception | None = None
+        self.deleted: list[str] = []
+        self.delete_errors: dict[str, Exception] = {}
 
     async def create_call(self, assistant: dict) -> VapiCall:
         self.assistants.append(assistant)
         if self.error is not None:
             raise self.error
         return VapiCall(self.call_id, SOCKET_URL)
+
+    async def delete_call(self, call_id: str) -> None:
+        if call_id in self.delete_errors:
+            raise self.delete_errors[call_id]
+        self.deleted.append(call_id)
 
 
 class FakeVapiConnection:
@@ -222,8 +239,9 @@ def app(settings, fakes):
 
 @pytest.fixture
 def client(app):
-    # https, so the client sends the Secure visitor cookie back.
-    with TestClient(app, base_url="https://testserver") as c:
+    # https, so the client sends the Secure visitor cookie back, and the Origin a browser on the
+    # site sends with a start (routes_api.py refuses a start without it).
+    with TestClient(app, base_url="https://testserver", headers={"origin": SITE}) as c:
         yield c
 
 
@@ -394,6 +412,50 @@ def test_an_owner_start_is_a_full_interview_with_three_questions(client, fakes, 
     assert len(set(interview.questions)) == 3
 
 
+# --- the time caps -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("owner", "cap_s", "minutes"), [(False, 120, 2), (True, 90, 1)], ids=["demo", "full"]
+)
+def test_the_cap_from_the_settings_reaches_the_relay_vapi_and_the_plan(
+    settings, fakes, monkeypatch, owner, cap_s, minutes
+):
+    # The three cost controls for one call: the relay ends it at the cap, Vapi's own limit is the
+    # backstop 30 s later, and the plan's clock wraps up before the cap. Each must follow
+    # DEMO_CAP_S or FULL_CAP_S, not the default 300 or 1200.
+    relays: list[float] = []
+
+    def recording_relay(*args, **kwargs):
+        relays.append(kwargs["cap_s"])
+        return Relay(*args, browser_timeout_s=30.0, **kwargs)
+
+    monkeypatch.setattr(routes_ws, "Relay", recording_relay)
+    capped = settings.model_copy(update={"demo_cap_s": 120, "full_cap_s": 90})
+    app = create_app(
+        capped,
+        store=fakes.store,
+        vapi=fakes.vapi,
+        streamer_factory=lambda: fakes.streamer,
+        grader=fakes.grader,
+    )
+    headers = {"X-Owner-Key": settings.owner_key} if owner else {}
+
+    with TestClient(app, base_url="https://testserver", headers={"origin": SITE}) as client:
+        body = start(client, **headers)
+        assert body["cap_s"] == cap_s
+        assert get(client, fakes.store, body["interview_id"]).cap_s == cap_s
+
+        with client.websocket_connect(body["ws_path"]) as ws:
+            client.portal.call(fakes.vapi_socket.wait_reading)
+            [assistant] = fakes.vapi.assistants
+            assert assistant["maxDurationSeconds"] == cap_s + 30
+            # The opening line states the plan's clock, which is the cap.
+            assert f"This is a {minutes} minute behavioral interview" in assistant["firstMessage"]
+            assert relays == [cap_s]
+            hang_up(app, ws, body["interview_id"])
+
+
 # --- WS /ws/interview/{id} ---------------------------------------------------------------------
 
 
@@ -492,6 +554,13 @@ def test_ws_token_reuse_closes_4401(client, app, fakes):
     assert closed_with(client, body["ws_path"]) == 4401
 
 
+def test_the_close_codes_are_the_ones_the_browser_expects():
+    # web/src/interviewSession.test.ts reads the same file and maps each code to its message.
+    wire = json.loads((Path(__file__).parent / "fixtures" / "wire_protocol.json").read_text())
+    assert routes_ws.TOKEN_REJECTED == wire["close_codes"]["token_rejected"]
+    assert routes_ws.INTERNAL_ERROR == wire["close_codes"]["call_not_started"]
+
+
 @pytest.mark.parametrize("wrong", ["token", "interview"])
 def test_ws_with_a_wrong_token_or_interview_closes_4401(client, app, fakes, wrong):
     body = start(client)
@@ -529,6 +598,8 @@ def test_a_call_that_cannot_be_created_closes_the_socket_and_frees_the_visitor(
 
     interview = get(client, fakes.store, body["interview_id"])
     assert (interview.status, interview.ended_reason) == ("abandoned", "error")
+    # Vapi's reason is already scrubbed of secrets, and it is what a first deploy needs to see.
+    assert "failed: VapiError: Vapi returned 500: try again" in caplog.text
     # No call ran, so the visitor's demo for today is not spent.
     fakes.vapi.error = None
     assert client.post("/api/interviews").status_code == 201
@@ -649,6 +720,38 @@ def test_speech_started_event_commits_draft(client, app, fakes):
         ("candidate", answer),
         ("interviewer", DEFAULT_LINE),
     ]
+
+
+@pytest.mark.parametrize("reply", ["written", "still_streaming"])
+def test_an_answer_the_call_ends_on_is_saved_and_graded(client, app, fakes, reply):
+    # The visitor answers and presses End before the interviewer replies: Vapi has asked the
+    # brain for a reply, and never started speaking it. The answer must still be graded.
+    if reply == "still_streaming":
+        fakes.streamer.scripts = [["Tell me", HANG]]
+    body = start(client)
+    interview_id = body["interview_id"]
+    answer = f"{FakeGrader.QUOTE} and walked the team through it."
+
+    with client.websocket_connect(body["ws_path"]) as ws:
+        client.portal.call(fakes.vapi_socket.wait_reading)
+        if reply == "written":
+            assert said(ask(client, answer)) == DEFAULT_LINE
+        else:
+            thread, _ = in_background(lambda: ask(client, answer))
+            assert fakes.streamer.hanging.get(timeout=2) == 1
+        hang_up(app, ws, interview_id)
+    if reply == "still_streaming":
+        thread.join(2)
+        assert fakes.streamer.cancelled == 1
+
+    turns = client.portal.call(fakes.store.list_turns, interview_id)
+    assert [(t.speaker, t.text, t.question_idx) for t in turns][1:] == [("candidate", answer, 0)]
+    report_url = f"/api/interviews/{interview_id}/report"
+    wait_until(lambda: client.get(report_url).status_code == 200)
+    report = client.get(report_url).json()
+    assert report["status"] == "graded"
+    assert report["questions"][0]["items"][0]["quotes"] == [FakeGrader.QUOTE]
+    assert fakes.grader.calls == 1
 
 
 def test_assistant_stopped_after_committed_wrap_up_ends_call(client, app, fakes):
@@ -1033,6 +1136,39 @@ async def test_sweep_leaves_alone_an_interview_its_route_ended_after_the_sweep_l
     assert (ended.status, ended.ended_reason, ended.duration_s) == ("ended", "cap", 297)
 
 
+async def test_sweep_abandons_a_created_interview_that_a_restart_left_behind():
+    # Its session was in the memory of the process that stopped, so its token is gone and it can
+    # never start. Created, it held its visitor's demo and a cap of the budget all day.
+    store = MemoryStore()
+    registry = SessionRegistry()
+    now = time.time()
+
+    def created(id: str, age_s: float) -> Interview:
+        return Interview(
+            id=id,
+            mode="demo",
+            status="created",
+            visitor_hash=f"v-{id}",
+            ip_hash=f"ip-{id}",
+            cap_s=300,
+            questions=["Q"],
+            created_at=datetime.fromtimestamp(now - age_s, UTC),
+        )
+
+    orphan, young, opening = created("orphan", 61), created("young", 30), created("opening", 90)
+    for i in (orphan, young, opening):
+        await store.create_interview(i)
+    registry.add(make_session(opening))  # its token was used; its route is connecting the call
+
+    await sweep_once(registry, store, now)
+
+    assert (await store.get_interview("orphan")).status == "abandoned"
+    assert (await store.get_interview("young")).status == "created"
+    assert (await store.get_interview("opening")).status == "created"
+    assert await store.starts_today("v-orphan", "ip-orphan") == 0
+    assert await store.seconds_used_today() == 2 * 300
+
+
 async def test_sweep_leaves_a_session_whose_token_was_used_alone():
     store = MemoryStore()
     registry = SessionRegistry()
@@ -1073,12 +1209,12 @@ class SweptStore(MemoryStore):
             raise RuntimeError(f"the database is down, call {CALL_ID}")
         return await super().list_live_interviews()
 
-    async def delete_demo_data_older_than(self, days: int) -> int:
+    async def delete_demo_data_older_than(self, days: int, **kwargs) -> int:
         self.purges.append((days, self.sweeps))
         if self.failing_purges:
             self.failing_purges -= 1
             raise RuntimeError(f"the database is down, call {CALL_ID}")
-        return await super().delete_demo_data_older_than(days)
+        return await super().delete_demo_data_older_than(days, **kwargs)
 
 
 T0 = 1_800_000_000.0  # some time in 2027, in seconds since the epoch
@@ -1117,7 +1253,9 @@ async def test_the_sweeper_sweeps_every_minute_and_deletes_week_old_demo_data_ho
         await asyncio.sleep(0)
 
     clock = scripted_clock(0, 60, 3599, 3600, 3660, 7199, 7200)  # one reading per sweep
-    sweeper = asyncio.create_task(run_sweeper(SessionRegistry(), store, clock=clock, sleep=sleep))
+    sweeper = asyncio.create_task(
+        run_sweeper(SessionRegistry(), store, FakeVapi(), clock=clock, sleep=sleep)
+    )
     await until(lambda: store.sweeps >= 9)
     await stop(sweeper)
 
@@ -1131,7 +1269,9 @@ async def test_a_failing_sweep_or_purge_is_logged_and_the_sweeper_goes_on(caplog
     store.failing_sweeps = 2
     store.failing_purges = 1
     clock = scripted_clock(0, 60, 120, 3600)
-    sweeper = asyncio.create_task(run_sweeper(SessionRegistry(), store, clock=clock, sleep=no_wait))
+    sweeper = asyncio.create_task(
+        run_sweeper(SessionRegistry(), store, FakeVapi(), clock=clock, sleep=no_wait)
+    )
     await until(lambda: store.sweeps >= 5)
     await stop(sweeper)
 
@@ -1156,7 +1296,7 @@ async def test_cancelling_the_sweeper_stops_it_whatever_it_is_doing(when):
             return listed
 
     store = Store()
-    sweeper = asyncio.create_task(run_sweeper(SessionRegistry(), store))
+    sweeper = asyncio.create_task(run_sweeper(SessionRegistry(), store, FakeVapi()))
     if when == "mid_sweep":
         await until(lambda: store.sweeps == 1)
     else:
@@ -1164,6 +1304,88 @@ async def test_cancelling_the_sweeper_stops_it_whatever_it_is_doing(when):
         await asyncio.sleep(0)
 
     await stop(sweeper)
+
+
+def old_demo(id: str, call_id: str | None, days: float = 8, mode: str = "demo") -> Interview:
+    return Interview(
+        id=id,
+        mode=mode,
+        status="graded",
+        visitor_hash="v",
+        ip_hash="ip",
+        cap_s=300,
+        questions=["Q"],
+        created_at=datetime.now(UTC) - timedelta(days=days),
+        vapi_call_id=call_id,
+    )
+
+
+async def test_the_purge_deletes_each_old_demos_call_at_vapi_before_its_row():
+    # Vapi keeps its own copy of every call: the transcript, the messages, logs and a summary.
+    # The 7-day retention covers that copy too, and only the row knows which call it was.
+    store = MemoryStore()
+    for interview in (
+        old_demo("old-a", "call-a"),
+        old_demo("old-b", "call-b"),
+        old_demo("old-no-call", None),  # its call never got created
+        old_demo("recent", "call-recent", days=6),
+        old_demo("old-full", "call-full", mode="full"),  # full mode is kept, here and at Vapi
+    ):
+        await store.create_interview(interview)
+
+    class Vapi(FakeVapi):
+        async def delete_call(self, call_id: str) -> None:
+            assert await store.get_interview_by_call(call_id) is not None  # the row comes after
+            await super().delete_call(call_id)
+
+    vapi = Vapi()
+    await purge_once(store, vapi)
+
+    assert sorted(vapi.deleted) == ["call-a", "call-b"]
+    for gone in ("old-a", "old-b", "old-no-call"):
+        assert await store.get_interview(gone) is None
+    for kept in ("recent", "old-full"):
+        assert await store.get_interview(kept) is not None
+
+
+async def test_a_call_vapi_would_not_delete_keeps_its_row_for_the_next_purge(caplog):
+    caplog.set_level(logging.DEBUG)
+    secret_id = "01a15690-48f3-7331-a348-64c2e5c04886"
+    store = MemoryStore()
+    await store.create_interview(old_demo("stuck", secret_id))
+    await store.create_interview(old_demo("fine", "call-fine"))
+    vapi = FakeVapi()
+    vapi.delete_errors = {
+        secret_id: VapiError("Vapi returned 503: try again"),
+    }
+
+    await purge_once(store, vapi)
+
+    assert vapi.deleted == ["call-fine"]
+    assert await store.get_interview("fine") is None
+    assert (await store.get_interview("stuck")).vapi_call_id == secret_id
+    [warning] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert "Vapi returned 503: try again" in warning.getMessage()
+    assert secret_id not in caplog.text
+
+    vapi.delete_errors = {}
+    await purge_once(store, vapi)  # an hour later
+    assert vapi.deleted == ["call-fine", secret_id]
+    assert await store.get_interview("stuck") is None
+
+
+async def test_a_purge_whose_vapi_delete_breaks_logs_only_the_error_type(caplog):
+    caplog.set_level(logging.DEBUG)
+    store = MemoryStore()
+    await store.create_interview(old_demo("stuck", "call-stuck"))
+    vapi = FakeVapi()
+    vapi.delete_errors = {"call-stuck": RuntimeError("bug near call-stuck")}
+
+    await purge_once(store, vapi)
+
+    assert await store.get_interview("stuck") is not None
+    assert "RuntimeError" in caplog.text
+    assert "call-stuck" not in caplog.text
 
 
 def test_the_app_runs_the_sweeper_from_start_up_to_shutdown(settings, fakes):

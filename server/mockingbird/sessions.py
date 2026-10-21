@@ -14,6 +14,10 @@ session's repr, and nothing here logs either of them.
 `sweep_once` runs every minute from `run_sweeper`:
 - a session whose token ran out unused is removed, and its interview marked `abandoned`, which
   gives the visitor their demo back (abandoned interviews do not count as starts);
+- any interview the store still has as `created`, older than a token's life, that no session here
+  holds is marked `abandoned` too. Those are the starts a restart (every deploy is one) left
+  behind: their tokens were in the old process's memory, so they can never start, and as
+  `created` each would hold its visitor's demo and a cap of the day's budget until midnight;
 - any interview the store still has as `live` well past its cap is marked ended with the reason
   "stale" and its cap as its duration (ruling R23). That is mostly a call this process lost
   track of in a crash, and until it is ended the daily budget keeps counting its full cap. It
@@ -21,7 +25,10 @@ session's repr, and nothing here logs either of them.
   its token's minute goes live a little over a minute after it was created, so its last few
   seconds can pass the stale line. That call's route marks it ended again when it does end,
   with the real reason and duration, so the stale mark only stands for a call nobody ends.
-`run_sweeper` also deletes demo data older than RETENTION_DAYS, once an hour.
+`run_sweeper` also deletes demo data older than RETENTION_DAYS, once an hour (`purge_once`). That
+covers Vapi's copy of each call too, the transcript, messages, logs and analysis it keeps: each
+old demo's call is deleted at Vapi first, while its row still holds the call id, and a row whose
+call Vapi would not delete is kept, call id and all, for the next purge to try again.
 """
 
 import asyncio
@@ -30,8 +37,11 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Protocol
 
 from mockingbird.brain import Brain
+from mockingbird.failures import describe
 from mockingbird.models import Interview
 from mockingbird.relay import Relay
 from mockingbird.store import Store
@@ -45,6 +55,12 @@ STALE_AFTER_CAP_S = 60
 SWEEP_EVERY_S = 60.0
 PURGE_EVERY_S = 3600.0
 RETENTION_DAYS = 7  # demo audio and transcripts are deleted after this many days (the spec)
+
+
+class CallDeleter(Protocol):
+    """The part of VapiClient the purge uses."""
+
+    async def delete_call(self, call_id: str) -> None: ...
 
 
 @dataclass
@@ -109,7 +125,8 @@ class SessionRegistry:
 
 
 async def sweep_once(registry: SessionRegistry, store: Store, now: float) -> None:
-    """Abandon the interviews whose token ran out unused, and end the stale live ones.
+    """Abandon the interviews whose token ran out unused or that nothing holds, and end the
+    stale live ones.
 
     `now` is in seconds since the epoch. Each write is tried on its own, so one that fails does
     not stop the rest; it is tried again on the next sweep.
@@ -122,6 +139,15 @@ async def sweep_once(registry: SessionRegistry, store: Store, now: float) -> Non
                 "abandon an unused interview",
                 store.update_interview(s.interview.id, status="abandoned"),
             )
+
+    # A start younger than a token's life may be one whose session is about to be added.
+    await _attempt(
+        "abandon the starts nothing holds",
+        store.abandon_unstarted(
+            created_before=datetime.fromtimestamp(now - TOKEN_TTL_S, UTC),
+            keep=[s.interview.id for s in registry.sessions()],
+        ),
+    )
 
     for i in await store.list_live_interviews():
         if i.created_at.timestamp() + i.cap_s + STALE_AFTER_CAP_S < now:
@@ -140,6 +166,7 @@ async def _end_stale(store: Store, i: Interview) -> None:
 async def run_sweeper(
     registry: SessionRegistry,
     store: Store,
+    vapi: CallDeleter,
     *,
     clock: Callable[[], float] = time.time,
     every_s: float = SWEEP_EVERY_S,
@@ -155,12 +182,24 @@ async def run_sweeper(
         await _attempt("sweep the sessions", sweep_once(registry, store, now))
         if last_purge is None or now - last_purge >= purge_every_s:
             last_purge = now
-            await _attempt("delete old demo data", _purge(store))
+            await _attempt("delete old demo data", purge_once(store, vapi))
         await sleep(every_s)
 
 
-async def _purge(store: Store) -> None:
-    deleted = await store.delete_demo_data_older_than(RETENTION_DAYS)
+async def purge_once(store: Store, vapi: CallDeleter) -> None:
+    """Delete the demo data older than RETENTION_DAYS: each call's copy at Vapi first, then our
+    rows. A row whose call Vapi would not delete is kept for the next purge."""
+    deleted_at_vapi = []
+    for call_id in await store.demo_calls_older_than(RETENTION_DAYS):
+        try:
+            await vapi.delete_call(call_id)
+        except Exception as exc:
+            # A VapiError's message holds no call id, URL or key; anything else gives its type.
+            msg = "could not delete an old call at Vapi, kept for the next purge: %s"
+            log.warning(msg, describe(exc))
+        else:
+            deleted_at_vapi.append(call_id)
+    deleted = await store.delete_demo_data_older_than(RETENTION_DAYS, vapi_deleted=deleted_at_vapi)
     if deleted:
         log.info("deleted %d demo interview(s) older than %d days", deleted, RETENTION_DAYS)
 

@@ -371,9 +371,10 @@ async def test_a_draft_that_is_never_committed_changes_nothing():
     assert brain.turns == turns_before
     assert not brain.finished
 
-    # The call ends without Vapi ever speaking it.
+    # The call ends without Vapi ever speaking it. The reply leaves no trace in the history, and
+    # only the candidate's answer is recorded, so it can still be graded.
     assert settled(brain) == history_before
-    assert brain.turns == turns_before
+    assert brain.turns == [*turns_before, Turn(1, "candidate", "I led the migration.", 0)]
 
     # The plan did not move either: the same text gets the same request again.
     assert await hear(brain, "I led the migration.") == ["Second draft."]
@@ -792,7 +793,8 @@ async def test_closing_an_uncommitted_draft_early_closes_claude_stream_and_leave
 
     assert streamer.closed == 1  # the Claude stream was shut, not left to the garbage collector
     assert settled(brain) == history_before
-    assert brain.turns == turns_before
+    # The call ended on that answer, so it is kept; the reply that was never spoken is not.
+    assert brain.turns == [*turns_before, Turn(1, "candidate", "I led the migration.", 0)]
 
 
 async def test_closing_a_committed_draft_early_records_the_partial_text():
@@ -885,15 +887,82 @@ async def test_finalize_with_a_reply_still_streaming_records_the_partial_text():
     assert brain.history[-1] == {"role": "assistant", "content": "Tell me"}  # no late changes
 
 
-async def test_finalize_drops_a_draft_that_was_never_spoken():
+async def test_finalize_records_the_answer_of_a_draft_that_was_never_spoken():
+    # The call ends (End, the cap, a dropped connection) before Vapi speaks the reply to the
+    # newest answer. The answer is the candidate's words and is kept; the reply is dropped.
     brain, _ = started(DEMO, FakeStreamer(["Tell me more."]))
     await hear(brain, "I led the migration.")
     history_before, turns_before = brain.history, brain.turns
 
     brain.finalize()
     assert brain.commit_spoken() is False
-    assert brain.history == history_before
-    assert brain.turns == turns_before
+    assert brain.history == history_before  # nothing more will be asked of Claude
+    assert brain.turns == [*turns_before, Turn(1, "candidate", "I led the migration.", 0)]
+    assert not brain.finished
+
+    brain.finalize()  # finalizing twice records it once
+    assert len(brain.turns) == 2
+
+
+async def test_finalize_records_the_answer_whose_reply_was_still_being_written():
+    # The route cancels a reply still streaming before it finalizes, and a cancelled draft is no
+    # longer pending. Its answer is still the newest thing the candidate said.
+    brain, _ = started(DEMO, FakeStreamer(["Tell me", HANG]))
+    task, heard = start_draft(brain, "I led the migration.")
+    await wait_for(lambda: heard)
+    await cancel(task)
+
+    brain.finalize()
+    assert [(t.speaker, t.text, t.question_idx) for t in brain.turns][1:] == [
+        ("candidate", "I led the migration.", 0)
+    ]
+    assert len(brain.history) == 2
+
+
+async def test_finalize_records_only_the_newest_answer():
+    # Vapi's requests carry the whole answer so far, so the newest one has all of it.
+    brain, _ = started(DEMO, FakeStreamer(["One."], ["Two."], ["Three."]))
+    for partial in ("I led", "I led the migration", "I led the migration and it shipped."):
+        await hear(brain, partial)
+
+    brain.finalize()
+    assert [(t.speaker, t.text) for t in brain.turns][1:] == [
+        ("candidate", "I led the migration and it shipped.")
+    ]
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+async def test_finalize_records_no_answer_for_a_blank_request(blank):
+    brain, _ = started(DEMO, FakeStreamer())
+    await hear(brain, blank)
+    brain.finalize()
+    assert [t.speaker for t in brain.turns] == ["interviewer"]
+
+
+async def test_finalize_writes_the_spoken_reply_before_the_answer_that_followed_it():
+    # A reply was spoken, the candidate answered it, and the call ended before the interviewer
+    # replied again. The turns keep the order things were said in.
+    brain, clock = started(FULL, FakeStreamer(["Tell me more."], ["Never spoken."]))
+    clock.advance(60)
+    await say(brain, LONG_ANSWER)
+    await hear(brain, "It shipped a week early.", "Tell me more.")
+
+    brain.finalize()
+    assert [(t.speaker, t.text, t.question_idx) for t in brain.turns] == [
+        ("interviewer", brain.turns[0].text, 0),
+        ("candidate", LONG_ANSWER, 0),
+        ("interviewer", "Tell me more.", 0),
+        ("candidate", "It shipped a week early.", 0),
+    ]
+    assert_history_valid(brain.history)
+    assert [m["content"] for m in brain.history if m["role"] == "user"][1:] == [LONG_ANSWER]
+
+
+async def test_an_answer_that_was_spoken_to_is_not_recorded_again_by_finalize():
+    brain, _ = started(DEMO, FakeStreamer(["Tell me more."]))
+    await say(brain, "I led the migration.")
+    brain.finalize()
+    assert [t.speaker for t in brain.turns] == ["interviewer", "candidate", "interviewer"]
 
 
 async def test_finalize_with_nothing_to_settle_changes_nothing():
@@ -936,7 +1005,11 @@ async def test_a_dropped_draft_that_asks_the_next_question_does_not_move_the_ans
     await say(brain, LONG_ANSWER)
     assert await hear(brain, LONG_ANSWER) == ["Dropped."]  # asks question 1, never spoken
     brain.finalize()
-    assert [(t.speaker, t.question_idx) for t in brain.turns][-1] == ("interviewer", 0)
+    # The answer the call ended on is kept, under question 0; the reply asking question 1 is not.
+    assert [(t.speaker, t.question_idx) for t in brain.turns][-2:] == [
+        ("interviewer", 0),
+        ("candidate", 0),
+    ]
     assert "Dropped." not in [t.text for t in brain.turns]
 
     await say(brain, LONG_ANSWER)  # this time the question is spoken
@@ -1020,6 +1093,8 @@ class RandomSession:
         self.pending: Draft | None = None
         self.committed: Draft | None = None  # spoken, but not settled into the history yet
         self.running: Draft | None = None  # the newest draft's task, in whatever state
+        # The newest draft whose answer no turn holds yet, cancelled or not: finalize() records it.
+        self.unanswered: Draft | None = None
 
     def replayed_plan(self) -> InterviewPlan:
         plan = InterviewPlan(self.config, qs(3))
@@ -1099,6 +1174,7 @@ class RandomSession:
         self.stats["drafts_dropped"] += self.pending is not None
         self.settle(spoken)
         self.pending = None
+        self.unanswered = None
         old = self.running
         calls_before = len(self.streamer.calls)
 
@@ -1119,6 +1195,7 @@ class RandomSession:
             assert len(self.streamer.calls) == calls_before
         else:
             self.pending = draft
+            self.unanswered = draft
             if move.kind is MoveKind.WRAP_UP:
                 assert heard == [WRAP_UP_LINE]
                 assert len(self.streamer.calls) == calls_before
@@ -1141,7 +1218,7 @@ class RandomSession:
             self.stats["commits_while_streaming"] += not draft.task.done()
             self.spoken_inputs.append((draft.elapsed_s, len(draft.text.split())))
             self.turns.append(Turn(len(self.turns), "candidate", draft.text, draft.answering_idx))
-            self.committed, self.pending = draft, None
+            self.committed, self.pending, self.unanswered = draft, None, None
             self.stats["wrap_ups_spoken"] += self.brain.finished
         else:
             self.stats["commits_with_nothing_pending"] += 1
@@ -1150,7 +1227,13 @@ class RandomSession:
     def finalize(self) -> None:
         self.brain.finalize()
         self.settle(None)
-        self.pending = None
+        answer = self.unanswered
+        self.pending = self.unanswered = None
+        if answer is not None and answer.text.strip():
+            # The call ended before any reply to this answer was spoken: only the answer is kept.
+            self.turns.append(Turn(len(self.turns), "candidate", answer.text, answer.answering_idx))
+            self.stats["unanswered_answers_kept"] += 1
+            self.stats["unanswered_answers_kept_after_a_cancel"] += answer.task.cancelled()
         self.stats["finalizes"] += 1
         self.check()
 
@@ -1206,6 +1289,8 @@ async def test_the_random_mixes_reach_every_interesting_case():
         "settled_unfinished",
         "settled_as_cut_off",
         "finalizes",
+        "unanswered_answers_kept",
+        "unanswered_answers_kept_after_a_cancel",
         "cancels",
     ):
         assert total[case] > 0, f"no random session reached {case}"
@@ -1349,6 +1434,28 @@ async def test_anthropic_errors_become_brain_error(error_class, when):
     assert got == (["Tell"] if when == "mid_stream" else [])
     assert client.entered == 1
     assert client.exited == (1 if when == "mid_stream" else 0)  # never entered, so never exited
+
+
+async def test_an_api_error_becomes_a_brain_error_that_names_its_status_type_and_request():
+    # The first live run is where failures show up, so the log line has to say which: the HTTP
+    # status, the error type the API names and the request id. Its free text is left out.
+    response = httpx2.Response(
+        529,
+        headers={"request-id": "req_011CU123"},
+        request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages"),
+    )
+    body = {"type": "error", "error": {"type": "overloaded_error", "message": "free text here"}}
+    error = anthropic.APIStatusError("free text here", response=response, body=body)
+    client = FakeAnthropicClient(open_error=error)
+
+    with pytest.raises(BrainError) as raised:
+        async for _ in AnthropicStreamer(client).stream(system=[], messages=[]):
+            pass
+
+    message = str(raised.value)
+    assert message == (
+        "Claude request failed: APIStatusError (HTTP 529, overloaded_error, request req_011CU123)"
+    )
 
 
 def sse(event: str, data: dict) -> bytes:

@@ -9,6 +9,7 @@ with a session-level SET, which a transaction pooler would not keep from one que
 """
 
 import asyncio
+import json
 import os
 import traceback
 import uuid
@@ -22,7 +23,8 @@ import pytest
 from mockingbird.migrate import MIGRATIONS_DIR, apply_migrations
 from mockingbird.migrate import migrate as run_migrate
 from mockingbird.models import Interview, Turn
-from mockingbird.store import MemoryStore, PostgresStore, create_pool
+from mockingbird.report import GradeResult, ItemGrade, QuestionGrade, _empty_report, verify_quotes
+from mockingbird.store import MemoryStore, PostgresStore, _score_rows, create_pool
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 needs_postgres = pytest.mark.skipif(
@@ -108,6 +110,47 @@ def make_interview(id: str = "i1", **overrides) -> Interview:
 def make_turn(idx: int, **overrides) -> Turn:
     fields = {"idx": idx, "speaker": "candidate", "text": f"line {idx}", "question_idx": 0}
     return Turn(**{**fields, **overrides})
+
+
+# --- the report as the scores and quotes tables hold it (no database needed) -------------------
+
+
+def test_a_report_from_verify_quotes_flattens_into_score_and_quote_rows():
+    # report.py writes the report and PostgresStore._score_rows reads it, with nothing between
+    # them but key names. This pins that contract where CI always runs, Postgres or not.
+    result = GradeResult(
+        questions=[
+            QuestionGrade(
+                question_idx=0,
+                items=[
+                    ItemGrade(
+                        item="action",
+                        score=3,
+                        rationale="Named the steps.",
+                        quotes=["I wrote the migration plan", "we saved a million dollars"],
+                    ),
+                    ItemGrade(
+                        item="result", score=2, rationale="No outcome.", quotes=["it shipped"]
+                    ),
+                ],
+            )
+        ]
+    )
+    report = verify_quotes(result, {0: "I wrote the migration plan and ran it."}, QUESTIONS)
+
+    # A dropped quote is kept with verified False, so the share that verify can be measured.
+    action_quotes = [("I wrote the migration plan", True), ("we saved a million dollars", False)]
+    rows = [
+        (0, "action", 3, "Named the steps.", "scored", action_quotes),
+        (0, "result", None, "No outcome.", "not_enough_evidence", [("it shipped", False)]),
+    ]
+    assert _score_rows(report) == rows
+    assert _score_rows(json.loads(json.dumps(report))) == rows  # as it comes back from jsonb
+
+
+@pytest.mark.parametrize("status", ["no_answers", "grading_failed"])
+def test_a_report_with_no_grade_has_no_score_rows(status):
+    assert _score_rows(_empty_report(status)) == []
 
 
 # --- a throwaway Postgres schema ---------------------------------------------------------------
@@ -435,6 +478,58 @@ async def test_starts_today_ignores_abandoned_other_days_and_full_mode(store):
     assert await store.starts_today("visitor-a", "ip-x") == 4
 
 
+async def test_attempts_today_counts_every_status_abandoned_included(store):
+    # starts_today gives an abandoned start back. attempts_today does not, so no-shows repeated
+    # from one visitor or IP still add up.
+    for id, status in [("a1", "abandoned"), ("a2", "abandoned"), ("e", "ended")]:
+        await store.create_interview(make_interview(id, status=status))
+    await store.create_interview(
+        make_interview("yesterday", status="abandoned", created_at=NOW - timedelta(days=1))
+    )
+    await store.create_interview(make_interview("full", mode="full", status="abandoned"))
+    await store.create_interview(
+        make_interview("elsewhere", visitor_hash="visitor-b", ip_hash="ip-y", status="abandoned")
+    )
+
+    assert await store.attempts_today("visitor-a", "ip-x") == 3
+    assert await store.attempts_today("visitor-a", "someone-else") == 3  # by the cookie alone
+    assert await store.attempts_today("someone-else", "ip-x") == 3  # by the IP alone
+    assert await store.attempts_today("visitor-a", "ip-y") == 4  # one of each
+    assert await store.starts_today("visitor-a", "ip-x") == 1
+
+
+async def test_abandon_unstarted_abandons_old_created_interviews_nobody_holds(store):
+    # After a restart nothing holds the tokens of the interviews created before it, so they can
+    # never start. Left as created, each would hold its cap in the day's budget and its visitor's
+    # demo for the rest of the day.
+    old = NOW - timedelta(minutes=5)
+    await store.create_interview(make_interview("orphan", created_at=old))
+    await store.create_interview(make_interview("held", created_at=old))  # its socket is opening
+    await store.create_interview(make_interview("young"))  # its token is still good
+    await store.create_interview(make_interview("live", status="live", created_at=old))
+    await store.create_interview(make_interview("orphan-full", mode="full", created_at=old))
+    assert await store.seconds_used_today() == 4 * 300
+
+    abandoned = await store.abandon_unstarted(
+        created_before=NOW - timedelta(minutes=1), keep=["held"]
+    )
+
+    assert abandoned == 2
+    statuses = {
+        id: (await store.get_interview(id)).status
+        for id in ("orphan", "held", "young", "live", "orphan-full")
+    }
+    assert statuses == {
+        "orphan": "abandoned",
+        "held": "created",
+        "young": "created",
+        "live": "live",
+        "orphan-full": "abandoned",
+    }
+    assert await store.seconds_used_today() == 3 * 300
+    assert await store.abandon_unstarted(created_before=NOW, keep=["held", "young"]) == 0
+
+
 # --- lookups for the sweeper and the webhook ---------------------------------------------------
 
 
@@ -511,6 +606,39 @@ async def test_an_interview_exactly_seven_days_old_is_kept(store):
     assert await store.delete_demo_data_older_than(7) == 1
     assert await store.get_interview("edge") is not None
     assert await store.get_interview("past-edge") is None
+
+
+async def test_demo_calls_older_than_lists_the_vapi_call_of_each_old_demo(store):
+    old = NOW - timedelta(days=8)
+    await store.create_interview(make_interview("old-a", created_at=old, vapi_call_id="call-a"))
+    await store.create_interview(make_interview("old-b", created_at=old, vapi_call_id="call-b"))
+    await store.create_interview(make_interview("old-no-call", created_at=old))
+    await store.create_interview(make_interview("recent", vapi_call_id="call-recent"))
+    await store.create_interview(
+        make_interview("old-full", mode="full", created_at=old, vapi_call_id="call-full")
+    )
+
+    assert sorted(await store.demo_calls_older_than(7)) == ["call-a", "call-b"]
+
+
+async def test_an_old_demo_that_holds_a_call_id_is_deleted_only_once_vapi_deleted_its_call(store):
+    # The call id is the only way to delete Vapi's copy of the call, so the row keeps it until
+    # that copy is gone. The next purge tries the rest again.
+    old = NOW - timedelta(days=8)
+    await store.create_interview(
+        make_interview("deleted-at-vapi", created_at=old, vapi_call_id="a")
+    )
+    await store.create_interview(make_interview("still-at-vapi", created_at=old, vapi_call_id="b"))
+    await store.create_interview(make_interview("no-call", created_at=old))
+
+    assert await store.delete_demo_data_older_than(7, vapi_deleted=["a"]) == 2
+
+    assert await store.get_interview("deleted-at-vapi") is None
+    assert await store.get_interview("no-call") is None
+    assert (await store.get_interview("still-at-vapi")).vapi_call_id == "b"
+    assert await store.demo_calls_older_than(7) == ["b"]
+    assert await store.delete_demo_data_older_than(7) == 0  # by default no call counts as deleted
+    assert await store.delete_demo_data_older_than(7, vapi_deleted=["b"]) == 1
 
 
 # --- the Vapi call id is a credential while a call is live -------------------------------------

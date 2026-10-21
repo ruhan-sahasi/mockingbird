@@ -16,11 +16,14 @@ from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 from mockingbird.app import create_app
-from mockingbird.limits import check_can_start, visitor_id
+from mockingbird.limits import MAX_ATTEMPTS_PER_DAY, check_can_start, visitor_id
 from mockingbird.models import Interview
+from mockingbird.sessions import sweep_once
 from mockingbird.store import MemoryStore
 
 SALT = "test-visitor-salt"  # the salt in conftest's test_settings
+# The page's own origin, which a browser sends with the start (public_base_url in conftest).
+SITE = "https://mockingbird.test"
 OWNER_KEY = "test-owner-key"
 
 
@@ -85,6 +88,26 @@ async def test_an_abandoned_start_gives_its_place_in_the_budget_back():
     await store.update_interview("a", status="abandoned")  # its token ran out unused
 
     assert await can_start(store, "visitor-b", "ip-b", daily_demo_s=300) == "ok"
+
+
+async def test_repeated_no_shows_from_one_ip_reach_the_visitor_limit():
+    # A start that is never followed up costs nothing but holds a cap of the budget until it is
+    # abandoned, and an abandoned start is given back. Without a cap on attempts, one address
+    # could hold the budget all day with one request every two minutes.
+    store = MemoryStore()
+    for n in range(MAX_ATTEMPTS_PER_DAY - 1):
+        await store.create_interview(
+            interview(
+                f"no-show-{n}", visitor_hash=f"cookie-{n}", ip_hash="ip-a", status="abandoned"
+            )
+        )
+    assert await can_start(store, "cookie-new", "ip-a") == "ok"  # an honest retry still works
+
+    await store.create_interview(
+        interview("one-more", visitor_hash="cookie-x", ip_hash="ip-a", status="abandoned")
+    )
+    assert await can_start(store, "cookie-new", "ip-a") == "visitor_limit"
+    assert await can_start(store, "cookie-0", "ip-new") == "ok"  # one no-show on this cookie
 
 
 async def test_the_visitor_limit_is_reported_before_the_daily_budget():
@@ -187,8 +210,10 @@ def make_client(settings):
 
         def make(**overrides) -> TestClient:
             app = create_app(settings.model_copy(update=overrides), store=MemoryStore())
-            # https, so the client sends the Secure cookie back.
-            return stack.enter_context(TestClient(app, base_url="https://testserver"))
+            # https, so the client sends the Secure cookie back, and the Origin a browser on the
+            # site sends.
+            client = TestClient(app, base_url="https://testserver", headers={"origin": SITE})
+            return stack.enter_context(client)
 
         yield make
 
@@ -274,3 +299,66 @@ def test_a_wrong_owner_key_is_an_ordinary_demo_under_the_limits(make_client):
     assert first.status_code == 201
     assert first.json()["cap_s"] == 300
     assert second.status_code == 429
+
+
+def test_the_route_refuses_repeated_no_shows_from_one_ip(make_client):
+    client = make_client()
+    registry = client.app.state.registry
+    for _ in range(MAX_ATTEMPTS_PER_DAY):
+        client.cookies.clear()  # a script, not a browser: no cookie
+        assert post(client, "198.51.100.1").status_code == 201
+        # The socket is never opened, and the sweeper abandons the start once its token runs out.
+        client.portal.call(sweep_once, registry, client.app.state.store, registry.clock() + 61)
+
+    client.cookies.clear()
+    refused = post(client, "198.51.100.1")
+
+    assert refused.status_code == 429
+    assert refused.json() == {"error": "visitor_limit"}
+    assert post(client, "198.51.100.2").status_code == 201  # another address is unaffected
+
+
+# --- where the start comes from ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [None, "https://elsewhere.example", "null", "https://mockingbird.test.elsewhere.example"],
+    ids=["missing", "another-site", "null", "a-lookalike"],
+)
+def test_a_start_from_another_site_is_refused_and_creates_nothing(make_client, origin):
+    # A page elsewhere can make its visitors' browsers post here without a preflight (a form, or
+    # fetch with mode no-cors): the start has no body and no custom header. Each such start would
+    # hold a cap of the day's budget.
+    client = make_client()
+    headers = {"CloudFront-Viewer-Address": "198.51.100.1:40000", "origin": origin or ""}
+    if origin is None:
+        client.headers.pop("origin")
+        headers.pop("origin")
+
+    refused = client.post("/api/interviews", headers=headers)
+
+    assert refused.status_code == 403
+    assert client.portal.call(client.app.state.store.seconds_used_today) == 0
+    assert client.app.state.registry.sessions() == []
+
+
+def test_a_start_from_the_page_on_the_host_it_was_sent_to_is_allowed(make_client):
+    # Locally the page is on the Vite server, which passes the API calls on, and PUBLIC_BASE_URL
+    # is the tunnel Vapi uses. The page's origin is still the host the request was sent to.
+    client = make_client()
+    client.headers["origin"] = "https://testserver"
+
+    assert post(client, "198.51.100.1").status_code == 201
+
+
+def test_the_owner_key_needs_no_origin(make_client):
+    # A page elsewhere cannot send the X-Owner-Key header without a preflight, which fails.
+    client = make_client()
+    client.headers.pop("origin")
+
+    owner = post(client, "198.51.100.1", **{"X-Owner-Key": OWNER_KEY})
+    demo = post(client, "198.51.100.1", **{"X-Owner-Key": "a-guess"})
+
+    assert owner.status_code == 201
+    assert demo.status_code == 403

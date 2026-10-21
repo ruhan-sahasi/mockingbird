@@ -19,7 +19,7 @@ Two rules every store follows:
 
 import copy
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import fields, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, get_args
@@ -113,13 +113,37 @@ class Store(Protocol):
         this IP. One that matches on both counts once."""
         ...
 
+    async def attempts_today(self, visitor_hash: str, ip_hash: str) -> int:
+        """Demo interviews created today by this visitor or from this IP, whatever became of
+        them, abandoned ones included. One that matches on both counts once."""
+        ...
+
+    async def abandon_unstarted(self, *, created_before: datetime, keep: Collection[str]) -> int:
+        """Mark `abandoned` every interview still `created` that was created before
+        `created_before`, except those whose ids are in `keep`. Returns how many it marked.
+
+        The sweeper keeps the ones this process still holds a session for. The rest can never
+        start: their tokens lived only in the memory of a process that has stopped."""
+        ...
+
     async def ping(self) -> None:
         """Raises if the store cannot be reached."""
         ...
 
-    async def delete_demo_data_older_than(self, days: int) -> int:
+    async def demo_calls_older_than(self, days: int) -> list[str]:
+        """The Vapi call ids of the demo interviews created more than `days` days ago that have
+        one. Vapi keeps its own copy of each call, which has to be deleted too."""
+        ...
+
+    async def delete_demo_data_older_than(
+        self, days: int, *, vapi_deleted: Collection[str] = ()
+    ) -> int:
         """Delete demo interviews created more than `days` days ago, with their turns, scores
-        and quotes. Full-mode interviews are kept. Returns how many interviews it deleted."""
+        and quotes. Full-mode interviews are kept. Returns how many interviews it deleted.
+
+        A demo that holds a Vapi call id is deleted only when that id is in `vapi_deleted`, the
+        calls whose copy at Vapi is gone. The id is the only way to delete that copy, so the row
+        keeps it until then."""
         ...
 
 
@@ -249,13 +273,49 @@ class MemoryStore:
             and (i.visitor_hash == visitor_hash or i.ip_hash == ip_hash)
         )
 
+    async def attempts_today(self, visitor_hash: str, ip_hash: str) -> int:
+        start, end = _utc_day(self._clock())
+        return sum(
+            1
+            for i in self._interviews.values()
+            if i.mode == "demo"
+            and start <= i.created_at < end
+            and (i.visitor_hash == visitor_hash or i.ip_hash == ip_hash)
+        )
+
+    async def abandon_unstarted(self, *, created_before: datetime, keep: Collection[str]) -> int:
+        kept = set(keep)
+        stranded = [
+            i
+            for i in self._interviews.values()
+            if i.status == "created" and i.created_at < created_before and i.id not in kept
+        ]
+        for i in stranded:
+            i.status = "abandoned"
+        return len(stranded)
+
     async def ping(self) -> None:
         return None
 
-    async def delete_demo_data_older_than(self, days: int) -> int:
+    async def demo_calls_older_than(self, days: int) -> list[str]:
         cutoff = self._clock() - timedelta(days=days)
+        return [
+            i.vapi_call_id
+            for i in self._interviews.values()
+            if i.mode == "demo" and i.created_at < cutoff and i.vapi_call_id is not None
+        ]
+
+    async def delete_demo_data_older_than(
+        self, days: int, *, vapi_deleted: Collection[str] = ()
+    ) -> int:
+        cutoff = self._clock() - timedelta(days=days)
+        gone = set(vapi_deleted)
         old = [
-            i.id for i in self._interviews.values() if i.mode == "demo" and i.created_at < cutoff
+            i.id
+            for i in self._interviews.values()
+            if i.mode == "demo"
+            and i.created_at < cutoff
+            and (i.vapi_call_id is None or i.vapi_call_id in gone)
         ]
         for id in old:
             del self._interviews[id]
@@ -453,16 +513,51 @@ class PostgresStore:
             ip_hash,
         )
 
+    async def attempts_today(self, visitor_hash: str, ip_hash: str) -> int:
+        start, end = _utc_day(self._clock())
+        return await self._pool.fetchval(
+            "select count(*) from interviews"
+            " where mode = 'demo'"
+            "   and created_at >= $1 and created_at < $2"
+            "   and (visitor_hash = $3 or ip_hash = $4)",
+            start,
+            end,
+            visitor_hash,
+            ip_hash,
+        )
+
+    async def abandon_unstarted(self, *, created_before: datetime, keep: Collection[str]) -> int:
+        result = await self._pool.execute(
+            "update interviews set status = 'abandoned'"
+            " where status = 'created' and created_at < $1 and not (id = any($2::text[]))",
+            created_before,
+            list(keep),
+        )
+        return int(result.removeprefix("UPDATE "))
+
     async def ping(self) -> None:
         await self._pool.execute("select 1")
 
-    async def delete_demo_data_older_than(self, days: int) -> int:
+    async def demo_calls_older_than(self, days: int) -> list[str]:
+        cutoff = self._clock() - timedelta(days=days)
+        rows = await self._pool.fetch(
+            "select vapi_call_id from interviews"
+            " where mode = 'demo' and created_at < $1 and vapi_call_id is not null",
+            cutoff,
+        )
+        return [row["vapi_call_id"] for row in rows]
+
+    async def delete_demo_data_older_than(
+        self, days: int, *, vapi_deleted: Collection[str] = ()
+    ) -> int:
         cutoff = self._clock() - timedelta(days=days)
         # The turns, scores and quotes go with their interview (on delete cascade).
         return await self._pool.fetchval(
             "with gone as (delete from interviews where mode = 'demo' and created_at < $1"
+            "   and (vapi_call_id is null or vapi_call_id = any($2::text[]))"
             " returning 1) select count(*) from gone",
             cutoff,
+            list(vapi_deleted),
         )
 
 

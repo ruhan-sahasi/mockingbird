@@ -79,8 +79,8 @@ def idle_sweeper(monkeypatch):
     tests see what the app built without a sweep running against it."""
     seen: list = []
 
-    async def run_sweeper(registry, store) -> None:
-        seen.append(store)
+    async def run_sweeper(registry, store, vapi) -> None:
+        seen.append((store, vapi))
         await asyncio.Event().wait()
 
     monkeypatch.setattr(app_module, "run_sweeper", run_sweeper)
@@ -92,9 +92,11 @@ def test_create_app_builds_the_grader_its_own_slow_client_and_one_live_client(se
         state = c.app.state
         assert isinstance(state.grader, Grader)
         grading = state.grader._client
-        # Grading with adaptive thinking takes a while, and nobody is waiting on the line.
-        assert grading.timeout == anthropic.Timeout(120.0, connect=5.0)
-        assert grading.max_retries == 2
+        # Grading with adaptive thinking takes a while, and nobody is waiting on the line. 600 s
+        # is the SDK's own limit for a request this size; one retry at most, so a grade that
+        # fails at the start is not paid for three times.
+        assert grading.timeout == anthropic.Timeout(600.0, connect=5.0)
+        assert grading.max_retries == 1
         assert grading.api_key == settings.anthropic_api_key
 
         one, two = state.streamer_factory(), state.streamer_factory()
@@ -139,7 +141,8 @@ def test_with_a_database_url_the_store_is_postgres_and_its_pool_closes_on_shutdo
         store = c.app.state.store
         assert isinstance(store, PostgresStore)
         assert store._pool is pool
-        assert idle_sweeper == [store]  # the sweeper works on the store that was built
+        # The sweeper works on the store that was built, and the Vapi client for the purge.
+        assert idle_sweeper == [(store, c.app.state.vapi)]
         assert not pool.closed
 
     assert dsns == [dsn]
@@ -180,6 +183,6 @@ def test_injected_dependencies_are_used_as_given_and_nothing_real_is_built(
         assert state.vapi is vapi
         assert state.streamer_factory is streamer_factory
         assert state.grader is grader
-        assert idle_sweeper == [store]
+        assert idle_sweeper == [(store, vapi)]
 
     assert built == []

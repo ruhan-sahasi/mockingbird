@@ -17,6 +17,8 @@ from typing import Protocol
 
 import anthropic
 
+from mockingbird.failures import describe
+
 MODEL = "claude-haiku-5-5"
 MAX_TOKENS = 200  # two spoken sentences are far shorter than this; it only caps a runaway reply
 
@@ -62,7 +64,8 @@ class AnthropicStreamer:
         except Exception as exc:
             # Opening the request, reading the stream and reading the final message all land
             # here: an API error, a timeout, a dropped connection, or a malformed event.
-            raise BrainError(f"Claude request failed: {type(exc).__name__}") from exc
+            # The type, and for an API error its status, error type and request id (failures.py).
+            raise BrainError(f"Claude request failed: {describe(exc)}") from exc
         # Haiku 5.5 has no server-side refusal fallback, so a refusal reaches us as a normal
         # end of stream with this stop reason. Treat it like any other failure.
         if final.stop_reason == "refusal":

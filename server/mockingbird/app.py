@@ -21,10 +21,14 @@ from mockingbird.vapi_client import VapiClient
 log = logging.getLogger(__name__)
 
 # Grading one interview takes Opus a while with adaptive thinking on, and nobody is waiting on
-# the line, so the grader gets its own client with a long read timeout. The live client's 10 s
-# would cut most grades off.
-GRADER_TIMEOUT = anthropic.Timeout(120.0, connect=5.0)
-GRADER_MAX_RETRIES = 2
+# the line, so the grader gets its own client. The grade is streamed (report.py), so the read
+# timeout is the longest wait for the next event, not for the whole grade. 600 s is what the SDK
+# itself allows a request of this size (its default for one of 16000 output tokens), so a long
+# stretch of thinking is never cut off. The live client's 10 s would cut most grades off.
+GRADER_TIMEOUT = anthropic.Timeout(600.0, connect=5.0)
+# The SDK retries a request that fails before its stream starts (a dropped connection, a 429 or
+# a 5xx). Once is enough: a grade is a paid Opus generation.
+GRADER_MAX_RETRIES = 1
 
 
 def create_app(
@@ -45,7 +49,7 @@ def create_app(
         state = api.state
         async with AsyncExitStack() as built:
             await _build_missing(state, settings, built)
-            sweeper = asyncio.create_task(run_sweeper(state.registry, state.store))
+            sweeper = asyncio.create_task(run_sweeper(state.registry, state.store, state.vapi))
             state.sweeper = sweeper
             try:
                 yield

@@ -1,8 +1,10 @@
-"""Vapi's REST API: the assistant we hand it, and the call-creating request.
+"""Vapi's REST API: the assistant we hand it, the call-creating request, and deleting a call.
 
 `build_assistant` makes the config for one interview call. `VapiClient.create_call` asks Vapi to
 start a call over a `vapi.websocket` transport and hands back the call id and the websocket URL
-the relay connects to. The Vapi facts here come from docs/vapi-contract.md.
+the relay connects to. `VapiClient.delete_call` deletes what Vapi keeps of a call once it is over
+(its transcript, messages and logs), which the 7-day retention needs (sessions.py). The Vapi
+facts here come from docs/vapi-contract.md.
 
 The call id and the websocket URL are credentials while a call is live (ruling R19): anyone who
 has the id can rebuild the URL and listen in. So `VapiCall` keeps both out of its `repr`, and a
@@ -13,6 +15,7 @@ traceback would print that. The assistant also holds our two path secrets, so do
 
 import re
 from dataclasses import dataclass, field
+from urllib.parse import quote
 
 import httpx
 
@@ -21,6 +24,8 @@ VAPI_API_BASE = "https://api.vapi.ai"
 # Starting an interview waits on this request, so it must not hang on a stalled connection. The
 # client we are given may have no timeout of its own, so each request carries this one.
 CREATE_CALL_TIMEOUT = httpx.Timeout(10.0, connect=3.0)
+# The hourly purge waits on each delete in turn, so a stalled one must not hold it up for long.
+DELETE_CALL_TIMEOUT = CREATE_CALL_TIMEOUT
 
 # Vapi's reason is a short sentence, or a short list of them for a validation error. Anything past
 # this many characters is not a reason any more, and could be a body or a long echo of our request.
@@ -66,6 +71,14 @@ def build_assistant(opening_line: str, *, llm_url: str, webhook_url: str, cap_s:
         "stopSpeakingPlan": {"numWords": 0, "voiceSeconds": 0.2, "backoffSeconds": 1},
         # Accepted and honoured by Vapi (contract, question 5): no recording is stored.
         "artifactPlan": {"recordingEnabled": False},
+        # Vapi's default end-of-call analysis sends the transcript to one more model (a summary
+        # and a success evaluation), which the consent does not name, keeps the summary at Vapi
+        # and bills each call for it (contract, question 5 and Surprise 6). Nothing reads it.
+        # Task 13b's live run checks that Vapi accepts this and runs no analysis.
+        "analysisPlan": {
+            "summaryPlan": {"enabled": False},
+            "successEvaluationPlan": {"enabled": False},
+        },
     }
 
 
@@ -98,13 +111,33 @@ class VapiClient:
             raise VapiError(self._failure_message(response))
         return self._parse_call(response)
 
-    def _failure_message(self, response: httpx.Response) -> str:
-        reason = self._short_reason(response)
+    async def delete_call(self, call_id: str) -> None:
+        """Delete a call's data at Vapi: its transcript, messages, logs and analysis. A call Vapi
+        no longer has (404) counts as deleted. Raises VapiError, with no id, URL or key in it,
+        when Vapi refuses or cannot be reached."""
+        try:
+            response = await self._http.delete(
+                # quote(safe=""): the id is one path segment, whatever is in it.
+                f"{VAPI_API_BASE}/call/{quote(call_id, safe='')}",
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                timeout=DELETE_CALL_TIMEOUT,
+                follow_redirects=False,
+            )
+        except httpx.HTTPError as exc:
+            raise VapiError(f"Vapi request failed: {type(exc).__name__}") from None
+        if response.status_code == 404:
+            return
+        if not response.is_success:
+            raise VapiError(self._failure_message(response, hide=call_id))
+
+    def _failure_message(self, response: httpx.Response, hide: str = "") -> str:
+        reason = self._short_reason(response, hide)
         status = f"Vapi returned {response.status_code}"
         return f"{status}: {reason}" if reason else status
 
-    def _short_reason(self, response: httpx.Response) -> str:
-        """Vapi's `message`, cleaned of URLs and our key, or "" if there is no usable one."""
+    def _short_reason(self, response: httpx.Response, hide: str = "") -> str:
+        """Vapi's `message`, cleaned of URLs, our key and `hide` (a call id the request named),
+        or "" if there is no usable one."""
         try:
             message = response.json()["message"]
         except (ValueError, KeyError, TypeError):
@@ -116,6 +149,8 @@ class VapiClient:
         # The key goes first and over the whole message, so the cut below cannot leave half of it.
         if self._api_key:
             message = message.replace(self._api_key, "[key]")
+        if hide:
+            message = message.replace(hide, "[call]")
         message = _URL.sub("[url]", message[:_MAX_SCRUBBED_CHARS])
         return " ".join(message.split())[:_MAX_REASON_CHARS]
 

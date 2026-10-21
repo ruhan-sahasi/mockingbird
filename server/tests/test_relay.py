@@ -11,13 +11,22 @@ Vapi's text frames here have the shapes recorded in fixtures/vapi/ws_text_frames
 import asyncio
 import json
 import logging
+from pathlib import Path
 
 import pytest
 from starlette.websockets import WebSocket
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from websockets.frames import Close
 
-from mockingbird.relay import Relay, SocketClosed, StarletteSocket, WebsocketsSocket
+from mockingbird.relay import (
+    FLUSH,
+    PING,
+    Relay,
+    SocketClosed,
+    StarletteSocket,
+    WebsocketsSocket,
+    _is_end_request,
+)
 from mockingbird.vapi_types import SpeechUpdate, StatusUpdate, UserInterrupted
 
 # One 20 ms frame each way: 320 samples of s16le, 640 bytes. Different bytes, so a frame sent the
@@ -306,6 +315,36 @@ async def test_browser_that_takes_nothing_cannot_hold_up_the_end(caplog):
     logged = [r.getMessage() for r in caplog.records]
     assert "could not tell the browser the call ended: TimeoutError" in logged
     assert "could not close the browser socket: TimeoutError" in logged
+
+
+async def test_a_failed_end_call_is_logged_as_a_warning(caplog):
+    # The only sign a Vapi call may still be running, and billing, until its own limit. Under
+    # uvicorn an app logger's INFO lines are dropped, so this must be a WARNING to be seen.
+    caplog.set_level(logging.DEBUG, logger="mockingbird.relay")
+    relay, browser, vapi = make_relay(hang_up_timeout_s=0.1)
+    task = await start(relay)
+    vapi.dropped = True  # Vapi's connection is gone, and nothing has noticed yet
+
+    await asyncio.wait_for(relay.end("cap"), 1.0)
+
+    assert await finished(task) == "cap"
+    [failed] = [r for r in caplog.records if "end-call" in r.getMessage()]
+    assert failed.getMessage() == "could not send end-call to Vapi: SocketClosed"
+    assert failed.levelno == logging.WARNING
+
+
+async def test_a_browser_that_is_gone_at_the_end_is_logged_at_info(caplog):
+    # Routine: the browser closing is often why the call ended.
+    caplog.set_level(logging.DEBUG, logger="mockingbird.relay")
+    relay, browser, _ = make_relay(hang_up_timeout_s=0.1)
+    task = await start(relay)
+    browser.dropped = True
+
+    await asyncio.wait_for(relay.end("cap"), 1.0)
+
+    await finished(task)
+    [told] = [r for r in caplog.records if "tell the browser" in r.getMessage()]
+    assert told.levelno == logging.INFO
 
 
 @pytest.mark.parametrize("before", [[], [MIC_1, MIC_2]], ids=["from-the-start", "after-audio"])
@@ -831,3 +870,31 @@ async def test_websockets_socket_close_cut_short_drops_the_connection():
 
     assert conn.close_codes == [1000]
     assert conn.transport.aborted
+
+
+# --- the wire contract the browser's tests share -----------------------------------------------
+
+WIRE = json.loads(
+    (Path(__file__).parent / "fixtures" / "wire_protocol.json").read_text(encoding="utf-8")
+)
+
+
+def test_the_text_frames_are_the_ones_the_browser_expects():
+    # web/src/protocol.test.ts and interviewSession.test.ts read the same file.
+    assert json.loads(FLUSH) == WIRE["server_to_browser"]["flush"]
+    assert json.loads(PING) == WIRE["server_to_browser"]["ping"]
+    assert _is_end_request(json.dumps(WIRE["browser_to_server"]["end"]))
+
+
+@pytest.mark.parametrize("reason", ["cap", "browser_closed", "vapi_closed", "plan_done"])
+async def test_the_ended_frame_has_the_shape_and_reasons_the_browser_expects(reason):
+    relay, browser, _ = make_relay()
+    task = await start(relay)
+
+    await relay.end(reason)
+
+    assert await finished(task) == reason
+    sent = await browser.next_sent()
+    assert sent.keys() == WIRE["server_to_browser"]["ended"].keys()
+    assert sent["type"] == "ended"
+    assert sent["reason"] in WIRE["ended_reasons"]

@@ -2,7 +2,9 @@
 
 Starting an interview creates its record, its brain and a one-time socket token, and nothing
 else: no Vapi call exists until the browser opens the socket (routes_ws.py), so a start that is
-never followed up costs nothing.
+never followed up costs nothing. It does hold a cap of the day's budget until it is abandoned, so
+a start must come from a page on this site (`_from_this_site`): otherwise any page elsewhere could
+make its own visitors' browsers hold the budget, without a single request of its own.
 """
 
 import hmac
@@ -13,6 +15,7 @@ import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -46,8 +49,12 @@ async def start_interview(request: Request) -> JSONResponse:
     """Start a demo, or with the owner key a full interview, and hand back the socket path."""
     state = request.app.state
     settings = state.settings
-    visitor_hash, ip_hash, set_cookie = visitor_id(request)
     owner = _is_owner(request.headers.get("x-owner-key"), settings.owner_key)
+    # The owner key skips this as it skips the limits: a page elsewhere cannot send that header
+    # without a preflight, which fails, and does not know the key.
+    if not owner and not _from_this_site(request, settings.public_base_url):
+        return JSONResponse({"error": "forbidden_origin"}, status_code=403)
+    visitor_hash, ip_hash, set_cookie = visitor_id(request)
     preset, cap_s = (FULL, settings.full_cap_s) if owner else (DEMO, settings.demo_cap_s)
 
     questions = load_questions(QUESTIONS_PATH, preset.main_questions, random.Random())
@@ -115,6 +122,32 @@ async def get_report(interview_id: str, request: Request) -> JSONResponse:
     if interview is not None and interview.status == "ended":
         return JSONResponse({"status": "grading"}, status_code=202)
     raise HTTPException(status_code=404)
+
+
+def _from_this_site(request: Request, public_base_url: str) -> bool:
+    """Whether the start came from a page on this site, by its Origin header.
+
+    A browser sends Origin with every POST, and a page cannot change it, so a page elsewhere
+    cannot pass for this one. The start has no body and no custom header, so it needs no
+    preflight, and CORS alone would not stop a cross-site post: the browser sends the request
+    and only hides the reply. A request with no Origin (a script) is refused as well.
+
+    Two origins count. PUBLIC_BASE_URL's, which is where the deployed page lives. And the host
+    the request was sent to: in local development the page is on the Vite server, which passes
+    /api on to the server, while PUBLIC_BASE_URL is the tunnel that Vapi uses.
+    """
+    origin = request.headers.get("origin")
+    if not origin:
+        return False
+    if origin == _origin_of(public_base_url):
+        return True
+    host = request.headers.get("host")
+    return host is not None and urlsplit(origin).netloc == host
+
+
+def _origin_of(url: str) -> str:
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}"
 
 
 def _is_owner(given: str | None, owner_key: str) -> bool:
