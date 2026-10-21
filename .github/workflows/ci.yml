@@ -19,3 +19,22 @@ jobs:
       - run: uv sync --locked
       - run: uv run ruff check .
       - run: uv run pytest
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          # The lockfile is not at the repo root, so say where it is.
+          cache-dependency-path: web/package-lock.json
+      # npm ci installs exactly what package-lock.json says and fails if it disagrees with package.json.
+      - run: npm ci
+      - run: npm test
+      # tsconfig.json is a single real config, so this checks src/ and vite.config.ts.
+      - run: npx tsc --noEmit
