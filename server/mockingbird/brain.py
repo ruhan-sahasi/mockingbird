@@ -6,14 +6,24 @@ Claude, with the move spelled out in a system message after the candidate's word
 wrap-up it says a fixed line and never calls Claude, so the model cannot talk its way past the
 clock. If Claude fails, a fixed line for that move is spoken instead and the interview goes on.
 
+A reply counts only once it is spoken. Vapi sends several requests while the candidate is still
+talking and speaks only the reply to the last one, so a request is not a turn. Each `draft()`
+works on a copy of the plan and changes nothing real. `commit_spoken()` makes the pending draft
+real when Vapi says it started speaking it, and the next `draft()` (or `finalize()` at the end
+of the call) writes it into the history, using the words Vapi says it actually spoke. A draft
+that is never spoken leaves no trace.
+
 The history is append-only and always settles into a shape the Claude API accepts: it starts with
 a user message, and every system message sits right after a user message and right before an
-assistant message. `reply()` guarantees that even if the reply is cancelled or abandoned halfway.
+assistant message. That holds because a user, system and assistant message are only ever added
+together, in one synchronous step, once their reply has been spoken.
 """
 
-import asyncio
+import copy
 import logging
+import re
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass, field
 from typing import Literal
 
 from mockingbird.claude import BrainError, ClaudeStreamer
@@ -149,6 +159,16 @@ FALLBACK_LINE: dict[MoveKind, str] = {
 WRAP_UP_LINE = "Thanks, that's all the time we have. Your report will be ready in about a minute."
 
 
+# A word is a run of letters and digits. A hyphen inside one ("twenty-five") keeps it a single
+# word, because Vapi may rebuild that as "25". An apostrophe splits it, so "I'm" and "I am" both
+# count two. Punctuation, quotes, dashes and spacing are not words.
+_WORD = re.compile(r"\w+(?:-\w+)*")
+
+
+def _count_words(text: str) -> int:
+    return len(_WORD.findall(text))
+
+
 def _instruction(move: Move) -> str:
     # Only ASK_QUESTION has a {text} placeholder, and only ASK_QUESTION has a question.
     text = move.question.text if move.question is not None else ""
@@ -167,6 +187,22 @@ async def _close(chunks: AsyncIterator[str]) -> None:
         await aclose()
 
 
+@dataclass
+class _Draft:
+    """One reply to one Vapi request, held apart from the real state until it is spoken."""
+
+    plan: InterviewPlan  # the real plan plus this draft's move, on a copy
+    move: Move
+    answering_idx: int  # the question the candidate was answering, before the move
+    candidate_text: str  # as it came in, blank or not
+    # What Claude sees in its place: a note instead of a blank, which the Messages API would
+    # reject for good once it was in the append-only history.
+    heard: str
+    instruction: str | None  # the system message Claude was sent; None for the wrap-up
+    chunks: list[str] = field(default_factory=list)  # everything produced so far
+    produced: bool = False  # the whole line has been produced, not cut short
+
+
 class Brain:
     def __init__(
         self,
@@ -174,15 +210,16 @@ class Brain:
         streamer: ClaudeStreamer,
         clock: Callable[[], float],
     ):
-        self._plan = plan
+        self._plan = plan  # only commit_spoken() changes it
         self._streamer = streamer
         self._clock = clock
         self._started_at: float | None = None
         self._history: list[dict] = []
         self._turns: list[Turn] = []
-        # One reply at a time. If Vapi sends a new request while an old reply is still being
-        # cancelled, the new one waits here until the old one has settled its history.
-        self._reply_lock = asyncio.Lock()
+        # At most one of these is set. A draft waits in `_pending` until Vapi starts speaking it,
+        # then sits in `_committed` until the next draft() or finalize() writes it down.
+        self._pending: _Draft | None = None
+        self._committed: _Draft | None = None
 
     @property
     def history(self) -> list[dict]:
@@ -196,6 +233,7 @@ class Brain:
 
     @property
     def finished(self) -> bool:
+        """True once the wrap-up has been spoken. A drafted wrap-up does not count."""
         return self._plan.finished
 
     def start(self) -> str:
@@ -209,96 +247,160 @@ class Brain:
         self._add_turn("interviewer", opening, self._plan.current_question_idx)
         return opening
 
-    async def reply(self, candidate_text: str) -> AsyncIterator[str]:
-        """Pick the next move for what the candidate just said and stream the line for it.
+    async def draft(
+        self, candidate_text: str, spoken_assistant_text: str | None
+    ) -> AsyncIterator[str]:
+        """Draft the next line for what the candidate has said so far, and stream it.
 
-        The line is recorded in `finally`, so a normal finish, a cancelled task and a consumer
-        that closes the generator early all leave exactly one assistant message and one
-        interviewer turn. A cancelled reply still uses up its move: the plan does not roll back.
+        `candidate_text` is the whole answer so far. `spoken_assistant_text` is the words Vapi
+        says it spoke of the last reply, or None. Nothing real changes here: the move is worked
+        out on a copy of the plan, and the reply is held as a draft until `commit_spoken()`.
+
+        The first three steps run before the first await, so a draft that was cancelled a
+        moment ago can never interleave with them. The caller cancels the old task before it
+        starts a new one, and this generator needs no lock.
         """
-        async with self._reply_lock:
-            if self._started_at is None:
-                raise RuntimeError("call start() before reply()")
+        if self._started_at is None:
+            raise RuntimeError("call start() before draft()")
 
-            # The candidate is answering the question in progress. Read it before next_move,
-            # which may advance to the next one.
-            answering_idx = self._plan.current_question_idx
-            elapsed_s = self._clock() - self._started_at
-            move = self._plan.next_move(elapsed_s, len(candidate_text.split()))
-            if move.kind is MoveKind.DONE:
+        # 1. A reply that was spoken is final now: Vapi's next request says how much of it.
+        self._finalize_committed(spoken_assistant_text)
+        # 2. A reply that was never spoken is gone. Nothing was recorded for it.
+        self._pending = None
+        # 3. The new draft's move comes from a copy of the plan, so the real plan stays put.
+        plan = copy.deepcopy(self._plan)
+        answering_idx = plan.current_question_idx  # read before next_move, which may advance it
+        elapsed_s = self._clock() - self._started_at
+        move = plan.next_move(elapsed_s, len(candidate_text.split()))
+        if move.kind is MoveKind.DONE:
+            return
+
+        draft = _Draft(
+            plan=plan,
+            move=move,
+            answering_idx=answering_idx,
+            candidate_text=candidate_text,
+            heard=candidate_text if candidate_text.strip() else NO_SPEECH_NOTE,
+            instruction=None if move.kind is MoveKind.WRAP_UP else _instruction(move),
+        )
+        self._pending = draft
+        try:
+            if draft.instruction is None:
+                draft.chunks.append(WRAP_UP_LINE)
+                draft.produced = True
+                yield WRAP_UP_LINE
                 return
 
-            # The turn keeps the candidate's text as it came in, blank or not, so a call where
-            # nothing was heard can still be told from one that was answered. Claude gets a
-            # note instead of a blank, which the Messages API would reject for good.
-            self._add_turn("candidate", candidate_text, answering_idx)
-            heard = candidate_text if candidate_text.strip() else NO_SPEECH_NOTE
-            self._history.append({"role": "user", "content": heard})
-
-            spoken: list[str] = []  # every chunk produced so far, including ones not yet delivered
-            completed = False
+            # The history is not touched: this list is the request, and it is a copy.
+            chunks = self._streamer.stream(
+                system=[
+                    {"type": "text", "text": STABLE_SYSTEM, "cache_control": {"type": "ephemeral"}}
+                ],
+                messages=[
+                    *self._history,
+                    {"role": "user", "content": draft.heard},
+                    {"role": "system", "content": draft.instruction},
+                ],
+            )
+            failed = False
             try:
-                if move.kind is MoveKind.WRAP_UP:
-                    spoken.append(WRAP_UP_LINE)
-                    yield WRAP_UP_LINE
-                else:
-                    self._history.append({"role": "system", "content": _instruction(move)})
-                    # Hand over a snapshot, so the assistant message appended later does not
-                    # appear in a request that has already been sent.
-                    chunks = self._streamer.stream(
-                        system=[
-                            {
-                                "type": "text",
-                                "text": STABLE_SYSTEM,
-                                "cache_control": {"type": "ephemeral"},
-                            }
-                        ],
-                        messages=list(self._history),
-                    )
-                    failed = False
+                while True:
+                    # Only the wait for the next chunk is guarded. The `yield` below is not, so
+                    # an exception the consumer throws in is not mistaken for a Claude failure
+                    # and answered with a fallback line.
                     try:
-                        while True:
-                            # Only the wait for the next chunk is guarded. The `yield` below
-                            # is not, so an exception the consumer throws in is not mistaken
-                            # for a Claude failure and answered with a fallback line.
-                            try:
-                                chunk = await anext(chunks)
-                            except StopAsyncIteration:
-                                break
-                            except BrainError as exc:
-                                log.warning("Claude failed, speaking the fallback line: %s", exc)
-                                failed = True
-                                break
-                            except Exception:
-                                # A streamer should only raise BrainError. If one has a bug,
-                                # the turn still gets its fixed line and the call goes on.
-                                log.exception("Streamer broke, speaking the fallback line")
-                                failed = True
-                                break
-                            spoken.append(chunk)
-                            yield chunk
-                    finally:
-                        await _close(chunks)
-
-                    said = "".join(spoken)
-                    if failed or not said.strip():
-                        # Claude may have spoken part of a line before it failed. Say the fixed
-                        # line after it, so the move (and the question, if it is a new one) is
-                        # still carried out. Add a space if the partial text does not end in one.
-                        lead = " " if said and not said[-1].isspace() else ""
-                        line = lead + _fallback(move)
-                        spoken.append(line)
-                        yield line
-                completed = True
+                        chunk = await anext(chunks)
+                    except StopAsyncIteration:
+                        break
+                    except BrainError as exc:
+                        log.warning("Claude failed, speaking the fallback line: %s", exc)
+                        failed = True
+                        break
+                    except Exception:
+                        # A streamer should only raise BrainError. If one has a bug, the turn
+                        # still gets its fixed line and the call goes on.
+                        log.exception("Streamer broke, speaking the fallback line")
+                        failed = True
+                        break
+                    draft.chunks.append(chunk)
+                    yield chunk
             finally:
-                self._record_interviewer_line(move, spoken, completed)
+                await _close(chunks)
 
-    def _record_interviewer_line(self, move: Move, spoken: list[str], completed: bool) -> None:
-        text = "".join(spoken)
+            said = "".join(draft.chunks)
+            fallback = None
+            if failed or not said.strip():
+                # Claude may have spoken part of a line before it failed. Say the fixed line
+                # after it, so the move (and the question, if it is a new one) is still carried
+                # out. Add a space if the partial text does not end in one.
+                lead = " " if said and not said[-1].isspace() else ""
+                fallback = lead + _fallback(move)
+                draft.chunks.append(fallback)
+            draft.produced = True
+            if fallback is not None:
+                yield fallback
+        finally:
+            # Cancelled or closed before the whole line was written, and never spoken: this
+            # draft leaves no trace. A committed draft is kept, because the candidate heard it.
+            # The identity check matters: a newer draft may have replaced this one already.
+            if not draft.produced and self._pending is draft:
+                self._pending = None
+
+    def commit_spoken(self) -> bool:
+        """Vapi started speaking the pending draft, so it becomes real.
+
+        The draft's plan copy becomes the plan, and the candidate's answer is recorded. It can
+        come while the draft is still streaming: the draft keeps filling in, and stays committed
+        even if it is cancelled later, because the candidate heard it. Returns False when no draft
+        is pending, for example for the opening line.
+        """
+        draft = self._pending
+        if draft is None:
+            return False
+        self._pending = None
+        self._plan = draft.plan
+        self._committed = draft
+        self._add_turn("candidate", draft.candidate_text, draft.answering_idx)
+        return True
+
+    def finalize(self) -> None:
+        """The call is over. Write down the last spoken reply and drop any unspoken draft."""
+        self._finalize_committed(None)
+        self._pending = None
+
+    def _finalize_committed(self, spoken_assistant_text: str | None) -> None:
+        """Write the committed draft into the history and the turns, if there is one.
+
+        The line is what Vapi says it spoke when that has fewer words than what was generated,
+        because the candidate talked over it. Vapi rebuilds the text from the words it said, so
+        its punctuation, dashes, quotes and spacing can differ from ours even for a line that
+        played to the end. Words are the only thing compared, and a text that does not have
+        fewer of them is not trusted. A draft that was cut off while Claude was still writing it
+        counts as interrupted too.
+        """
+        draft = self._committed
+        if draft is None:
+            return
+        self._committed = None
+
+        generated = "".join(draft.chunks)
+        spoken = spoken_assistant_text or ""
+        spoken_words = _count_words(spoken)
+        cut_short = 0 < spoken_words < _count_words(generated)
+        text = spoken if cut_short else generated
         if not text.strip():
             text = CUT_OFF_TEXT
+
+        self._history.append({"role": "user", "content": draft.heard})
+        if draft.instruction is not None:
+            self._history.append({"role": "system", "content": draft.instruction})
         self._history.append({"role": "assistant", "content": text})
-        self._add_turn("interviewer", text, move.question_idx, interrupted=not completed)
+        self._add_turn(
+            "interviewer",
+            text,
+            draft.move.question_idx,
+            interrupted=cut_short or not draft.produced,
+        )
 
     def _add_turn(
         self,
