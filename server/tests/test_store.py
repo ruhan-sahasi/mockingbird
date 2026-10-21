@@ -342,32 +342,35 @@ async def test_seconds_used_today_is_zero_for_an_empty_store(store):
     assert await store.seconds_used_today() == 0
 
 
-async def test_seconds_used_today_counts_live_at_cap_and_ended_at_duration(store):
+async def test_seconds_used_today_counts_live_and_created_at_cap_and_ended_at_duration(store):
     demos = [
-        ("live-demo", "live", None),  # counts its cap_s: 300
-        ("ended-demo", "ended", 95),
-        ("graded-demo", "graded", 40),  # grading does not give the seconds back
-        ("ended-without-duration", "ended", None),  # counts nothing
-        ("created-demo", "created", None),  # not started yet
-        ("abandoned-demo", "abandoned", 77),
+        ("live-demo", "live", None, 300),  # counts its cap_s
+        ("created-demo", "created", None, 250),  # its call is about to start: counts its cap_s
+        ("ended-demo", "ended", 95, 300),
+        ("graded-demo", "graded", 40, 300),  # grading does not give the seconds back
+        ("ended-without-duration", "ended", None, 300),  # counts nothing
+        ("abandoned-demo", "abandoned", 77, 300),  # gives its place back
     ]
-    for id, status, duration_s in demos:
-        await store.create_interview(make_interview(id, status=status, duration_s=duration_s))
+    for id, status, duration_s, cap_s in demos:
+        await store.create_interview(
+            make_interview(id, status=status, duration_s=duration_s, cap_s=cap_s)
+        )
     # Full mode has its own cap and is never limited.
     await store.create_interview(
         make_interview("full-live", mode="full", status="live", cap_s=1200)
     )
+    await store.create_interview(make_interview("full-created", mode="full", cap_s=1200))
     await store.create_interview(
         make_interview("full-ended", mode="full", status="ended", duration_s=500)
     )
-    # Ended on an earlier day: not today's.
+    # Ended, or left created, on an earlier day: not today's.
+    yesterday = NOW - timedelta(days=1)
     await store.create_interview(
-        make_interview(
-            "ended-yesterday", status="ended", duration_s=111, created_at=NOW - timedelta(days=1)
-        )
+        make_interview("ended-yesterday", status="ended", duration_s=111, created_at=yesterday)
     )
+    await store.create_interview(make_interview("created-yesterday", created_at=yesterday))
 
-    assert await store.seconds_used_today() == 300 + 95 + 40
+    assert await store.seconds_used_today() == 300 + 250 + 95 + 40
 
 
 async def test_a_live_demo_counts_at_its_own_cap(store):
@@ -432,6 +435,42 @@ async def test_starts_today_ignores_abandoned_other_days_and_full_mode(store):
     assert await store.starts_today("visitor-a", "ip-x") == 4
 
 
+# --- lookups for the sweeper and the webhook ---------------------------------------------------
+
+
+async def test_list_live_interviews_returns_every_live_one_and_nothing_else(store):
+    for id, status in [("c", "created"), ("e", "ended"), ("g", "graded"), ("a", "abandoned")]:
+        await store.create_interview(make_interview(id, status=status))
+    await store.create_interview(make_interview("live-demo", status="live"))
+    # A live call left over from another day is still live: the sweeper must see it.
+    await store.create_interview(
+        make_interview(
+            "live-full", mode="full", status="live", cap_s=1200, created_at=NOW - timedelta(days=2)
+        )
+    )
+
+    live = await store.list_live_interviews()
+
+    assert sorted(i.id for i in live) == ["live-demo", "live-full"]
+    assert {i.id: i.cap_s for i in live} == {"live-demo": 300, "live-full": 1200}
+    assert next(i for i in live if i.id == "live-full").created_at == NOW - timedelta(days=2)
+
+
+async def test_list_live_interviews_is_empty_when_none_are_live(store):
+    await store.create_interview(make_interview(status="ended"))
+    assert await store.list_live_interviews() == []
+
+
+async def test_get_interview_by_call_finds_the_interview_that_holds_the_call_id(store):
+    await store.create_interview(make_interview("with-call", vapi_call_id=CALL_ID))
+    await store.create_interview(make_interview("without-call"))
+
+    found = await store.get_interview_by_call(CALL_ID)
+
+    assert found == make_interview("with-call", vapi_call_id=CALL_ID)
+    assert await store.get_interview_by_call("some-other-call") is None
+
+
 # --- the 7-day retention -----------------------------------------------------------------------
 
 
@@ -487,6 +526,8 @@ async def test_the_store_never_logs_the_vapi_call_id(store, caplog):
     await store.create_interview(make_interview())
     await store.update_interview("i1", status="live", vapi_call_id=CALL_ID)
     await store.get_interview("i1")
+    await store.get_interview_by_call(CALL_ID)
+    await store.list_live_interviews()
     await store.seconds_used_today()
     await store.delete_demo_data_older_than(7)
     assert CALL_ID not in caplog.text

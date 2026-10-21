@@ -398,6 +398,50 @@ async def test_end_is_idempotent():
     assert_hung_up_in_order(vapi.log, "plan_done")
 
 
+async def test_on_end_hears_the_reason_once_and_before_the_browser_does():
+    # The route marks the interview ended here, so the report page the browser opens next finds
+    # it ended and not still live.
+    log: list = []
+    browser, vapi = FakeSocket("browser", log), FakeSocket("vapi", log)
+
+    async def on_end(reason: str) -> None:
+        log.append(("route", "on_end", reason))
+
+    relay = Relay(browser, vapi, cap_s=60.0, on_end=on_end)
+    task = await start(relay)
+
+    await relay.end("plan_done")
+    assert await finished(task) == "plan_done"
+    await relay.end("cap")
+
+    assert log[0] == ("vapi", "send", END_CALL)  # the bill still stops first
+    assert [entry for entry in log if entry[0] == "route"] == [("route", "on_end", "plan_done")]
+    told = ("browser", "send", ended("plan_done"))
+    assert log.index(("route", "on_end", "plan_done")) < log.index(told)
+
+
+@pytest.mark.parametrize("trouble", ["raises", "hangs"])
+async def test_an_on_end_that_fails_or_hangs_cannot_stop_the_hang_up(trouble, caplog):
+    caplog.set_level(logging.DEBUG)
+
+    async def on_end(reason: str) -> None:
+        if trouble == "raises":
+            raise RuntimeError(f"could not write the row for {CALL_ID}")
+        await asyncio.Event().wait()  # never set, like a database that stopped answering
+
+    relay, browser, vapi = make_relay(on_end=on_end, hang_up_timeout_s=0.1)
+    task = await start(relay)
+
+    await asyncio.wait_for(relay.end("cap"), 1.0)
+
+    assert await finished(task) == "cap"
+    # The Vapi side runs alongside, so a hanging on_end can only hold up the browser's message.
+    assert vapi.log[0] == ("vapi", "send", END_CALL)
+    assert vapi.actions == [("send", END_CALL), ("close", 1000)]
+    assert browser.actions == [("send", ended("cap")), ("close", 1000)]
+    assert CALL_ID not in caplog.text
+
+
 async def test_end_from_on_event_stops_the_relay():
     # The route ends the call this way once the wrap-up line has been spoken.
     async def on_event(event) -> None:

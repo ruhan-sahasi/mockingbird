@@ -16,12 +16,14 @@ TaskGroup. `end(reason)` starts the hang-up and stops that group. The hang-up ru
 task, so cancelling whoever called `end()` cannot stop it halfway. It sends Vapi `end-call` first,
 because that is what stops the call and its bill. Then two things run side by side: the browser
 is told why and closed, and the Vapi socket is closed. So a browser that has stopped reading
-cannot hold up the Vapi close. Each of those steps gets at most `hang_up_timeout_s`, so `run()`
-and every `end()` caller return within a few seconds whatever state either socket is in. When
-`run()` exits without anyone having called `end()` (a task failed, or `run()` itself was
-cancelled by a server shutdown), it hangs up anyway with reason "error" before raising, so no
-path out of `run()` leaves a Vapi call running until its own time limit. `run()` only ever
-returns "cap", "browser_closed", "vapi_closed" or "plan_done".
+cannot hold up the Vapi close. Before the browser is told, `on_end(reason)` is awaited, so the
+route can record that the call ended before the browser hears it and asks for the report. Each
+of those steps gets at most `hang_up_timeout_s`, so `run()` and every `end()` caller return
+within a few seconds whatever state either socket is in. When `run()` exits without anyone
+having called `end()` (a task failed, or `run()` itself was cancelled by a server shutdown), it
+hangs up anyway with reason "error" before raising, so no path out of `run()` leaves a Vapi call
+running until its own time limit. `run()` only ever returns "cap", "browser_closed",
+"vapi_closed" or "plan_done".
 
 A browser can also vanish without closing. When its network drops with no FIN or RST, nothing
 reaches the relay, and its sends to the browser only fill a buffer that drains once the kernel
@@ -73,6 +75,8 @@ _ERROR = "error"
 # What the route's `on_event` is given. Ignored frames and the ones that end the call are not.
 LiveEvent = SpeechUpdate | UserInterrupted | StatusUpdate
 OnEvent = Callable[[LiveEvent], Awaitable[None]]
+# What the route's `on_end` is given: the reason the call ended, as the browser is about to hear.
+OnEnd = Callable[[str], Awaitable[None]]
 
 
 class SocketClosed(Exception):
@@ -176,9 +180,10 @@ class _Stopped(Exception):
 class Relay:
     """Relays one call's audio between the browser and Vapi until the call ends.
 
-    `cap_s` is the call's time cap, `on_event` hears Vapi's live events, and the browser gets a
-    ping every `ping_every_s`. The browser counts as gone once `browser_timeout_s` passes with no
-    frame from it, or with a send to it not done. Its mic frames come every 20 ms, so the 2 s
+    `cap_s` is the call's time cap, `on_event` hears Vapi's live events, `on_end` hears why the
+    call ended just before the browser does, and the browser gets a ping every `ping_every_s`.
+    The browser counts as gone once `browser_timeout_s` passes with no frame from it, or with
+    a send to it not done. Its mic frames come every 20 ms, so the 2 s
     default is 100 missing frames: enough to ride out a busy page or a few TCP retransmits, while
     a dropped network costs about 2 s of call. Each hang-up step, one send or one close, gets at
     most `hang_up_timeout_s`.
@@ -191,6 +196,7 @@ class Relay:
         *,
         cap_s: float,
         on_event: OnEvent | None = None,
+        on_end: OnEnd | None = None,
         ping_every_s: float = 20.0,
         browser_timeout_s: float = 2.0,
         hang_up_timeout_s: float = 1.0,
@@ -199,6 +205,7 @@ class Relay:
         self._vapi = vapi
         self._cap_s = cap_s
         self._on_event = on_event
+        self._on_end = on_end
         self._ping_every_s = ping_every_s
         self._browser_timeout_s = browser_timeout_s
         self._hang_up_timeout_s = hang_up_timeout_s
@@ -254,6 +261,9 @@ class Relay:
         log.info("relay ended: %s", reason)
 
     async def _tell_and_close_browser(self, reason: str) -> None:
+        if self._on_end is not None:
+            # Before the browser hears it: the report page asks about the interview next.
+            await self._attempt("record the end of the call", self._on_end(reason))
         ended = json.dumps({"type": "ended", "reason": reason})
         await self._attempt("tell the browser the call ended", self._browser.send_text(ended))
         await self._attempt("close the browser socket", self._browser.close())

@@ -33,6 +33,10 @@ Clock = Callable[[], datetime]
 # A finished interview. A graded one still counts toward the day's seconds: grading the report
 # does not give the call time back.
 _FINISHED = ("ended", "graded")
+# Today's demos that count toward the day's seconds: a created one at its cap, as it holds a
+# place for a call about to start, and a finished one at how long it ran. A live one counts at
+# its cap on any day.
+_COUNTED_TODAY = ("created", *_FINISHED)
 # What update_interview may change: any field of an Interview except its id. This is also what
 # makes it safe to put the field names into the SQL.
 _UPDATABLE = frozenset(f.name for f in fields(Interview)) - {"id"}
@@ -61,6 +65,16 @@ class Store(Protocol):
 
     async def get_interview(self, id: str) -> Interview | None: ...
 
+    async def get_interview_by_call(self, call_id: str) -> Interview | None:
+        """The interview whose `vapi_call_id` is `call_id`. Vapi's end-of-call report names only
+        the call, and it can come after the live session is gone."""
+        ...
+
+    async def list_live_interviews(self) -> list[Interview]:
+        """Every interview whose status is `live`, of any mode and any day. One left live by a
+        crash shows up here, so the sweeper can end it."""
+        ...
+
     async def update_interview(self, id: str, **changes: Any) -> None:
         """Change fields of an interview. Raises ValueError for a field it does not have, for
         `id`, which never changes, or for a value that breaks a rule of the interviews table, as
@@ -86,8 +100,12 @@ class Store(Protocol):
     async def get_report(self, interview_id: str) -> dict | None: ...
 
     async def seconds_used_today(self) -> int:
-        """Demo seconds spent today: `duration_s` of each finished demo interview, plus `cap_s`
-        of each demo that is live right now. Full-mode and abandoned interviews are ignored."""
+        """Demo seconds spent or promised today: `duration_s` of each finished demo interview,
+        plus `cap_s` of each demo that is live right now, plus `cap_s` of each demo created today
+        whose call has not started yet. That last part holds a place in the budget for a start
+        that was let through, so the next start is checked against it and the budget cannot be
+        overshot while calls are still connecting. An abandoned interview gives its place back.
+        Full-mode and abandoned interviews are ignored."""
         ...
 
     async def starts_today(self, visitor_hash: str, ip_hash: str) -> int:
@@ -167,6 +185,15 @@ class MemoryStore:
         found = self._interviews.get(id)
         return None if found is None else copy.deepcopy(found)
 
+    async def get_interview_by_call(self, call_id: str) -> Interview | None:
+        for i in self._interviews.values():
+            if i.vapi_call_id == call_id:
+                return copy.deepcopy(i)
+        return None
+
+    async def list_live_interviews(self) -> list[Interview]:
+        return [copy.deepcopy(i) for i in self._interviews.values() if i.status == "live"]
+
     async def update_interview(self, id: str, **changes: Any) -> None:
         _check_fields(changes)
         if not changes:
@@ -207,8 +234,8 @@ class MemoryStore:
                 continue
             if i.status == "live":
                 total += i.cap_s
-            elif i.status in _FINISHED and start <= i.created_at < end:
-                total += i.duration_s or 0
+            elif i.status in _COUNTED_TODAY and start <= i.created_at < end:
+                total += i.cap_s if i.status == "created" else i.duration_s or 0
         return total
 
     async def starts_today(self, visitor_hash: str, ip_hash: str) -> int:
@@ -291,9 +318,19 @@ class PostgresStore:
         row = await self._pool.fetchrow(
             f"select {_INTERVIEW_COLUMNS} from interviews where id = $1", id
         )
-        if row is None:
-            return None
-        return Interview(**{**row, "questions": json.loads(row["questions"])})
+        return None if row is None else _interview(row)
+
+    async def get_interview_by_call(self, call_id: str) -> Interview | None:
+        row = await self._pool.fetchrow(
+            f"select {_INTERVIEW_COLUMNS} from interviews where vapi_call_id = $1", call_id
+        )
+        return None if row is None else _interview(row)
+
+    async def list_live_interviews(self) -> list[Interview]:
+        rows = await self._pool.fetch(
+            f"select {_INTERVIEW_COLUMNS} from interviews where status = 'live'"
+        )
+        return [_interview(row) for row in rows]
 
     async def update_interview(self, id: str, **changes: Any) -> None:
         _check_fields(changes)
@@ -392,13 +429,13 @@ class PostgresStore:
     async def seconds_used_today(self) -> int:
         start, end = _utc_day(self._clock())
         return await self._pool.fetchval(
-            "select coalesce(sum(case when status = 'live' then cap_s"
+            "select coalesce(sum(case when status in ('created', 'live') then cap_s"
             "                         else coalesce(duration_s, 0) end), 0)"
             " from interviews"
             " where mode = 'demo'"
             "   and (status = 'live'"
             "        or (status = any($1::text[]) and created_at >= $2 and created_at < $3))",
-            list(_FINISHED),
+            list(_COUNTED_TODAY),
             start,
             end,
         )
@@ -427,6 +464,10 @@ class PostgresStore:
             " returning 1) select count(*) from gone",
             cutoff,
         )
+
+
+def _interview(row: asyncpg.Record) -> Interview:
+    return Interview(**{**row, "questions": json.loads(row["questions"])})
 
 
 def _score_rows(report: dict) -> list[tuple]:
