@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  # No branch filter: the PRs are stacked, so most of them target another PR's branch.
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+      # --locked fails the build if uv.lock is out of date, instead of quietly updating it.
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run pytest

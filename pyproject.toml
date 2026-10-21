@@ -1,0 +1,51 @@
+[project]
+name = "mockingbird"
+version = "0.1.0"
+description = "A voice mock interviewer: browser to Python relay to Vapi, with Claude as the brain."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "websockets>=13",
+    "httpx>=0.27",
+    "asyncpg>=0.29",
+    "pydantic-settings>=2.5",
+    "pyyaml>=6",
+    "anthropic>=1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "respx>=0.21",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# The package sits in server/, so uv installs it (editable) as `mockingbird`.
+# That is what lets `uvicorn mockingbird.app:app --factory` import it in Docker.
+[tool.hatch.build.targets.wheel]
+packages = ["server/mockingbird"]
+
+[tool.pytest.ini_options]
+testpaths = ["server/tests"]
+# Also lets pytest import `mockingbird` without an install step.
+pythonpath = ["server"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# The package lives in server/, so import sorting treats `mockingbird` as first-party.
+src = ["server"]
+# Task 1's throwaway Vapi recorder. It has its own inline dependencies and is not
+# part of the server, so it is not held to the server's style.
+extend-exclude = ["scripts/spike_vapi.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
