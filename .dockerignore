@@ -1,0 +1,14 @@
+# An allowlist: the build context holds only what the image installs and runs. Everything else
+# stays out, .env with its keys first of all, and also the tests, the web app and infra/.
+*
+!pyproject.toml
+!uv.lock
+!.python-version
+!server/mockingbird
+!server/data
+!server/migrations
+!scripts/entrypoint.sh
+
+# Bytecode from local runs. The image compiles its own.
+**/__pycache__
+**/*.pyc

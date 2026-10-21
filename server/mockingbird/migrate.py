@@ -31,8 +31,9 @@ async def apply_migrations(
     applied: list[str] = []
     for path in sorted(migrations_dir.glob("*.sql")):
         async with conn.transaction():
-            # An ECS deploy briefly runs the old and new task together, and both migrate on
-            # startup. This lock makes the second one wait, then find the file already applied.
+            # The ECS service never runs two tasks at once (minimum healthy 0%, maximum 100%),
+            # but two runners can still meet, for example a manual migrate during a deploy.
+            # This lock makes the second one wait, then find the file already applied.
             # It lasts until the transaction ends, so it also works through a transaction
             # pooler (a session-level lock would not).
             await conn.execute("select pg_advisory_xact_lock($1)", _LOCK_KEY)

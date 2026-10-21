@@ -7,3 +7,11 @@ scripts/.spike/
 *.egg-info/
 node_modules/
 web/dist/
+# Terraform: downloaded providers, local state (once the secrets are set, it holds them
+# decrypted) and real variable values. The provider lock file, .terraform.lock.hcl, is committed.
+infra/.terraform/
+*.tfstate*
+*.tfvars
+# Saved plans (terraform plan -out) can embed sensitive values too.
+*.tfplan
+infra/*.plan
