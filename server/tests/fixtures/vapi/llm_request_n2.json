@@ -1,0 +1,110 @@
+{
+  "model": "mockingbird-brain",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are an assistant."
+    },
+    {
+      "role": "assistant",
+      "content": "Hi. This is a Mockingbird test call. Tell me about a project you led."
+    },
+    {
+      "role": "user",
+      "content": "At my last internship, I led a migration of our billing service from 1 big monolith to a few smaller services. I wrote the plan."
+    }
+  ],
+  "temperature": 0.5,
+  "max_tokens": 250,
+  "call": {
+    "id": "01a15690-48f3-7331-a348-64c2e5c04886",
+    "orgId": "00000000-0000-0000-0000-000000000000",
+    "createdAt": "2026-10-19T23:47:38.867Z",
+    "updatedAt": "2026-10-19T23:47:38.867Z",
+    "type": "vapi.websocketCall",
+    "cost": 0,
+    "monitor": {
+      "listenUrl": "wss://phone-call-websocket.aws-us-west-2-backend-production1.vapi.ai/REDACTED",
+      "controlUrl": "https://phone-call-websocket.aws-us-west-2-backend-production1.vapi.ai/REDACTED"
+    },
+    "transport": {
+      "conversationType": "voice",
+      "provider": "vapi.websocket",
+      "audioFormat": {
+        "format": "pcm_s16le",
+        "container": "raw",
+        "sampleRate": 16000
+      },
+      "websocketCallUrl": "wss://phone-call-websocket.aws-us-west-2-backend-production1.vapi.ai/REDACTED"
+    },
+    "status": "queued",
+    "assistant": {
+      "model": {
+        "url": "https://tunnel.example/spike/llm",
+        "model": "mockingbird-brain",
+        "provider": "custom-llm"
+      },
+      "server": {
+        "url": "https://tunnel.example/spike/webhook"
+      },
+      "artifactPlan": {
+        "recordingEnabled": false
+      },
+      "firstMessage": "Hi, this is a Mockingbird test call. Tell me about a project you led.",
+      "serverMessages": [
+        "status-update",
+        "speech-update",
+        "user-interrupted",
+        "end-of-call-report"
+      ],
+      "stopSpeakingPlan": {
+        "numWords": 0,
+        "voiceSeconds": 0.2,
+        "backoffSeconds": 1
+      },
+      "startSpeakingPlan": {
+        "waitSeconds": 0.4
+      },
+      "maxDurationSeconds": 120,
+      "silenceTimeoutSeconds": 30
+    }
+  },
+  "assistant": {
+    "model": {
+      "model": "mockingbird-brain",
+      "provider": "custom-llm",
+      "url": "https://tunnel.example/spike/llm"
+    },
+    "firstMessage": "Hi, this is a Mockingbird test call. Tell me about a project you led.",
+    "serverMessages": [
+      "status-update",
+      "speech-update",
+      "user-interrupted",
+      "end-of-call-report"
+    ],
+    "silenceTimeoutSeconds": 30,
+    "maxDurationSeconds": 120,
+    "artifactPlan": {
+      "recordingEnabled": false
+    },
+    "startSpeakingPlan": {
+      "waitSeconds": 0.4
+    },
+    "stopSpeakingPlan": {
+      "numWords": 0,
+      "voiceSeconds": 0.2,
+      "backoffSeconds": 1
+    },
+    "server": {
+      "url": "https://tunnel.example/spike/webhook"
+    }
+  },
+  "metadata": {
+    "numAssistantTurns": 1,
+    "numUserTurns": 0,
+    "numModelRequestInTurn": 2,
+    "assistantTurnInterrupted": true
+  },
+  "timestamp": 1792453671130,
+  "stream": true
+}

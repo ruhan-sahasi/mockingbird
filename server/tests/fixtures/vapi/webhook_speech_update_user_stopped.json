@@ -1,0 +1,497 @@
+{
+  "message": {
+    "timestamp": 1792453676593,
+    "type": "speech-update",
+    "status": "stopped",
+    "role": "user",
+    "turn": 0,
+    "artifact": {
+      "messages": [
+        {
+          "role": "system",
+          "message": "You are an assistant.",
+          "time": 1792453658920,
+          "secondsFromStart": 0
+        },
+        {
+          "role": "bot",
+          "message": "Hi. This is a Mockingbird test call. Tell me about a project you led.",
+          "time": 1792453660198,
+          "endTime": 1792453663878,
+          "secondsFromStart": 0.96,
+          "duration": 3520,
+          "source": "",
+          "assistantName": ""
+        },
+        {
+          "role": "user",
+          "message": "At my last internship, I led a migration of our billing service from 1 big monolith to a few smaller services. I wrote the plan. Split the work between 3 engineers. And we shipped it 2 weeks early with no downtime.",
+          "time": 1792453664418,
+          "endTime": 1792453676628,
+          "secondsFromStart": 5.18,
+          "duration": 10370,
+          "metadata": {
+            "wordLevelConfidence": [
+              {
+                "word": "at",
+                "start": 5.18,
+                "end": 5.42,
+                "confidence": 0.62060547,
+                "punctuated_word": "At"
+              },
+              {
+                "word": "my",
+                "start": 5.42,
+                "end": 5.58,
+                "confidence": 0.99902344,
+                "punctuated_word": "my"
+              },
+              {
+                "word": "last",
+                "start": 5.58,
+                "end": 5.98,
+                "confidence": 1,
+                "punctuated_word": "last"
+              },
+              {
+                "word": "internship",
+                "start": 5.98,
+                "end": 6.48,
+                "confidence": 0.8684082,
+                "punctuated_word": "internship,"
+              },
+              {
+                "word": "i",
+                "start": 6.89,
+                "end": 6.93,
+                "confidence": 1,
+                "punctuated_word": "I"
+              },
+              {
+                "word": "led",
+                "start": 6.93,
+                "end": 6.97,
+                "confidence": 0.89208984,
+                "punctuated_word": "led"
+              },
+              {
+                "word": "a",
+                "start": 6.97,
+                "end": 7.0499997,
+                "confidence": 0.9970703,
+                "punctuated_word": "a"
+              },
+              {
+                "word": "migration",
+                "start": 7.0499997,
+                "end": 7.5499997,
+                "confidence": 1,
+                "punctuated_word": "migration"
+              },
+              {
+                "word": "of",
+                "start": 7.85,
+                "end": 7.9300003,
+                "confidence": 1,
+                "punctuated_word": "of"
+              },
+              {
+                "word": "our",
+                "start": 7.9300003,
+                "end": 8.01,
+                "confidence": 1,
+                "punctuated_word": "our"
+              },
+              {
+                "word": "billing",
+                "start": 8.01,
+                "end": 8.33,
+                "confidence": 1,
+                "punctuated_word": "billing"
+              },
+              {
+                "word": "service",
+                "start": 8.33,
+                "end": 8.49,
+                "confidence": 1,
+                "punctuated_word": "service"
+              },
+              {
+                "word": "from",
+                "start": 8.49,
+                "end": 8.73,
+                "confidence": 1,
+                "punctuated_word": "from"
+              },
+              {
+                "word": "1",
+                "start": 8.73,
+                "end": 8.889999,
+                "confidence": 1,
+                "punctuated_word": "1"
+              },
+              {
+                "word": "big",
+                "start": 8.889999,
+                "end": 9.21,
+                "confidence": 1,
+                "punctuated_word": "big"
+              },
+              {
+                "word": "monolith",
+                "start": 9.21,
+                "end": 9.69,
+                "confidence": 0.99560547,
+                "punctuated_word": "monolith"
+              },
+              {
+                "word": "to",
+                "start": 9.69,
+                "end": 9.849999,
+                "confidence": 1,
+                "punctuated_word": "to"
+              },
+              {
+                "word": "a",
+                "start": 9.849999,
+                "end": 9.929999,
+                "confidence": 1,
+                "punctuated_word": "a"
+              },
+              {
+                "word": "few",
+                "start": 9.929999,
+                "end": 10.17,
+                "confidence": 1,
+                "punctuated_word": "few"
+              },
+              {
+                "word": "smaller",
+                "start": 10.17,
+                "end": 10.57,
+                "confidence": 1,
+                "punctuated_word": "smaller"
+              },
+              {
+                "word": "services",
+                "start": 10.57,
+                "end": 11.07,
+                "confidence": 0.967041,
+                "punctuated_word": "services."
+              },
+              {
+                "word": "i",
+                "start": 11.559999,
+                "end": 11.629999,
+                "confidence": 1,
+                "punctuated_word": "I"
+              },
+              {
+                "word": "wrote",
+                "start": 11.629999,
+                "end": 11.879999,
+                "confidence": 1,
+                "punctuated_word": "wrote"
+              },
+              {
+                "word": "the",
+                "start": 11.879999,
+                "end": 11.96,
+                "confidence": 0.99902344,
+                "punctuated_word": "the"
+              },
+              {
+                "word": "plan",
+                "start": 11.96,
+                "end": 12.46,
+                "confidence": 0.96240234,
+                "punctuated_word": "plan."
+              },
+              {
+                "word": "split",
+                "start": 12.76,
+                "end": 13.08,
+                "confidence": 1,
+                "punctuated_word": "Split"
+              },
+              {
+                "word": "the",
+                "start": 13.08,
+                "end": 13.160001,
+                "confidence": 1,
+                "punctuated_word": "the"
+              },
+              {
+                "word": "work",
+                "start": 13.160001,
+                "end": 13.4800005,
+                "confidence": 1,
+                "punctuated_word": "work"
+              },
+              {
+                "word": "between",
+                "start": 13.4800005,
+                "end": 13.9800005,
+                "confidence": 1,
+                "punctuated_word": "between"
+              },
+              {
+                "word": "3",
+                "start": 14.120001,
+                "end": 14.370001,
+                "confidence": 1,
+                "punctuated_word": "3"
+              },
+              {
+                "word": "engineers",
+                "start": 14.370001,
+                "end": 14.81,
+                "confidence": 0.8156738,
+                "punctuated_word": "engineers."
+              },
+              {
+                "word": "and",
+                "start": 15.450001,
+                "end": 15.530001,
+                "confidence": 1,
+                "punctuated_word": "And"
+              },
+              {
+                "word": "we",
+                "start": 15.530001,
+                "end": 15.610001,
+                "confidence": 1,
+                "punctuated_word": "we"
+              },
+              {
+                "word": "shipped",
+                "start": 15.610001,
+                "end": 15.690001,
+                "confidence": 0.90625,
+                "punctuated_word": "shipped"
+              },
+              {
+                "word": "it",
+                "start": 15.690001,
+                "end": 15.77,
+                "confidence": 0.9550781,
+                "punctuated_word": "it"
+              },
+              {
+                "word": "2",
+                "start": 15.77,
+                "end": 15.97,
+                "confidence": 0.99902344,
+                "punctuated_word": "2"
+              },
+              {
+                "word": "weeks",
+                "start": 15.97,
+                "end": 16.17,
+                "confidence": 1,
+                "punctuated_word": "weeks"
+              },
+              {
+                "word": "early",
+                "start": 16.17,
+                "end": 16.33,
+                "confidence": 1,
+                "punctuated_word": "early"
+              },
+              {
+                "word": "with",
+                "start": 16.33,
+                "end": 16.57,
+                "confidence": 0.99902344,
+                "punctuated_word": "with"
+              },
+              {
+                "word": "no",
+                "start": 16.57,
+                "end": 16.89,
+                "confidence": 1,
+                "punctuated_word": "no"
+              },
+              {
+                "word": "downtime",
+                "start": 16.89,
+                "end": 17.39,
+                "confidence": 0.9916992,
+                "punctuated_word": "downtime."
+              }
+            ]
+          },
+          "confidence": 0.99902344,
+          "confidenceSource": "derived"
+        }
+      ],
+      "messagesOpenAIFormatted": [
+        {
+          "role": "system",
+          "content": "You are an assistant."
+        },
+        {
+          "role": "assistant",
+          "content": "Hi. This is a Mockingbird test call. Tell me about a project you led."
+        },
+        {
+          "role": "user",
+          "content": "At my last internship, I led a migration of our billing service from 1 big monolith to a few smaller services. I wrote the plan. Split the work between 3 engineers. And we shipped it 2 weeks early with no downtime."
+        }
+      ],
+      "variables": {
+        "now": "Oct 19, 2026, 11:47 PM UTC",
+        "currentDateTime": "Monday, October 19, 2026 at 11:47 PM UTC",
+        "date": "Oct 19, 2026 UTC",
+        "time": "11:47 PM UTC",
+        "year": "2026",
+        "month": "October",
+        "day": "19",
+        "transport": {
+          "conversationType": "voice",
+          "provider": "vapi.websocket",
+          "audioFormat": {
+            "format": "pcm_s16le",
+            "container": "raw",
+            "sampleRate": 16000
+          },
+          "websocketCallUrl": "wss://phone-call-websocket.aws-us-west-2-backend-production1.vapi.ai/REDACTED"
+        },
+        "call": {
+          "id": "01a15690-48f3-7331-a348-64c2e5c04886",
+          "type": "vapi.websocketCall",
+          "status": "queued",
+          "createdAt": "2026-10-19T23:47:38.867Z",
+          "transport": {
+            "conversationType": "voice",
+            "provider": "vapi.websocket",
+            "audioFormat": {
+              "format": "pcm_s16le",
+              "container": "raw",
+              "sampleRate": 16000
+            },
+            "websocketCallUrl": "wss://phone-call-websocket.aws-us-west-2-backend-production1.vapi.ai/REDACTED"
+          }
+        }
+      },
+      "variableValues": {
+        "now": "Oct 19, 2026, 11:47 PM UTC",
+        "currentDateTime": "Monday, October 19, 2026 at 11:47 PM UTC",
+        "date": "Oct 19, 2026 UTC",
+        "time": "11:47 PM UTC",
+        "year": "2026",
+        "month": "October",
+        "day": "19",
+        "transport": {
+          "conversationType": "voice",
+          "provider": "vapi.websocket",
+          "audioFormat": {
+            "format": "pcm_s16le",
+            "container": "raw",
+            "sampleRate": 16000
+          },
+          "websocketCallUrl": "wss://phone-call-websocket.aws-us-west-2-backend-production1.vapi.ai/REDACTED"
+        },
+        "call": {
+          "id": "01a15690-48f3-7331-a348-64c2e5c04886",
+          "type": "vapi.websocketCall",
+          "status": "queued",
+          "createdAt": "2026-10-19T23:47:38.867Z",
+          "transport": {
+            "conversationType": "voice",
+            "provider": "vapi.websocket",
+            "audioFormat": {
+              "format": "pcm_s16le",
+              "container": "raw",
+              "sampleRate": 16000
+            },
+            "websocketCallUrl": "wss://phone-call-websocket.aws-us-west-2-backend-production1.vapi.ai/REDACTED"
+          }
+        }
+      }
+    },
+    "call": {
+      "id": "01a15690-48f3-7331-a348-64c2e5c04886",
+      "orgId": "00000000-0000-0000-0000-000000000000",
+      "createdAt": "2026-10-19T23:47:38.867Z",
+      "updatedAt": "2026-10-19T23:47:38.867Z",
+      "type": "vapi.websocketCall",
+      "cost": 0,
+      "monitor": {
+        "listenUrl": "wss://phone-call-websocket.aws-us-west-2-backend-production1.vapi.ai/REDACTED",
+        "controlUrl": "https://phone-call-websocket.aws-us-west-2-backend-production1.vapi.ai/REDACTED"
+      },
+      "transport": {
+        "conversationType": "voice",
+        "provider": "vapi.websocket",
+        "audioFormat": {
+          "format": "pcm_s16le",
+          "container": "raw",
+          "sampleRate": 16000
+        },
+        "websocketCallUrl": "wss://phone-call-websocket.aws-us-west-2-backend-production1.vapi.ai/REDACTED"
+      },
+      "status": "queued",
+      "assistant": {
+        "model": {
+          "url": "https://tunnel.example/spike/llm",
+          "model": "mockingbird-brain",
+          "provider": "custom-llm"
+        },
+        "server": {
+          "url": "https://tunnel.example/spike/webhook"
+        },
+        "artifactPlan": {
+          "recordingEnabled": false
+        },
+        "firstMessage": "Hi, this is a Mockingbird test call. Tell me about a project you led.",
+        "serverMessages": [
+          "status-update",
+          "speech-update",
+          "user-interrupted",
+          "end-of-call-report"
+        ],
+        "stopSpeakingPlan": {
+          "numWords": 0,
+          "voiceSeconds": 0.2,
+          "backoffSeconds": 1
+        },
+        "startSpeakingPlan": {
+          "waitSeconds": 0.4
+        },
+        "maxDurationSeconds": 120,
+        "silenceTimeoutSeconds": 30
+      }
+    },
+    "assistant": {
+      "model": {
+        "model": "mockingbird-brain",
+        "provider": "custom-llm",
+        "url": "https://tunnel.example/spike/llm"
+      },
+      "firstMessage": "Hi, this is a Mockingbird test call. Tell me about a project you led.",
+      "serverMessages": [
+        "status-update",
+        "speech-update",
+        "user-interrupted",
+        "end-of-call-report"
+      ],
+      "silenceTimeoutSeconds": 30,
+      "maxDurationSeconds": 120,
+      "artifactPlan": {
+        "recordingEnabled": false
+      },
+      "startSpeakingPlan": {
+        "waitSeconds": 0.4
+      },
+      "stopSpeakingPlan": {
+        "numWords": 0,
+        "voiceSeconds": 0.2,
+        "backoffSeconds": 1
+      },
+      "server": {
+        "url": "https://tunnel.example/spike/webhook"
+      }
+    }
+  }
+}

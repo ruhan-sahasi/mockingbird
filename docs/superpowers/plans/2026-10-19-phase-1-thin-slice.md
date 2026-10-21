@@ -101,6 +101,140 @@ checks.
 
 ---
 
+## Amendment 1: how Vapi really behaves (2026-10-19)
+
+The Task 1 live recording (`docs/vapi-contract.md`) contradicted two
+assumptions this plan was written on. Ruhan made two decisions, recorded in
+the spec's decisions table. They change Tasks 4, 6, 8, 9 and 11 as follows.
+Where this section and a task's text disagree, this section wins.
+
+**What Vapi does**
+- It sends several brain requests per candidate answer, as its transcript
+  grows (4 for one answer in the recording), and speaks only the reply to
+  the last one. Older streams are dropped.
+- Each request's last message is the candidate's whole answer so far: one
+  `user` message, cumulative for the turn.
+- After an interruption, the history Vapi sends holds only the words that
+  were actually spoken.
+- Live events arrive as text frames on the audio WebSocket, in order with the
+  audio: `speech-update`, `user-interrupted`, `status-update`, `hangup` and
+  others.
+
+**Decision 1: a reply counts only once it is spoken.** Each request gets a
+draft from a copy of the interview plan. The draft becomes real when Vapi
+reports the interviewer started speaking. Dropped drafts change nothing.
+This supersedes ruling R14.
+
+**Decision 2: live events come from the audio WebSocket.** Webhooks are used
+only for the end-of-call report.
+
+### Changes to Task 4
+
+`LlmRequest(call_id: str, user_text: str, spoken_assistant_text: str | None)`:
+- `user_text` is the content of the last `user` message, not a join of
+  several messages.
+- `spoken_assistant_text` is the content of the last `assistant` message in
+  the body, or `None` if there is none.
+- The full-answer test uses `llm_request_n4.json`.
+  `llm_request_turn1.json` is a partial answer.
+
+Add `Hangup(call_id: str | None)`. The webhook event dataclasses take
+`call_id: str | None`.
+
+Add `parse_ws_event(frame: dict) -> SpeechUpdate | UserInterrupted |
+StatusUpdate | Hangup | Ignored` for Vapi's audio-socket text frames, with
+`call_id=None`. Test it against every frame type in
+`ws_text_frames.jsonl`.
+
+### New Task 6b: commit replies only when spoken
+
+This goes on top of Task 6's `Brain`, in `brain.py` and `test_brain.py`.
+
+**Methods:**
+- `reply()` becomes `draft(candidate_text: str, spoken_assistant_text: str |
+  None) -> AsyncIterator[str]`. In order, it:
+  1. Finalizes the previously committed draft, if there is one. It appends
+     that draft's user, system and assistant messages to the history. The
+     assistant text is `spoken_assistant_text` when that is non-empty and
+     shorter than the generated text, otherwise the generated text. It also
+     records the interviewer `Turn`, with `interrupted=True` when the
+     spoken text was shorter.
+  2. Discards any uncommitted draft.
+  3. Builds the new draft on `copy.deepcopy(self.plan)`, then streams it
+     exactly as Task 6's `reply()` did (same prompts, fallbacks and fixed
+     wrap-up line).
+- `commit_spoken() -> bool`:
+  - With a draft pending: makes that draft's plan copy the real plan, records
+    the candidate `Turn` (whose `question_idx` is the committed plan's
+    `current_question_idx` before the move), and returns `True`.
+  - With nothing pending (for example the opening line): returns `False`.
+- `finalize()`: finalizes a committed draft at call end, using its generated
+  text.
+- `finished` reads the committed plan, so wrap-up counts only once it is
+  spoken.
+
+**Tests:**
+- 4 drafts for one answer, then one `commit_spoken()`: the plan advanced
+  exactly once, and the history holds one user/system/assistant triple.
+- A draft never committed leaves the plan, history and turns unchanged.
+- An interrupted reply: the next `draft()` carries a shorter
+  `spoken_assistant_text`. The interviewer turn then has `interrupted=True`
+  and the spoken text, and the history's assistant message equals the
+  spoken text.
+- After any mix of drafts and commits, every `system` message is followed
+  by an `assistant` message.
+- Wrap-up sets `finished` only after `commit_spoken()`.
+- `commit_spoken()` with no draft returns `False`.
+
+### Changes to Task 8
+
+`serverMessages` is `["end-of-call-report"]`. Task 13's live run checks
+that the audio socket still carries `speech-update` and `user-interrupted`
+with that setting.
+
+### Changes to Task 9
+
+The signature is `Relay(browser, vapi, *, cap_s, on_event: Callable[[event],
+Awaitable[None]] | None = None, ping_every_s=20.0)`.
+
+Vapi text frames are parsed with `parse_ws_event`:
+- `UserInterrupted`: the relay sends `{"type": "flush"}` to the browser
+  itself, before forwarding any later audio frame, and then calls
+  `on_event`.
+- `Hangup`, or `StatusUpdate(status="ended")`: `end("vapi_closed")`.
+- Every other event goes to `on_event`.
+
+**Tests:**
+- `test_user_interrupted_frame_flushes_before_later_audio`
+- `test_hangup_frame_ends_with_vapi_closed`
+- `test_events_reach_on_event_in_order`
+
+### Changes to Task 11
+
+- The LLM route calls `brain.draft(req.user_text,
+  req.spoken_assistant_text)`, and cancels any in-flight draft task first.
+  Overlapping requests are normal now that Vapi speculates.
+- The relay's `on_event`:
+  - `SpeechUpdate(role="assistant", status="started")`: calls
+    `brain.commit_spoken()`.
+  - `SpeechUpdate(role="assistant", status="stopped")` while
+    `brain.finished`: calls `relay.end("plan_done")`.
+- When `run()` returns, call `brain.finalize()` before writing turns.
+- The webhook route acts only on `EndOfCallReport`, recording
+  `ended_reason`. Every other type gets 200 `{}` and no action.
+
+**Tests:** `test_user_interrupted_webhook_flushes_browser` and
+`test_assistant_stopped_after_wrap_up_ends_call` become:
+- `test_speech_started_event_commits_draft`
+- `test_assistant_stopped_after_committed_wrap_up_ends_call`
+- `test_overlapping_llm_requests_commit_only_the_spoken_one`
+
+### New execution order
+
+1a, 2, 3, 5, 6, 1b (rebased onto Task 6), 4, 6b, 7, 8, 9, 10, 11, 12, 13, 14.
+
+---
+
 ## Prerequisites (Ruhan, before Task 1)
 
 - `brew install terraform awscli ngrok`, plus `ngrok config add-authtoken

@@ -1,0 +1,192 @@
+{
+  "message": {
+    "timestamp": 1792453663232,
+    "type": "speech-update",
+    "status": "stopped",
+    "role": "assistant",
+    "turn": 0,
+    "artifact": {
+      "messages": [
+        {
+          "role": "system",
+          "message": "You are an assistant.",
+          "time": 1792453658920,
+          "secondsFromStart": 0
+        },
+        {
+          "role": "bot",
+          "message": "Hi. This is a Mockingbird test call. Tell me about a project you led.",
+          "time": 1792453660198,
+          "endTime": 1792453663878,
+          "secondsFromStart": 0.96,
+          "duration": 3520,
+          "source": "",
+          "assistantName": ""
+        }
+      ],
+      "messagesOpenAIFormatted": [
+        {
+          "role": "system",
+          "content": "You are an assistant."
+        },
+        {
+          "role": "assistant",
+          "content": "Hi. This is a Mockingbird test call. Tell me about a project you led."
+        }
+      ],
+      "variables": {
+        "now": "Oct 19, 2026, 11:47 PM UTC",
+        "currentDateTime": "Monday, October 19, 2026 at 11:47 PM UTC",
+        "date": "Oct 19, 2026 UTC",
+        "time": "11:47 PM UTC",
+        "year": "2026",
+        "month": "October",
+        "day": "19",
+        "transport": {
+          "conversationType": "voice",
+          "provider": "vapi.websocket",
+          "audioFormat": {
+            "format": "pcm_s16le",
+            "container": "raw",
+            "sampleRate": 16000
+          },
+          "websocketCallUrl": "wss://phone-call-websocket.aws-us-west-2-backend-production1.vapi.ai/REDACTED"
+        },
+        "call": {
+          "id": "01a15690-48f3-7331-a348-64c2e5c04886",
+          "type": "vapi.websocketCall",
+          "status": "queued",
+          "createdAt": "2026-10-19T23:47:38.867Z",
+          "transport": {
+            "conversationType": "voice",
+            "provider": "vapi.websocket",
+            "audioFormat": {
+              "format": "pcm_s16le",
+              "container": "raw",
+              "sampleRate": 16000
+            },
+            "websocketCallUrl": "wss://phone-call-websocket.aws-us-west-2-backend-production1.vapi.ai/REDACTED"
+          }
+        }
+      },
+      "variableValues": {
+        "now": "Oct 19, 2026, 11:47 PM UTC",
+        "currentDateTime": "Monday, October 19, 2026 at 11:47 PM UTC",
+        "date": "Oct 19, 2026 UTC",
+        "time": "11:47 PM UTC",
+        "year": "2026",
+        "month": "October",
+        "day": "19",
+        "transport": {
+          "conversationType": "voice",
+          "provider": "vapi.websocket",
+          "audioFormat": {
+            "format": "pcm_s16le",
+            "container": "raw",
+            "sampleRate": 16000
+          },
+          "websocketCallUrl": "wss://phone-call-websocket.aws-us-west-2-backend-production1.vapi.ai/REDACTED"
+        },
+        "call": {
+          "id": "01a15690-48f3-7331-a348-64c2e5c04886",
+          "type": "vapi.websocketCall",
+          "status": "queued",
+          "createdAt": "2026-10-19T23:47:38.867Z",
+          "transport": {
+            "conversationType": "voice",
+            "provider": "vapi.websocket",
+            "audioFormat": {
+              "format": "pcm_s16le",
+              "container": "raw",
+              "sampleRate": 16000
+            },
+            "websocketCallUrl": "wss://phone-call-websocket.aws-us-west-2-backend-production1.vapi.ai/REDACTED"
+          }
+        }
+      }
+    },
+    "call": {
+      "id": "01a15690-48f3-7331-a348-64c2e5c04886",
+      "orgId": "00000000-0000-0000-0000-000000000000",
+      "createdAt": "2026-10-19T23:47:38.867Z",
+      "updatedAt": "2026-10-19T23:47:38.867Z",
+      "type": "vapi.websocketCall",
+      "cost": 0,
+      "monitor": {
+        "listenUrl": "wss://phone-call-websocket.aws-us-west-2-backend-production1.vapi.ai/REDACTED",
+        "controlUrl": "https://phone-call-websocket.aws-us-west-2-backend-production1.vapi.ai/REDACTED"
+      },
+      "transport": {
+        "conversationType": "voice",
+        "provider": "vapi.websocket",
+        "audioFormat": {
+          "format": "pcm_s16le",
+          "container": "raw",
+          "sampleRate": 16000
+        },
+        "websocketCallUrl": "wss://phone-call-websocket.aws-us-west-2-backend-production1.vapi.ai/REDACTED"
+      },
+      "status": "queued",
+      "assistant": {
+        "model": {
+          "url": "https://tunnel.example/spike/llm",
+          "model": "mockingbird-brain",
+          "provider": "custom-llm"
+        },
+        "server": {
+          "url": "https://tunnel.example/spike/webhook"
+        },
+        "artifactPlan": {
+          "recordingEnabled": false
+        },
+        "firstMessage": "Hi, this is a Mockingbird test call. Tell me about a project you led.",
+        "serverMessages": [
+          "status-update",
+          "speech-update",
+          "user-interrupted",
+          "end-of-call-report"
+        ],
+        "stopSpeakingPlan": {
+          "numWords": 0,
+          "voiceSeconds": 0.2,
+          "backoffSeconds": 1
+        },
+        "startSpeakingPlan": {
+          "waitSeconds": 0.4
+        },
+        "maxDurationSeconds": 120,
+        "silenceTimeoutSeconds": 30
+      }
+    },
+    "assistant": {
+      "model": {
+        "model": "mockingbird-brain",
+        "provider": "custom-llm",
+        "url": "https://tunnel.example/spike/llm"
+      },
+      "firstMessage": "Hi, this is a Mockingbird test call. Tell me about a project you led.",
+      "serverMessages": [
+        "status-update",
+        "speech-update",
+        "user-interrupted",
+        "end-of-call-report"
+      ],
+      "silenceTimeoutSeconds": 30,
+      "maxDurationSeconds": 120,
+      "artifactPlan": {
+        "recordingEnabled": false
+      },
+      "startSpeakingPlan": {
+        "waitSeconds": 0.4
+      },
+      "stopSpeakingPlan": {
+        "numWords": 0,
+        "voiceSeconds": 0.2,
+        "backoffSeconds": 1
+      },
+      "server": {
+        "url": "https://tunnel.example/spike/webhook"
+      }
+    }
+  }
+}

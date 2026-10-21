@@ -192,6 +192,15 @@ sentence, server region, frame size, and jitter buffer size.
 
 ### Interruptions
 
+- Measured in the Task 1 recording (`docs/vapi-contract.md`): Vapi sends
+  several brain requests per answer and speaks only the last reply; its
+  history after an interruption holds only the spoken words; and live events
+  (`speech-update`, `user-interrupted`, `hangup`) arrive as text frames on the
+  audio WebSocket, in order with the audio. Ruhan's decisions: a reply counts
+  only once Vapi starts speaking it, and live events are read from the audio
+  socket, so the relay flushes the browser the moment the interruption frame
+  arrives. Webhooks carry only the end-of-call report. This replaces the
+  webhook-driven design below where they differ.
 - Vapi detects the candidate talking over the interviewer, stops speaking, and
   sends a `user-interrupted` webhook.
 - Problem: interviewer audio already buffered in the browser keeps playing,
@@ -393,6 +402,8 @@ v1.
 | Who codes | Agent writes, Ruhan reviews every PR | Ruhan writes the core; agent writes all, Ruhan skims |
 | Build order | Thin slice first | Finish each part fully |
 | Budget | Nothing out of pocket; credits plus free tiers | Paid monthly budget |
+| Which reply counts (after measuring Vapi) | Only the reply Vapi starts speaking: drafts on a copy of the plan, committed on speech start | Group requests by the candidate's words; make Vapi wait longer before replying |
+| Live event source (after measuring Vapi) | Text frames on the audio WebSocket; webhooks only for the end-of-call report | Webhooks as first planned; both |
 
 ## My calls (flagged for Ruhan to check)
 

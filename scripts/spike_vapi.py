@@ -108,6 +108,16 @@ SENSITIVE_HEADERS = {"authorization", "x-vapi-secret", "x-api-key", "cookie", "s
 # --------------------------------------------------------------------------
 
 
+def pick_reply(body, request_number: int) -> str:
+    """The long reply while the history holds only the opening line, the short one after that.
+
+    Every reply starts with "Request N." so the transcript shows which of Vapi's requests it spoke.
+    """
+    messages = body.get("messages", []) if isinstance(body, dict) else []
+    assistant_turns = sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant")
+    return f"Request {request_number}. " + (LONG_REPLY if assistant_turns <= 1 else SHORT_REPLY)
+
+
 def build_app():
     app = FastAPI()
     state = {"seq": 0, "llm_calls": 0}
@@ -133,7 +143,7 @@ def build_app():
         print(f"{request.method} {request.url.path} -> {response.status_code}", flush=True)
         return response
 
-    def sse_reply(text: str) -> StreamingResponse:
+    def sse_reply(text: str, request_seq: int) -> StreamingResponse:
         base = {
             "id": "chatcmpl-spike",
             "object": "chat.completion.chunk",
@@ -146,12 +156,22 @@ def build_app():
             return f"data: {json.dumps(payload)}\n\n"
 
         async def stream():
-            yield chunk({"role": "assistant", "content": ""})
-            for word in text.split(" "):
-                yield chunk({"content": word + " "})
-                await asyncio.sleep(0.02)
-            yield chunk({}, finish="stop")
-            yield "data: [DONE]\n\n"
+            # Slow enough (about 2.5 s per reply) that a newer request from Vapi arrives while this
+            # one is still streaming, so we can see whether Vapi drops the older stream.
+            sent, outcome = 0, "completed"
+            try:
+                yield chunk({"role": "assistant", "content": ""})
+                for word in text.split(" "):
+                    yield chunk({"content": word + " "})
+                    sent += 1
+                    await asyncio.sleep(0.06)
+                yield chunk({}, finish="stop")
+                yield "data: [DONE]\n\n"
+            except BaseException as exc:  # CancelledError / GeneratorExit when the client goes away
+                outcome = type(exc).__name__
+                raise
+            finally:
+                log_event(kind="llm_stream", request_seq=request_seq, outcome=outcome, words_sent=sent)
 
         return StreamingResponse(stream(), media_type="text/event-stream")
 
@@ -176,17 +196,18 @@ def build_app():
                 },
             },
         )
-        reply = LONG_REPLY if state["llm_calls"] == 1 else SHORT_REPLY
-        return sse_reply(reply)
+        return sse_reply(pick_reply(body, state["llm_calls"]), n)
 
     @app.post(f"{LLM_MOUNT}/chat/completions")
     async def llm_chat(request: Request):
         return await handle_llm(request, expected_path=True)
 
     # Catch-all: if Vapi appends a different path, save it and still answer so
-    # the call keeps going. Question 1 is about exactly this.
+    # the call keeps going. Question 1 is about exactly this. The bare model.url
+    # (nothing appended at all) is a separate route: "{rest:path}" needs the slash.
+    @app.post(LLM_MOUNT)
     @app.post(LLM_MOUNT + "/{rest:path}")
-    async def llm_other(rest: str, request: Request):
+    async def llm_other(request: Request, rest: str = ""):
         return await handle_llm(request, expected_path=False)
 
     @app.post("/spike/webhook")
@@ -445,9 +466,18 @@ async def run_call(args, transport=None) -> None:
     async with httpx.AsyncClient(timeout=30, transport=transport) as http:
         call, artifact_ok = await create_call(http, args.api_base, key, ngrok)
         write_json(RAW / "create_call_response.json", call)
-        ws_url = call["transport"]["websocketCallUrl"]
-        call_id = call.get("id")
+        call_id = call.get("id") if isinstance(call, dict) else None
+        transport_info = call.get("transport") if isinstance(call, dict) else None
+        ws_url = transport_info.get("websocketCallUrl") if isinstance(transport_info, dict) else None
         print(f"call {call_id} created; artifactPlan accepted: {artifact_ok}", flush=True)
+        if not ws_url:
+            # The response is already saved. Record what Vapi says about the call, then stop cleanly.
+            ended = await fetch_call_after(http, args.api_base, key, call_id)
+            save_call_artifacts(
+                CallState(), Streamer(), {}, call_id, artifact_ok, ended,
+                "create-call response has no transport.websocketCallUrl",
+            )
+            raise SystemExit("create-call response has no transport.websocketCallUrl; create_call_response.json is saved")
 
         state = CallState()
         state.frames_path = RAW / "ws_text_frames.jsonl"
@@ -635,6 +665,8 @@ _COUNT_KEY = re.compile(r"(max|prompt|completion|total|input|output)[-_]?tokens?
 _URL_KEY = re.compile(
     r"^(websocketCallUrl|listenUrl|controlUrl|logUrl|pcapUrl|recordingUrl|.*RecordingUrl|.*CallUrl)$", re.I
 )
+# Case-sensitive on purpose: camelCase compounds (presignedLogUrl, stereoRecordingUrl, ...) but not a bare "url".
+_URL_KEY_CAMEL = re.compile(r"^.+(?:Url|URL)$")
 _ORG_KEY = re.compile(r"^org[-_]?id$", re.I)
 _JWT = re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}")
 _BEARER = re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]+", re.I)
@@ -668,7 +700,7 @@ def scrub(value, literals: dict[str, str], key: str = "", redact: bool = False):
         return value
     if redact:
         return "REDACTED"
-    if _URL_KEY.match(key):
+    if _URL_KEY.match(key) or _URL_KEY_CAMEL.match(key):
         # capability / recording URLs: keep the scheme and host, drop everything after
         whole = _URL_WHOLE.match(value)
         return whole.group(1) + "REDACTED" if whole else "REDACTED"
@@ -705,6 +737,10 @@ _LEAK_PATTERNS = [
     (
         "a control/listen/transport URL",
         re.compile(r"(?:wss?|https?)://[^\s\"'\\]*/(?:control|listen|transport)\b", re.I),
+    ),
+    (
+        "a storage or presigned URL",
+        re.compile(r"(?:cloudflarestorage|amazonaws)\.com/(?!REDACTED)|X-Amz-|[?&]Signature=", re.I),
     ),
     ("an ngrok host", re.compile(r"\.ngrok(?:-free)?\.(?:app|dev|io|pizza|pro)\b", re.I)),
     ("an orgId that is not the zero UUID", re.compile(r'"orgId"\s*:\s*"(?!0{8}-0{4}-0{4}-0{4}-0{12}")', re.I)),
@@ -769,6 +805,14 @@ def cmd_fixtures(args) -> None:
         fixture_for_seq.setdefault(pick["seq"], "llm_request_after_interrupt.json")
         print(f"llm_request_after_interrupt.json = seq {pick['seq']}: {rule}")
 
+    # Vapi sends several requests per user turn, so keep them all: llm_request_n<i>.json, in arrival order.
+    for i, e in enumerate(llm, start=1):
+        if e["seq"] not in fixture_for_seq:
+            emit(f"llm_request_n{i}.json", raw_for(e))
+            fixture_for_seq[e["seq"]] = f"llm_request_n{i}.json"
+    outcomes = {e["request_seq"]: e for e in events if e["kind"] == "llm_stream"}
+    t0 = events[0]["t"] if events else 0.0
+
     # Question 1 evidence: the path Vapi appends to model.url, plus the query and headers it sent.
     paths = []
     for e in llm:
@@ -785,6 +829,10 @@ def cmd_fixtures(args) -> None:
                 "query": meta.get("query", e.get("query", "")),
                 "headers": meta.get("headers", {}),
                 "body_fixture": fixture_for_seq.get(e["seq"]),
+                "arrived_at_s": round(e["t"] - t0, 2),  # seconds since the first event of the run
+                "stream_outcome": outcomes.get(e["seq"], {}).get("outcome"),
+                "stream_words_sent": outcomes.get(e["seq"], {}).get("words_sent"),
+                "stream_ended_at_s": round(outcomes[e["seq"]]["t"] - t0, 2) if e["seq"] in outcomes else None,
             }
         )
     if paths:
@@ -901,7 +949,7 @@ class _Sandbox:
         self.tmp.cleanup()
 
 
-def _fake_vapi_rest(ws_port: int):
+def _fake_vapi_rest(ws_port: int, with_socket: bool = True):
     """An httpx.MockTransport that answers POST /call and GET /call/{id} like Vapi, capability URLs and all."""
     import httpx
 
@@ -920,7 +968,10 @@ def _fake_vapi_rest(ws_port: int):
             body = json.loads(request.content)
             assert body["assistant"]["artifactPlan"] == {"recordingEnabled": False}
             assert body["assistant"]["model"]["url"] == FAKE_NGROK + LLM_MOUNT
-            return httpx.Response(201, json={**call_object, "status": "queued"})
+            created = {**call_object, "status": "queued"}
+            if not with_socket:
+                created["transport"] = {"provider": "vapi.websocket"}
+            return httpx.Response(201, json=created)
         if request.method == "GET" and request.url.path == f"/call/{FAKE_CALL}":
             return httpx.Response(200, json=call_object)
         return httpx.Response(404, json={"message": "unexpected request"})
@@ -1173,6 +1224,92 @@ def test_full_call_still_ends_on_end_call():
         assert summary["first_frame_byte_sizes"] == [FRAME_BYTES] and summary["aborted_with"] is None
 
 
+def test_the_bare_model_url_and_any_appended_path_get_an_answer_and_are_recorded():
+    from fastapi.testclient import TestClient
+
+    with _Sandbox():
+        client = TestClient(build_app())
+        for path in (LLM_MOUNT, LLM_MOUNT + "/", LLM_MOUNT + "/v1/chat/completions", LLM_MOUNT + "/chat/completions"):
+            resp = client.post(path, json={"messages": [], "call": {"id": "c1"}})
+            assert resp.status_code == 200 and resp.text.rstrip().endswith("data: [DONE]"), (path, resp.status_code)
+            assert '"finish_reason": "stop"' in resp.text
+        events = [json.loads(line) for line in (RAW / "events.jsonl").read_text().splitlines()]
+        events = [e for e in events if e["kind"] in ("llm", "llm_other")]  # not the llm_stream bookkeeping
+        assert [(e["kind"], e["path"]) for e in events] == [
+            ("llm_other", LLM_MOUNT),
+            ("llm_other", LLM_MOUNT + "/"),
+            ("llm_other", LLM_MOUNT + "/v1/chat/completions"),
+            ("llm", LLM_MOUNT + "/chat/completions"),
+        ], events
+        for e in events:
+            assert json.loads((RAW / f"llm_{e['seq']:03d}.json").read_text())["call"] == {"id": "c1"}
+            assert json.loads((RAW / f"llm_{e['seq']:03d}.meta.json").read_text())["path"] == e["path"]
+
+
+def test_a_create_call_response_without_a_socket_url_is_saved_and_exits_cleanly():
+    with _Sandbox() as root:
+        async def go():
+            try:
+                await run_call(_call_args(root), transport=_fake_vapi_rest(0, with_socket=False))
+            except SystemExit as exc:
+                assert "websocketCallUrl" in str(exc), exc
+            else:
+                raise AssertionError("run_call carried on without a socket URL")
+
+        asyncio.run(go())
+        saved = json.loads((RAW / "create_call_response.json").read_text())
+        assert saved["id"] == FAKE_CALL and "websocketCallUrl" not in saved["transport"], saved
+        summary = json.loads((RAW / "call_summary.json").read_text())
+        assert summary["call_id"] == FAKE_CALL and "websocketCallUrl" in summary["aborted_with"], summary
+        assert summary["get_call_status_after"] == "ended"
+        assert (RAW / "get_call_after.json").exists()
+
+
+def test_scrub_hides_presigned_storage_urls_and_the_check_flags_them():
+    url = "https://bucket.r2.cloudflarestorage.com/org/call.log?X-Amz-Signature=abc&X-Amz-Expires=3600"
+    payload = {"artifact": {"logUrl": url, "presignedLogUrl": url, "recording": {"mono": {}}}, "server": {"url": "http://x.test/hook"}}
+    out = scrub(payload, {})
+    assert out["artifact"]["presignedLogUrl"] == "https://bucket.r2.cloudflarestorage.com/REDACTED", out
+    assert out["artifact"]["logUrl"] == "https://bucket.r2.cloudflarestorage.com/REDACTED"
+    assert out["server"]["url"] == "http://x.test/hook", "a bare url key must stay readable"
+    assert find_leaks(json.dumps(out), []) == []
+    assert "a storage or presigned URL" in find_leaks(json.dumps({"note": url}), [])
+
+
+def test_fake_replies_are_tagged_and_the_stream_outcome_is_logged():
+    from fastapi.testclient import TestClient
+
+    opening = [{"role": "system", "content": "s"}, {"role": "assistant", "content": "hi"}]
+    assert pick_reply({"messages": opening}, 3).startswith("Request 3. Thanks, that is helpful")
+    assert pick_reply({"messages": opening + [{"role": "assistant", "content": "x"}]}, 9) == "Request 9. " + SHORT_REPLY
+    assert pick_reply("not a dict", 1).startswith("Request 1. ")
+    with _Sandbox():
+        client = TestClient(build_app())
+        resp = client.post(LLM_MOUNT + "/chat/completions", json={"messages": opening})
+        assert "Request 1. " in "".join(json.loads(c[6:])["choices"][0]["delta"].get("content", "")
+                                         for c in resp.text.split("\n\n") if c.startswith("data: {"))
+        events = [json.loads(line) for line in (RAW / "events.jsonl").read_text().splitlines()]
+        done = [e for e in events if e["kind"] == "llm_stream"]
+        assert len(done) == 1 and done[0]["request_seq"] == 1 and done[0]["outcome"] == "completed", events
+        assert done[0]["words_sent"] > 20
+
+
+def test_fixtures_keep_every_llm_request_and_the_stream_outcomes():
+    with _Sandbox():
+        _seed_raw_capture()
+        with (RAW / "events.jsonl").open("a") as fh:
+            fh.write(json.dumps({"seq": 7, "t": 7.0, "kind": "llm", "path": f"{LLM_MOUNT}/chat/completions", "query": ""}) + "\n")
+            fh.write(json.dumps({"seq": 8, "t": 7.5, "kind": "llm_stream", "request_seq": 7, "outcome": "CancelledError", "words_sent": 3}) + "\n")
+        write_json(RAW / "llm_007.json", {"call": {"id": FAKE_CALL}, "messages": []})
+        write_json(RAW / "llm_007.meta.json", {"method": "POST", "path": f"{LLM_MOUNT}/chat/completions", "query": "", "headers": {}})
+        cmd_fixtures(argparse.Namespace())
+        assert (FIXTURES / "llm_request_n3.json").exists()
+        paths = json.loads((FIXTURES / "llm_request_paths.json").read_text())
+        assert [p["body_fixture"] for p in paths] == ["llm_request_turn1.json", "llm_request_after_interrupt.json", "llm_request_n3.json"]
+        assert paths[2]["stream_outcome"] == "CancelledError" and paths[2]["stream_words_sent"] == 3
+        assert paths[2]["stream_ended_at_s"] == 6.5 and paths[0]["stream_outcome"] is None
+
+
 def _seed_raw_capture() -> None:
     """A synthetic capture shaped like what serve + call would leave in RAW."""
     events = [
@@ -1291,6 +1428,11 @@ SELFTESTS = [
     test_call_survives_the_socket_closing_early_and_keeps_the_evidence,
     test_an_error_mid_run_still_writes_frames_summary_and_get_call,
     test_full_call_still_ends_on_end_call,
+    test_the_bare_model_url_and_any_appended_path_get_an_answer_and_are_recorded,
+    test_a_create_call_response_without_a_socket_url_is_saved_and_exits_cleanly,
+    test_scrub_hides_presigned_storage_urls_and_the_check_flags_them,
+    test_fake_replies_are_tagged_and_the_stream_outcome_is_logged,
+    test_fixtures_keep_every_llm_request_and_the_stream_outcomes,
     test_fixtures_publish_the_path_evidence_and_nothing_secret,
     test_fixtures_refuse_to_write_what_scrub_missed,
     test_the_sweep_catches_stale_dirty_files,
