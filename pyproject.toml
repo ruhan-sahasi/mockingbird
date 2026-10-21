@@ -16,6 +16,8 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    # The anthropic SDK sends through httpx2. The streamer tests fake its network layer with it.
+    "httpx2>=2",
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "respx>=0.21",
