@@ -5,9 +5,15 @@ keeps what it is given, up to a cap, so a call that runs long or a browser that 
 frames cannot grow memory without bound.
 """
 
+import logging
 import struct
 from collections.abc import Callable
 from typing import Literal
+
+from mockingbird.audio_store import AudioStore
+from mockingbird.store import Store
+
+log = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
 FRAME_BYTES = 640  # one 20 ms frame of 16 kHz s16le mono
@@ -92,3 +98,28 @@ class CallRecorder:
             }
             for name, track in (("candidate", self.candidate), ("interviewer", self.interviewer))
         }
+
+
+async def upload_recording(
+    store: Store, audio: AudioStore, interview_id: str, recorder: CallRecorder
+) -> None:
+    """Put both tracks in the audio store, then note on the interview that they are there.
+
+    Never raises: a call that cannot be recorded still has its report. On any failure the
+    interview's `recording` says `upload_failed` and the log gets the exception type only,
+    because a storage error can carry the project URL or the service key (ruling R19).
+    """
+    try:
+        base = f"interviews/{interview_id}"
+        # One track at a time, each WAV built once, so a 20-minute track (about 40 MB) is never
+        # held in more than one extra copy at once.
+        await audio.put_wav(f"{base}/candidate.wav", wav_bytes(recorder.candidate.pcm()))
+        await audio.put_wav(f"{base}/interviewer.wav", wav_bytes(recorder.interviewer.pcm()))
+        recording = {"status": "uploaded", **recorder.metadata()}
+    except Exception as exc:
+        log.error("could not upload the recording: %s", type(exc).__name__)
+        recording = {"status": "upload_failed"}
+    try:
+        await store.update_interview(interview_id, recording=recording)
+    except Exception as exc:
+        log.error("could not note the recording status: %s", type(exc).__name__)

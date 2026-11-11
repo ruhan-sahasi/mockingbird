@@ -59,7 +59,9 @@ def create_app(
             except Exception as exc:
                 # Interviews still run. Uploads fail visibly later, and the type is all we log.
                 log.error("audio store is not ready: %s", type(exc).__name__)
-            sweeper = asyncio.create_task(run_sweeper(state.registry, state.store, state.vapi))
+            sweeper = asyncio.create_task(
+                run_sweeper(state.registry, state.store, state.vapi, state.audio_store)
+            )
             state.sweeper = sweeper
             try:
                 yield

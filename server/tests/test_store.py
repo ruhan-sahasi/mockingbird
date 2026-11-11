@@ -327,6 +327,40 @@ async def test_a_turn_idx_cannot_be_used_twice(store):
     assert [t.text for t in await store.list_turns("i1")] == ["first"]
 
 
+async def test_the_recording_round_trips_and_is_a_copy(store):
+    await store.create_interview(make_interview())
+    assert (await store.get_interview("i1")).recording is None
+
+    recording = {"status": "uploaded", "candidate": {"frames": 5, "first_frame_ms": None}}
+    await store.update_interview("i1", recording=recording)
+    recording["status"] = "changed after the write"
+    got = await store.get_interview("i1")
+    assert got.recording == {
+        "status": "uploaded",
+        "candidate": {"frames": 5, "first_frame_ms": None},
+    }
+    got.recording["status"] = "changed after the read"
+    assert (await store.get_interview("i1")).recording["status"] == "uploaded"
+
+    await store.update_interview("i1", recording={"status": "upload_failed"})
+    assert (await store.get_interview("i1")).recording == {"status": "upload_failed"}
+
+
+async def test_demo_interviews_older_than_lists_old_demo_ids_and_the_purge_honours_keep(store):
+    await store.create_interview(make_interview(id="old-a", created_at=NOW - timedelta(days=8)))
+    await store.create_interview(make_interview(id="old-b", created_at=NOW - timedelta(days=8)))
+    await store.create_interview(
+        make_interview(id="old-full", mode="full", created_at=NOW - timedelta(days=8))
+    )
+    await store.create_interview(make_interview(id="new", created_at=NOW - timedelta(days=6)))
+
+    assert sorted(await store.demo_interviews_older_than(7)) == ["old-a", "old-b"]
+
+    assert await store.delete_demo_data_older_than(7, keep=["old-b"]) == 1
+    assert await store.get_interview("old-a") is None
+    assert await store.get_interview("old-b") is not None
+
+
 # --- reports -----------------------------------------------------------------------------------
 
 

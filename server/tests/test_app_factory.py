@@ -79,7 +79,7 @@ def idle_sweeper(monkeypatch):
     tests see what the app built without a sweep running against it."""
     seen: list = []
 
-    async def run_sweeper(registry, store, vapi) -> None:
+    async def run_sweeper(registry, store, vapi, audio) -> None:
         seen.append((store, vapi))
         await asyncio.Event().wait()
 

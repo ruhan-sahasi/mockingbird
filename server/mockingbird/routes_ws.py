@@ -37,6 +37,7 @@ from fastapi import APIRouter, WebSocket
 
 from mockingbird.failures import describe
 from mockingbird.models import Turn
+from mockingbird.recording import CallRecorder, upload_recording
 from mockingbird.relay import LiveEvent, OnEvent, Relay, StarletteSocket, WebsocketsSocket
 from mockingbird.report import build_report
 from mockingbird.sessions import LiveSession
@@ -115,15 +116,19 @@ async def _run_call(websocket: WebSocket, session: LiveSession) -> None:
         connection = await websockets.connect(
             call.websocket_url, close_timeout=VAPI_CLOSE_TIMEOUT_S
         )
+        recorder = CallRecorder(time.monotonic, interview.cap_s)
+        session.recorder = recorder
         session.relay = Relay(
             StarletteSocket(websocket),
             WebsocketsSocket(connection),
             cap_s=interview.cap_s,
             on_event=_live_events(session),
             on_end=ending.record,
+            on_audio=recorder.on_audio,
         )
         await state.store.update_interview(interview.id, status="live")
         ending.live_since = time.monotonic()
+        recorder.start()
         reason = await session.relay.run()
     except Exception as exc:
         # Mostly the type: a library's message can hold the socket URL, which holds the call id.
@@ -175,6 +180,10 @@ async def _clean_up(
     await _attempt("mark the interview ended", ending.record(reason))
     await _attempt("save the turns", _save_turns(store, interview_id, session.brain.turns))
     state.registry.remove(interview_id)
+    if session.recorder is not None:
+        _in_background(
+            state, upload_recording(store, state.audio_store, interview_id, session.recorder)
+        )
     _in_background(state, build_report(store, state.grader, interview_id))
 
 

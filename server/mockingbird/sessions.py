@@ -26,9 +26,10 @@ session's repr, and nothing here logs either of them.
   seconds can pass the stale line. That call's route marks it ended again when it does end,
   with the real reason and duration, so the stale mark only stands for a call nobody ends.
 `run_sweeper` also deletes demo data older than RETENTION_DAYS, once an hour (`purge_once`). That
-covers Vapi's copy of each call too, the transcript, messages, logs and analysis it keeps: each
-old demo's call is deleted at Vapi first, while its row still holds the call id, and a row whose
-call Vapi would not delete is kept, call id and all, for the next purge to try again.
+covers Vapi's copy of each call too, the transcript, messages, logs and analysis it keeps, and the
+recording in storage: each old demo's recording and its call at Vapi are deleted first, while its
+row still holds the call id, and a row whose recording or call would not delete is kept, call id
+and all, for the next purge to try again.
 """
 
 import asyncio
@@ -40,9 +41,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol
 
+from mockingbird.audio_store import AudioStore
 from mockingbird.brain import Brain
 from mockingbird.failures import describe
 from mockingbird.models import Interview
+from mockingbird.recording import CallRecorder
 from mockingbird.relay import Relay
 from mockingbird.store import Store
 
@@ -72,6 +75,7 @@ class LiveSession:
     token: str = field(repr=False)  # "" once it has been used
     token_expires_at: float  # by the registry's clock
     relay: Relay | None = None
+    recorder: CallRecorder | None = None  # both tracks of the call, once it is live
     call_id: str | None = field(default=None, repr=False)
     reply_task: asyncio.Task | None = None  # the brain reply now streaming to Vapi, if any
 
@@ -167,6 +171,7 @@ async def run_sweeper(
     registry: SessionRegistry,
     store: Store,
     vapi: CallDeleter,
+    audio: AudioStore,
     *,
     clock: Callable[[], float] = time.time,
     every_s: float = SWEEP_EVERY_S,
@@ -182,13 +187,23 @@ async def run_sweeper(
         await _attempt("sweep the sessions", sweep_once(registry, store, now))
         if last_purge is None or now - last_purge >= purge_every_s:
             last_purge = now
-            await _attempt("delete old demo data", purge_once(store, vapi))
+            await _attempt("delete old demo data", purge_once(store, vapi, audio))
         await sleep(every_s)
 
 
-async def purge_once(store: Store, vapi: CallDeleter) -> None:
-    """Delete the demo data older than RETENTION_DAYS: each call's copy at Vapi first, then our
-    rows. A row whose call Vapi would not delete is kept for the next purge."""
+async def purge_once(store: Store, vapi: CallDeleter, audio: AudioStore) -> None:
+    """Delete the demo data older than RETENTION_DAYS: each interview's recording first, then
+    its call's copy at Vapi, then our rows. A row whose recording or call could not be deleted
+    is kept for the next purge, so nothing is left without the row that names it."""
+    keep = []
+    for interview_id in await store.demo_interviews_older_than(RETENTION_DAYS):
+        try:
+            await audio.delete_prefix(f"interviews/{interview_id}/")
+        except Exception as exc:
+            # The type only: a storage error can carry the project URL or the key (ruling R19).
+            msg = "could not delete an old recording, kept for the next purge: %s"
+            log.warning(msg, type(exc).__name__)
+            keep.append(interview_id)
     deleted_at_vapi = []
     for call_id in await store.demo_calls_older_than(RETENTION_DAYS):
         try:
@@ -199,7 +214,9 @@ async def purge_once(store: Store, vapi: CallDeleter) -> None:
             log.warning(msg, describe(exc))
         else:
             deleted_at_vapi.append(call_id)
-    deleted = await store.delete_demo_data_older_than(RETENTION_DAYS, vapi_deleted=deleted_at_vapi)
+    deleted = await store.delete_demo_data_older_than(
+        RETENTION_DAYS, vapi_deleted=deleted_at_vapi, keep=keep
+    )
     if deleted:
         log.info("deleted %d demo interview(s) older than %d days", deleted, RETENTION_DAYS)
 

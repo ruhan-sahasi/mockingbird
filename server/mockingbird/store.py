@@ -42,7 +42,7 @@ _COUNTED_TODAY = ("created", *_FINISHED)
 _UPDATABLE = frozenset(f.name for f in fields(Interview)) - {"id"}
 _INTERVIEW_COLUMNS = (
     "id, mode, status, visitor_hash, ip_hash, cap_s, questions, created_at,"
-    " vapi_call_id, ended_reason, duration_s"
+    " vapi_call_id, ended_reason, duration_s, recording"
 )
 
 
@@ -135,11 +135,17 @@ class Store(Protocol):
         one. Vapi keeps its own copy of each call, which has to be deleted too."""
         ...
 
+    async def demo_interviews_older_than(self, days: int) -> list[str]:
+        """The ids of the demo interviews created more than `days` days ago. Their recordings
+        are in storage under their ids, and are deleted before the rows."""
+        ...
+
     async def delete_demo_data_older_than(
-        self, days: int, *, vapi_deleted: Collection[str] = ()
+        self, days: int, *, vapi_deleted: Collection[str] = (), keep: Collection[str] = ()
     ) -> int:
         """Delete demo interviews created more than `days` days ago, with their turns, scores
-        and quotes. Full-mode interviews are kept. Returns how many interviews it deleted.
+        and quotes. Full-mode interviews are kept, and so are the interview ids in `keep` (the
+        ones whose recording could not be deleted). Returns how many interviews it deleted.
 
         A demo that holds a Vapi call id is deleted only when that id is in `vapi_deleted`, the
         calls whose copy at Vapi is gone. The id is the only way to delete that copy, so the row
@@ -226,6 +232,9 @@ class MemoryStore:
             raise KeyError(id)
         _check_values(changes)
         for name, value in changes.items():
+            if name == "recording":
+                # Through JSON, like the jsonb column: a copy, and only what JSON can hold.
+                value = None if value is None else json.loads(json.dumps(value))
             setattr(self._interviews[id], name, copy.deepcopy(value))
 
     async def add_turn(self, interview_id: str, t: Turn) -> None:
@@ -305,16 +314,24 @@ class MemoryStore:
             if i.mode == "demo" and i.created_at < cutoff and i.vapi_call_id is not None
         ]
 
+    async def demo_interviews_older_than(self, days: int) -> list[str]:
+        cutoff = self._clock() - timedelta(days=days)
+        return [
+            i.id for i in self._interviews.values() if i.mode == "demo" and i.created_at < cutoff
+        ]
+
     async def delete_demo_data_older_than(
-        self, days: int, *, vapi_deleted: Collection[str] = ()
+        self, days: int, *, vapi_deleted: Collection[str] = (), keep: Collection[str] = ()
     ) -> int:
         cutoff = self._clock() - timedelta(days=days)
         gone = set(vapi_deleted)
+        kept = set(keep)
         old = [
             i.id
             for i in self._interviews.values()
             if i.mode == "demo"
             and i.created_at < cutoff
+            and i.id not in kept
             and (i.vapi_call_id is None or i.vapi_call_id in gone)
         ]
         for id in old:
@@ -356,7 +373,7 @@ class PostgresStore:
         try:
             await self._pool.execute(
                 f"insert into interviews ({_INTERVIEW_COLUMNS})"
-                " values ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11)",
+                " values ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12::jsonb)",
                 i.id,
                 i.mode,
                 i.status,
@@ -368,6 +385,7 @@ class PostgresStore:
                 i.vapi_call_id,
                 i.ended_reason,
                 i.duration_s,
+                None if i.recording is None else json.dumps(i.recording),
             )
         except asyncpg.UniqueViolationError:
             raise ValueError(f"interview {i.id} already exists") from None
@@ -400,9 +418,9 @@ class PostgresStore:
         values = []
         for n, (name, value) in enumerate(changes.items(), start=2):
             # `name` was checked against the Interview fields above, so it is safe in the SQL.
-            if name == "questions":
+            if name in ("questions", "recording"):
                 assignments.append(f"{name} = ${n}::jsonb")
-                values.append(json.dumps(value))
+                values.append(None if value is None else json.dumps(value))
             else:
                 assignments.append(f"{name} = ${n}")
                 values.append(value)
@@ -547,22 +565,38 @@ class PostgresStore:
         )
         return [row["vapi_call_id"] for row in rows]
 
+    async def demo_interviews_older_than(self, days: int) -> list[str]:
+        cutoff = self._clock() - timedelta(days=days)
+        rows = await self._pool.fetch(
+            "select id from interviews where mode = 'demo' and created_at < $1", cutoff
+        )
+        return [row["id"] for row in rows]
+
     async def delete_demo_data_older_than(
-        self, days: int, *, vapi_deleted: Collection[str] = ()
+        self, days: int, *, vapi_deleted: Collection[str] = (), keep: Collection[str] = ()
     ) -> int:
         cutoff = self._clock() - timedelta(days=days)
         # The turns, scores and quotes go with their interview (on delete cascade).
         return await self._pool.fetchval(
             "with gone as (delete from interviews where mode = 'demo' and created_at < $1"
             "   and (vapi_call_id is null or vapi_call_id = any($2::text[]))"
+            "   and id <> all($3::text[])"
             " returning 1) select count(*) from gone",
             cutoff,
             list(vapi_deleted),
+            list(keep),
         )
 
 
 def _interview(row: asyncpg.Record) -> Interview:
-    return Interview(**{**row, "questions": json.loads(row["questions"])})
+    recording = row["recording"]
+    return Interview(
+        **{
+            **row,
+            "questions": json.loads(row["questions"]),
+            "recording": None if recording is None else json.loads(recording),
+        }
+    )
 
 
 def _score_rows(report: dict) -> list[tuple]:
