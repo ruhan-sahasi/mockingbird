@@ -133,7 +133,7 @@ cleanup() {
   [[ -n "${all// /}" ]] || return 0
   # TERM first: it lets the API hang up a call that is still running, so Vapi stops billing.
   kill $all 2>/dev/null || true
-  for waited in $(seq 1 50); do # up to 10 s
+  for _ in $(seq 1 50); do # up to 10 s
     alive=0
     for pid in $all; do
       ! kill -0 "$pid" 2>/dev/null || alive=1
