@@ -126,7 +126,7 @@ descendants() { # every child, grandchild and so on of a pid (npm and uv start t
 
 cleanup() {
   trap - EXIT INT TERM
-  local all="" pid waited alive
+  local all="" pid alive
   for pid in ${pids[@]+"${pids[@]}"}; do
     all="$all $(descendants "$pid") $pid"
   done
