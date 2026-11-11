@@ -404,6 +404,10 @@ v1.
 | Budget | Nothing out of pocket; credits plus free tiers | Paid monthly budget |
 | Which reply counts (after measuring Vapi) | Only the reply Vapi starts speaking: drafts on a copy of the plan, committed on speech start | Group requests by the candidate's words; make Vapi wait longer before replying |
 | Live event source (after measuring Vapi) | Text frames on the audio WebSocket; webhooks only for the end-of-call report | Webhooks as first planned; both |
+| Stop-of-speech detection (phase 2) | Energy threshold in the browser capture worklet | Small neural VAD in the browser; Vapi's own speech event |
+| Latency trace storage (phase 2) | Postgres table plus a stats page | OpenTelemetry to a hosted tracer; structured logs on CloudWatch |
+| Recording format (phase 2) | WAV, 16 kHz PCM, in Supabase Storage | Opus |
+| Browser ducking on interruption (phase 2) | Measure the flush delay first; add ducking only if p95 is above about 300 ms | Build it now; skip it |
 
 ## My calls (flagged for Ruhan to check)
 
