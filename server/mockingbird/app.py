@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from mockingbird import routes_api, routes_vapi, routes_ws
 from mockingbird.claude import AnthropicStreamer, make_anthropic_client
 from mockingbird.config import Settings, get_settings
+from mockingbird.log_redaction import install_log_redaction
 from mockingbird.report import Grader, load_rubric
 from mockingbird.sessions import SessionRegistry, run_sweeper
 from mockingbird.store import MemoryStore, PostgresStore, Store, create_pool
@@ -43,6 +44,7 @@ def create_app(
     is not passed is built from `settings` when the app starts: PostgresStore when DATABASE_URL
     is set (MemoryStore when it is not), the Vapi client, the live Claude streamer and the
     grader. Starting also starts the sweeper (sessions.py); stopping closes what was built."""
+    install_log_redaction()  # uvicorn logs the socket's one-time token in the accept line
 
     @asynccontextmanager
     async def lifespan(api: FastAPI) -> AsyncIterator[None]:
