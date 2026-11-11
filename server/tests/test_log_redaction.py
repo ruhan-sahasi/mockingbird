@@ -9,10 +9,10 @@ import pytest
 import uvicorn
 import websockets
 
+import tests.conftest as helpers
 from mockingbird.app import create_app
 from mockingbird.log_redaction import LOGGERS, RedactQueryStrings, install_log_redaction
 from mockingbird.store import MemoryStore
-from tests.conftest import test_settings
 
 ACCEPT = '%s - "WebSocket %s" [accepted]'
 
@@ -54,6 +54,8 @@ def test_filter_redacts_a_message_with_no_args():
         ("%(a)s", ({"a": "b"},)),
         ("%d and %s", (3, "x")),
         ("%s", (None,)),
+        ("why? really?", None),
+        ("%s", ("is it?",)),
     ],
 )
 def test_filter_leaves_other_records_alone(msg, args):
@@ -85,14 +87,20 @@ async def test_a_real_uvicorn_accept_never_logs_the_token(clean_loggers, caplog)
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
-    app = create_app(test_settings(), store=MemoryStore())  # installs the redaction
+    app = create_app(helpers.test_settings(), store=MemoryStore())  # installs the redaction
     # log_config=None keeps uvicorn from replacing its loggers' handlers, so caplog sees them.
-    server = uvicorn.Server(uvicorn.Config(app, log_config=None, log_level="info", ws="websockets"))
+    server = uvicorn.Server(
+        uvicorn.Config(app, log_config=None, log_level="info", ws="websockets-sansio")
+    )
     serving = asyncio.create_task(server.serve(sockets=[sock]))
     try:
         with caplog.at_level(logging.INFO):
-            while not server.started:
-                await asyncio.sleep(0.01)
+            async with asyncio.timeout(5):
+                while not server.started:
+                    if serving.done():
+                        serving.result()  # re-raises why serve() died
+                        raise AssertionError("uvicorn stopped before it started")
+                    await asyncio.sleep(0.01)
             url = f"ws://127.0.0.1:{port}/ws/interview/abc?token=SECRET"
             async with websockets.connect(url) as ws:
                 with pytest.raises(websockets.ConnectionClosed):

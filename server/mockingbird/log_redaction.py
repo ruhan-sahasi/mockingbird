@@ -9,7 +9,7 @@ import logging
 import re
 
 LOGGERS = ("uvicorn.error", "uvicorn.access", "uvicorn")
-_QUERY = re.compile(r"\?[^\s\"']*")
+_QUERY = re.compile(r"\?[^\s\"']+")
 REDACTED = "?[redacted]"
 
 
