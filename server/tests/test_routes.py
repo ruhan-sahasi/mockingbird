@@ -1464,6 +1464,31 @@ async def test_purge_deletes_recordings_before_rows():
     assert await store.get_interview("old-full") is not None
 
 
+async def test_an_interview_that_turns_old_mid_purge_keeps_its_row_until_its_audio_is_deleted():
+    # Every store call reads the clock, and the clock moves an hour per read. This interview is
+    # not 7 days old when the purge lists the recordings to delete, but is by the time the rows
+    # go. Its folder was never deleted, so its row must stay: it is the only thing that names it.
+    base = datetime.now(UTC)
+    reads = iter(range(1, 100))
+    store = MemoryStore(clock=lambda: base + timedelta(hours=next(reads)))
+    crossing = old_demo("crossing", "call-crossing")
+    crossing.created_at = base - timedelta(days=7) + timedelta(minutes=150)
+    await store.create_interview(crossing)
+    audio = FakeAudioStore()
+    vapi = FakeVapi()
+
+    await purge_once(store, vapi, audio)
+
+    assert audio.deleted == []
+    assert await store.get_interview("crossing") is not None
+
+    await purge_once(store, vapi, audio)  # an hour later: now it is listed first
+
+    assert audio.deleted == ["interviews/crossing/"]
+    assert "call-crossing" in vapi.deleted
+    assert await store.get_interview("crossing") is None
+
+
 async def test_purge_keeps_rows_when_storage_delete_fails(caplog):
     caplog.set_level(logging.DEBUG)
     store = MemoryStore()
