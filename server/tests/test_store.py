@@ -978,9 +978,19 @@ async def test_the_real_migration_creates_the_four_tables(pg_pool):
         )
     }
     assert tables == {"schema_migrations", "interviews", "turns", "scores", "quotes"}
-    assert "001_init.sql" in [p.name for p in MIGRATIONS_DIR.glob("*.sql")]
+    shipped = sorted(p.name for p in MIGRATIONS_DIR.glob("*.sql"))
+    assert "001_init.sql" in shipped
     async with pg_pool.acquire() as conn:
-        assert await applied_names(conn) == ["001_init.sql"]
+        # Every shipped migration, so a new one does not break this test.
+        assert await applied_names(conn) == shipped
+    columns = {
+        r[0]
+        for r in await pg_pool.fetch(
+            "select column_name from information_schema.columns"
+            " where table_schema = current_schema() and table_name = 'interviews'"
+        )
+    }
+    assert "recording" in columns
 
 
 @needs_postgres
