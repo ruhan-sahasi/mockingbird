@@ -85,6 +85,7 @@ async def test_supabase_put_wav_posts_the_object_with_upsert(http):
     await supabase(http).put_wav("interviews/a/candidate.wav", b"wavbytes")
     req = route.calls.last.request
     assert req.headers["Authorization"] == f"Bearer {KEY}"
+    assert req.headers["apikey"] == KEY
     assert req.headers["Content-Type"] == "audio/wav"
     assert req.headers["x-upsert"] == "true"
     assert req.content == b"wavbytes"
@@ -103,7 +104,9 @@ async def test_supabase_delete_prefix_lists_then_deletes_with_one_slash(http):
     }
     sent = json.loads(delete.calls.last.request.content)
     assert sent == {"prefixes": ["interviews/a/candidate.wav", "interviews/a/interviewer.wav"]}
-    assert delete.calls.last.request.headers["Authorization"] == f"Bearer {KEY}"
+    for call in (listing.calls.last, delete.calls.last):
+        assert call.request.headers["Authorization"] == f"Bearer {KEY}"
+        assert call.request.headers["apikey"] == KEY
 
 
 @respx.mock
@@ -129,12 +132,43 @@ async def test_supabase_ensure_ready_creates_a_private_bucket(http):
     req = route.calls.last.request
     assert json.loads(req.content) == {"id": BUCKET, "name": BUCKET, "public": False}
     assert req.headers["Authorization"] == f"Bearer {KEY}"
+    assert req.headers["apikey"] == KEY
 
 
 @respx.mock
-async def test_supabase_ensure_ready_treats_409_as_already_there(http):
+async def test_supabase_ensure_ready_treats_a_bare_409_as_already_there(http):
     respx.post(f"{URL}/storage/v1/bucket").respond(409, json={"error": "Duplicate"})
     await supabase(http).ensure_ready()
+
+
+@respx.mock
+@pytest.mark.parametrize("code", ["409", 409])
+async def test_supabase_ensure_ready_treats_400_with_a_409_body_as_already_there(http, code):
+    # What Supabase Storage really sends: HTTP 400, the real code in the JSON body.
+    respx.post(f"{URL}/storage/v1/bucket").respond(
+        400,
+        json={"statusCode": code, "error": "Duplicate", "message": "The resource already exists"},
+    )
+    await supabase(http).ensure_ready()
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "body",
+    [{"statusCode": "403", "error": "Unauthorized"}, {"error": "x"}, ["409"]],
+)
+async def test_supabase_ensure_ready_raises_on_a_400_with_another_body(http, body):
+    respx.post(f"{URL}/storage/v1/bucket").respond(400, json=body)
+    with pytest.raises(AudioStoreError) as err:
+        await supabase(http).ensure_ready()
+    assert err.value.status == 400
+
+
+@respx.mock
+async def test_supabase_ensure_ready_raises_on_a_400_that_is_not_json(http):
+    respx.post(f"{URL}/storage/v1/bucket").respond(400, text="nope")
+    with pytest.raises(AudioStoreError):
+        await supabase(http).ensure_ready()
 
 
 @respx.mock

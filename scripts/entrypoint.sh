@@ -12,7 +12,7 @@ fail() {
   exit 1
 }
 
-for name in ANTHROPIC_API_KEY VAPI_API_KEY DATABASE_URL BRAIN_SECRET WEBHOOK_SECRET OWNER_KEY VISITOR_SALT; do
+for name in ANTHROPIC_API_KEY VAPI_API_KEY DATABASE_URL BRAIN_SECRET WEBHOOK_SECRET OWNER_KEY VISITOR_SALT SUPABASE_SERVICE_KEY; do
   value=$(printenv "$name" || true)
   if [ "$value" = "unset" ]; then
     fail "$name is still Terraform's placeholder \"unset\". Set it with aws ssm put-parameter --overwrite, then redeploy."

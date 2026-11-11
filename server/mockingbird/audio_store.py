@@ -1,10 +1,11 @@
 """Where interview recordings are kept: a private Supabase Storage bucket, or a local folder.
 
 Both stores take paths like `interviews/{interview_id}/candidate.wav`. The Supabase service key
-is a secret: it is sent only in the Authorization header and never reaches an error, a log or a
-repr (ruling R19)."""
+is a secret: it is sent only in the apikey and Authorization headers and never reaches an
+error, a log or a repr (ruling R19)."""
 
 import asyncio
+import json
 import shutil
 from pathlib import Path
 from typing import Protocol
@@ -88,7 +89,13 @@ class SupabaseAudioStore:
     async def _send(
         self, method: str, path: str, *, ok: tuple[int, ...] = (), **kwargs
     ) -> httpx.Response:
-        headers = {"Authorization": f"Bearer {self._key}", **kwargs.pop("headers", {})}
+        # Secret keys (sb_secret_...) are not JWTs, and the gateway reads the apikey header, so
+        # send both, as supabase-js does.
+        headers = {
+            "apikey": self._key,
+            "Authorization": f"Bearer {self._key}",
+            **kwargs.pop("headers", {}),
+        }
         response = await self._http.request(
             method, f"{self._url}/storage/v1/{path}", headers=headers, **kwargs
         )
@@ -117,10 +124,23 @@ class SupabaseAudioStore:
         await self._send("DELETE", f"object/{self._bucket}", json={"prefixes": names})
 
     async def ensure_ready(self) -> None:
-        """Create the private bucket. It already existing (409) is fine."""
-        await self._send(
+        """Create the private bucket. It already existing is fine.
+
+        Supabase Storage reports "already exists" as a bare 409 or, more often, as HTTP 400 with
+        the real code in the JSON body: {"statusCode": "409", ...}. Any other failure raises."""
+        response = await self._send(
             "POST",
             "bucket",
-            ok=(409,),
+            ok=(400, 409),
             json={"id": self._bucket, "name": self._bucket, "public": False},
         )
+        if response.status_code == 400 and not _body_says_409(response):
+            raise AudioStoreError(400)
+
+
+def _body_says_409(response: httpx.Response) -> bool:
+    try:
+        body = response.json()
+    except (ValueError, json.JSONDecodeError):
+        return False
+    return isinstance(body, dict) and str(body.get("statusCode")) == "409"
