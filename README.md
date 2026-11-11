@@ -8,6 +8,11 @@ It runs a behavioral interview out loud in your browser, you can cut it off mid-
 you would a person, and when the call ends you get a graded report where every score points to
 words you actually said.
 
+What makes it interesting: Vapi sends several brain requests per answer and speaks only the
+reply to the last one, so the brain commits only the draft Vapi actually speaks, and every quote
+in the report is checked against the transcript before it is shown. More in
+[The interesting engineering](#the-interesting-engineering).
+
 It runs locally today. The AWS deployment is defined in Terraform (`infra/`) but has not been
 applied, so there is no public link yet.
 
@@ -29,9 +34,9 @@ flowchart LR
     relay <-->|"WebSocket: audio,<br/>live events as text frames"| vapi
     vapi <-->|"POST /chat/completions,<br/>several per answer"| brain
     brain <-->|"streamed line for each reply"| haiku
-    brain -.->|"after the call: the turns"| report
+    brain -.->|"after the call, a background task<br/>grades the stored turns"| report
     report <-->|"structured grade"| opus
-    report -.->|"report page"| browser
+    browser -.->|"polls GET /api/interviews/{id}/report"| report
 ```
 
 - **Browser.** An AudioWorklet resamples the mic to 16 kHz, 16-bit mono and sends one 640-byte
@@ -86,15 +91,17 @@ flowchart LR
   candidate for every score. `verify_quotes` lowercases the quote and the answer, removes all
   punctuation (curly quotes and dashes included) and collapses whitespace. It then keeps the
   quote only if what is left appears, as one unbroken run of text, in what the candidate said
-  under that same main question, follow-up answers included. A quote with no words in it never
+  under that same main question, follow-up answers included. It is a character match, not a
+  whole-word match, so a quote can start or end inside a word. A quote with no words in it never
   counts. Dropped quotes stay in the saved report as `dropped_quotes`, and an item with no quote
   left shows "not enough evidence" instead of a score (`report.py`, `test_report.py`).
 - **Cost and abuse guards.** Each visitor gets one demo per UTC day, counted by an anonymous
   cookie and by IP address, both stored only as salted SHA-256 hashes, with at most three start
   attempts a day. All demos share a daily budget (`DAILY_DEMO_MINUTES`, 60 by default), and a
   start must come from a page on the site itself. The relay ends every call at its cap, with
-  the Vapi limit 30 s later as a backstop, and ends it as soon as the browser sends no audio
-  frame for 2 s, so a closed tab or a dropped network stops the bill in about 2 s. Demo
+  the Vapi limit 30 s later as a backstop. It also ends the call when there is no frame from
+  the browser for 2 s, or a send to the browser stalled for 2 s, so a closed tab or a dropped
+  network stops the bill in about 2 s. Demo
   interviews are deleted after 7 days, along with the copy Vapi keeps of each call, and Vapi
   recording and end-of-call analysis are turned off (`limits.py`, `relay.py`, `sessions.py`,
   `vapi_client.py`).
@@ -165,10 +172,12 @@ it for both), talks over the reply to the first answer, hangs up, and waits up t
 report. It prints ok or FAIL for each step and exits 0 only if they all pass. It makes a real
 call, so it costs money.
 
-**Last live run.** On 2026-10-21 the smoke call passed against real Vapi and Claude. The opening
-line was heard, the reply to the first answer started about 2.1 s after the answer ended (a
-rough reading), a flush arrived after the interruption, the call ended cleanly, and the report
-came back graded with 6 scored items and 13 verified quotes.
+**Last live run.** These numbers come from the scripted smoke call run on 2026-10-21 against
+real Vapi and Claude, and the description of
+[PR #18](https://github.com/ruhan-sahasi/mockingbird/pull/18) records its output. It passed:
+the opening line was heard, the reply to the first answer started about 2.1 s after the answer
+ended (a rough reading), a flush arrived after the interruption, the call ended cleanly, and the
+report came back graded with 6 scored items and 13 verified quotes.
 
 **Latency.** The design sets a goal of a median under 800 ms from the moment the candidate stops
 talking to the moment the interviewer audio starts, measured in the browser. That goal has not
@@ -202,8 +211,8 @@ terraform -chdir=infra validate
 ```
 
 Counts from a run on this branch on 2026-11-11: `uv run pytest -q` printed
-`623 passed, 58 skipped`, and `npm test` printed `220 passed (220)` across 16 test files. The 58 skipped
-tests are the PostgresStore tests in `server/tests/test_store.py`, which run only when
+`623 passed, 58 skipped`, and `npm test` printed `220 passed (220)` across 16 test files. The
+58 skipped tests are the PostgresStore tests in `server/tests/test_store.py`, which run only when
 `TEST_DATABASE_URL` points at a Postgres database (a direct connection, for example
 `postgresql://postgres:postgres@localhost:5432/postgres`).
 
@@ -232,6 +241,9 @@ traffic only from CloudFront and sends it to one Fargate task (ARM64). The image
 the secrets are SSM SecureString parameters, and an AWS Budgets alert sends an email at 80% of
 a monthly limit. There is no NAT gateway and no custom domain. It runs exactly one task,
 because live interviews are held in the memory of that task.
+
+Deploying needs Terraform, Docker with buildx, npm, and the AWS CLI signed in to the account
+that will hold the stack.
 
 ```bash
 cp infra/terraform.tfvars.example infra/terraform.tfvars   # then set alert_email
