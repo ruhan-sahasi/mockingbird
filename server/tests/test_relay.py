@@ -656,6 +656,61 @@ async def test_on_event_error_is_logged_and_relaying_continues(caplog):
     assert "SpeechUpdate" in errors[0].getMessage()
 
 
+async def test_on_audio_taps_both_directions_in_order():
+    tapped: list = []
+    browser = vapi = None
+
+    def on_audio(direction: str, frame: bytes) -> None:
+        # Runs before the frame is sent on: the far socket has not seen it yet.
+        far = vapi if direction == "candidate" else browser
+        tapped.append((direction, frame, far.frames()))
+
+    relay, browser, vapi = make_relay(on_audio=on_audio)
+    task = await start(relay)
+
+    browser.incoming.put_nowait(MIC_1)
+    vapi.incoming.put_nowait(VOICE_1)
+    browser.incoming.put_nowait(MIC_2)
+    vapi.incoming.put_nowait(VOICE_2)
+    assert [await vapi.next_sent() for _ in range(2)] == [MIC_1, MIC_2]
+    assert [await browser.next_sent() for _ in range(2)] == [VOICE_1, VOICE_2]
+    await relay.end("plan_done")
+    await finished(task)
+
+    assert [(d, f) for d, f, _ in tapped if d == "candidate"] == [
+        ("candidate", MIC_1),
+        ("candidate", MIC_2),
+    ]
+    assert [(d, f) for d, f, _ in tapped if d == "interviewer"] == [
+        ("interviewer", VOICE_1),
+        ("interviewer", VOICE_2),
+    ]
+    assert [seen for d, f, seen in tapped if f == MIC_1] == [[]]
+    assert [seen for d, f, seen in tapped if f == VOICE_1] == [[]]
+
+
+async def test_on_audio_exception_does_not_stop_relaying(caplog):
+    caplog.set_level(logging.DEBUG, logger="mockingbird.relay")
+
+    def on_audio(direction: str, frame: bytes) -> None:
+        raise RuntimeError(f"recorder bug {CALL_ID}")
+
+    relay, browser, vapi = make_relay(on_audio=on_audio)
+    task = await start(relay)
+
+    browser.incoming.put_nowait(MIC_1)
+    vapi.incoming.put_nowait(VOICE_1)
+    browser.incoming.put_nowait(MIC_2)
+    assert [await vapi.next_sent() for _ in range(2)] == [MIC_1, MIC_2]
+    assert await browser.next_sent() == VOICE_1
+    await relay.end("plan_done")
+    assert await finished(task) == "plan_done"
+
+    logged = [r.getMessage() + (r.exc_text or "") for r in caplog.records]
+    assert any("RuntimeError" in line for line in logged)
+    assert not [line for line in logged if CALL_ID in line or "recorder bug" in line]
+
+
 async def test_logs_never_hold_frame_contents(caplog):
     # Ruling R19: the call id is a credential. Socket frames do not carry it today, but the relay
     # logs only a frame's type, so it could not leak one that did.
