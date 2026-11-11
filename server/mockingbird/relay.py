@@ -77,6 +77,9 @@ LiveEvent = SpeechUpdate | UserInterrupted | StatusUpdate
 OnEvent = Callable[[LiveEvent], Awaitable[None]]
 # What the route's `on_end` is given: the reason the call ended, as the browser is about to hear.
 OnEnd = Callable[[str], Awaitable[None]]
+# What the route's `on_audio` is given: "candidate" or "interviewer", and one audio frame. It is
+# synchronous and must not block.
+OnAudio = Callable[[str, bytes], None]
 
 
 class SocketClosed(Exception):
@@ -181,7 +184,8 @@ class Relay:
     """Relays one call's audio between the browser and Vapi until the call ends.
 
     `cap_s` is the call's time cap, `on_event` hears Vapi's live events, `on_end` hears why the
-    call ended just before the browser does, and the browser gets a ping every `ping_every_s`.
+    call ended just before the browser does, `on_audio(direction, frame)` is given every audio
+    frame just before it goes on, and the browser gets a ping every `ping_every_s`.
     The browser counts as gone once `browser_timeout_s` passes with no frame from it, or with
     a send to it not done. Its mic frames come every 20 ms, so the 2 s
     default is 100 missing frames: enough to ride out a busy page or a few TCP retransmits, while
@@ -197,6 +201,7 @@ class Relay:
         cap_s: float,
         on_event: OnEvent | None = None,
         on_end: OnEnd | None = None,
+        on_audio: OnAudio | None = None,
         ping_every_s: float = 20.0,
         browser_timeout_s: float = 2.0,
         hang_up_timeout_s: float = 1.0,
@@ -206,6 +211,7 @@ class Relay:
         self._cap_s = cap_s
         self._on_event = on_event
         self._on_end = on_end
+        self._on_audio = on_audio
         self._ping_every_s = ping_every_s
         self._browser_timeout_s = browser_timeout_s
         self._hang_up_timeout_s = hang_up_timeout_s
@@ -299,6 +305,7 @@ class Relay:
     async def _browser_to_vapi(self) -> None:
         while (frame := await self._next_browser_frame()) is not None:
             if isinstance(frame, bytes):
+                self._tap("candidate", frame)
                 try:
                     await self._vapi.send_bytes(frame)
                 except SocketClosed:
@@ -324,6 +331,7 @@ class Relay:
     async def _vapi_to_browser(self) -> None:
         while (frame := await self._vapi.recv()) is not None:
             if isinstance(frame, bytes):
+                self._tap("interviewer", frame)
                 if not await self._send_browser(frame):
                     return
             elif not await self._on_vapi_text(frame):
@@ -368,6 +376,23 @@ class Relay:
             log.error(
                 "on_event failed for a %s event: %s at %s:%s; relaying goes on",
                 type(event).__name__,
+                type(exc).__name__,
+                where.filename,
+                where.lineno,
+            )
+
+    def _tap(self, direction: str, frame: bytes) -> None:
+        """Give one audio frame to `on_audio`, just before it goes on. A failing callback must not
+        cut the interview off, so it is logged by type and where, never by message (ruling R19)."""
+        if self._on_audio is None:
+            return
+        try:
+            self._on_audio(direction, frame)
+        except Exception as exc:
+            where = traceback.extract_tb(exc.__traceback__)[-1]
+            log.error(
+                "on_audio failed for a %s frame: %s at %s:%s; relaying goes on",
+                direction,
                 type(exc).__name__,
                 where.filename,
                 where.lineno,
