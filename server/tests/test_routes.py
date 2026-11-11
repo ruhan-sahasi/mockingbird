@@ -35,6 +35,7 @@ from websockets.exceptions import ConnectionClosedOK
 
 from mockingbird import routes_vapi, routes_ws
 from mockingbird.app import create_app
+from mockingbird.audio_store import LocalAudioStore
 from mockingbird.brain import WRAP_UP_LINE, Brain
 from mockingbird.models import Interview
 from mockingbird.plan import DEMO, InterviewPlan, Question
@@ -597,6 +598,46 @@ def test_a_call_that_never_went_live_has_no_recording(client, app, fakes):
     wait_cleaned_up(app, body["interview_id"])
     assert get(client, fakes.store, body["interview_id"]).recording is None
     assert fakes.audio.files == {}
+
+
+def everything_under(folder: Path) -> list[str]:
+    if not folder.exists():
+        return []
+    return sorted(str(path.relative_to(folder)) for path in folder.rglob("*"))
+
+
+def test_a_test_call_records_into_its_tmp_folder_and_never_into_the_repo(settings, fakes, tmp_path):
+    # Without an injected audio store the app keeps recordings in RECORDINGS_DIR, "recordings"
+    # under the working directory by default. The settings fixture moves that into tmp_path, so
+    # running the tests never leaves WAV files in the repo (ruling P2-R22).
+    repo = Path(__file__).resolve().parents[2]
+    repo_folders = {repo / "recordings", repo / "server" / "recordings", Path.cwd() / "recordings"}
+    before = {folder: everything_under(folder) for folder in repo_folders}
+    app = create_app(
+        settings,
+        store=fakes.store,
+        vapi=fakes.vapi,
+        streamer_factory=lambda: fakes.streamer,
+        grader=fakes.grader,
+    )
+
+    with TestClient(app, base_url="https://testserver", headers={"origin": SITE}) as client:
+        audio = app.state.audio_store
+        assert isinstance(audio, LocalAudioStore)
+        assert audio._root.is_relative_to(tmp_path.resolve())
+        body = start(client)
+        interview_id = body["interview_id"]
+        with client.websocket_connect(body["ws_path"]) as ws:
+            client.portal.call(fakes.vapi_socket.wait_reading)
+            ws.send_bytes(MIC)
+            wait_until(lambda: MIC in fakes.vapi_socket.sent)
+            hang_up(app, ws, interview_id)
+        wait_until(lambda: get(client, fakes.store, interview_id).recording is not None)
+        assert get(client, fakes.store, interview_id).recording["status"] == "uploaded"
+
+    written = tmp_path / "recordings" / "interviews" / interview_id
+    assert sorted(path.name for path in written.iterdir()) == ["candidate.wav", "interviewer.wav"]
+    assert {folder: everything_under(folder) for folder in repo_folders} == before
 
 
 def test_the_interview_is_ended_before_the_browser_hears_the_call_ended(client, app, fakes):
