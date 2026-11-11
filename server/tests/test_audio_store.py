@@ -38,6 +38,18 @@ async def test_local_delete_of_a_missing_prefix_is_fine(tmp_path):
     await LocalAudioStore(tmp_path).delete_prefix("interviews/none/")
 
 
+async def test_local_delete_failure_surfaces(tmp_path, monkeypatch):
+    store = LocalAudioStore(tmp_path)
+    await store.put_wav("interviews/a/candidate.wav", b"x")
+
+    def boom(*args, **kwargs):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr("mockingbird.audio_store.shutil.rmtree", boom)
+    with pytest.raises(PermissionError):
+        await store.delete_prefix("interviews/a")
+
+
 @pytest.mark.parametrize("bad", ["../x", "/etc/x", "interviews/../../x"])
 async def test_local_refuses_paths_that_escape_the_root(tmp_path, bad):
     store = LocalAudioStore(tmp_path / "root")

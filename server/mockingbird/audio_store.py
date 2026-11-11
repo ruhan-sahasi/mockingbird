@@ -58,7 +58,16 @@ class LocalAudioStore:
         target = self._resolve(prefix)
         if target == self._root:
             raise ValueError("refusing to delete the whole recordings folder")
-        await asyncio.to_thread(shutil.rmtree, target, True)
+
+        def remove() -> None:
+            # Only a missing folder is fine. Any other failure must surface so the purge keeps
+            # the interview row and the audio is never orphaned.
+            try:
+                shutil.rmtree(target)
+            except FileNotFoundError:
+                pass
+
+        await asyncio.to_thread(remove)
 
     async def ensure_ready(self) -> None:
         """Nothing to prepare: put_wav creates folders as it needs them."""
