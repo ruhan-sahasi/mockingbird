@@ -42,10 +42,20 @@ def secret_names_in_the_entrypoint() -> set[str]:
 def test_terraform_the_entrypoint_and_settings_name_the_same_secrets():
     # Every text setting is a secret except PUBLIC_BASE_URL, which ecs.tf sets in the open. The
     # numbers have defaults and are not secrets either.
+    # The recording settings are not deployed yet: the task that uploads recordings adds them
+    # to Terraform and the entrypoint, and removes this exclusion.
+    not_deployed_yet = {
+        "supabase_url",
+        "supabase_service_key",
+        "recordings_bucket",
+        "recordings_dir",
+    }
     settings = {
         name.upper()
         for name, field in Settings.model_fields.items()
-        if field.annotation is not int and name != "public_base_url"
+        if field.annotation is not int
+        and name != "public_base_url"
+        and name not in not_deployed_yet
     }
 
     assert secret_names_in_terraform() == settings

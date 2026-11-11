@@ -4,6 +4,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import anthropic
@@ -11,6 +12,7 @@ import httpx
 from fastapi import FastAPI
 
 from mockingbird import routes_api, routes_vapi, routes_ws
+from mockingbird.audio_store import AudioStore, LocalAudioStore, SupabaseAudioStore
 from mockingbird.claude import AnthropicStreamer, make_anthropic_client
 from mockingbird.config import Settings, get_settings
 from mockingbird.report import Grader, load_rubric
@@ -38,17 +40,25 @@ def create_app(
     vapi: Any | None = None,
     streamer_factory: Any | None = None,
     grader: Any | None = None,
+    audio_store: AudioStore | None = None,
 ) -> FastAPI:
     """Build the app. The keyword arguments are injection points, and tests pass fakes. Whatever
     is not passed is built from `settings` when the app starts: PostgresStore when DATABASE_URL
     is set (MemoryStore when it is not), the Vapi client, the live Claude streamer and the
-    grader. Starting also starts the sweeper (sessions.py); stopping closes what was built."""
+    grader, and the audio store (Supabase Storage when both Supabase settings are set, a local
+    folder when not). Starting also starts the sweeper (sessions.py); stopping closes what was
+    built."""
 
     @asynccontextmanager
     async def lifespan(api: FastAPI) -> AsyncIterator[None]:
         state = api.state
         async with AsyncExitStack() as built:
             await _build_missing(state, settings, built)
+            try:
+                await state.audio_store.ensure_ready()
+            except Exception as exc:
+                # Interviews still run. Uploads fail visibly later, and the type is all we log.
+                log.error("audio store is not ready: %s", type(exc).__name__)
             sweeper = asyncio.create_task(run_sweeper(state.registry, state.store, state.vapi))
             state.sweeper = sweeper
             try:
@@ -66,6 +76,7 @@ def create_app(
     api.state.vapi = vapi
     api.state.streamer_factory = streamer_factory
     api.state.grader = grader
+    api.state.audio_store = audio_store
     api.state.registry = SessionRegistry()
     api.state.start_lock = asyncio.Lock()
     api.state.background = set()  # report grading tasks, held until they finish
@@ -102,6 +113,22 @@ async def _build_missing(state: Any, settings: Settings, built: AsyncExitStack) 
         )
         built.push_async_callback(grading.close)
         state.grader = Grader(grading, load_rubric())
+    if state.audio_store is None:
+        if settings.supabase_url and settings.supabase_service_key:
+            recordings_http = httpx.AsyncClient(timeout=30.0)
+            built.push_async_callback(recordings_http.aclose)
+            state.audio_store = SupabaseAudioStore(
+                settings.supabase_url,
+                settings.supabase_service_key,
+                settings.recordings_bucket,
+                recordings_http,
+            )
+        else:
+            log.warning(
+                "SUPABASE_URL and SUPABASE_SERVICE_KEY are not both set: "
+                "recordings are kept in a local folder"
+            )
+            state.audio_store = LocalAudioStore(Path(settings.recordings_dir))
 
 
 def app() -> FastAPI:
