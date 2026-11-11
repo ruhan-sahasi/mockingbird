@@ -194,8 +194,10 @@ async def run_sweeper(
 async def purge_once(store: Store, vapi: CallDeleter, audio: AudioStore) -> None:
     """Delete the demo data older than RETENTION_DAYS: each interview's recording first, then
     its call's copy at Vapi, then our rows. A row whose recording or call could not be deleted
-    is kept for the next purge, so nothing is left without the row that names it."""
-    keep = []
+    is kept for the next purge, so nothing is left without the row that names it. Only the ids
+    whose recording was deleted are handed on, so an interview that turned 7 days old while this
+    ran, and so was never offered for deletion, keeps its row until the next purge."""
+    audio_deleted = []
     for interview_id in await store.demo_interviews_older_than(RETENTION_DAYS):
         try:
             await audio.delete_prefix(f"interviews/{interview_id}/")
@@ -203,7 +205,8 @@ async def purge_once(store: Store, vapi: CallDeleter, audio: AudioStore) -> None
             # The type only: a storage error can carry the project URL or the key (ruling R19).
             msg = "could not delete an old recording, kept for the next purge: %s"
             log.warning(msg, type(exc).__name__)
-            keep.append(interview_id)
+        else:
+            audio_deleted.append(interview_id)
     deleted_at_vapi = []
     for call_id in await store.demo_calls_older_than(RETENTION_DAYS):
         try:
@@ -215,7 +218,7 @@ async def purge_once(store: Store, vapi: CallDeleter, audio: AudioStore) -> None
         else:
             deleted_at_vapi.append(call_id)
     deleted = await store.delete_demo_data_older_than(
-        RETENTION_DAYS, vapi_deleted=deleted_at_vapi, keep=keep
+        RETENTION_DAYS, audio_deleted=audio_deleted, vapi_deleted=deleted_at_vapi
     )
     if deleted:
         log.info("deleted %d demo interview(s) older than %d days", deleted, RETENTION_DAYS)

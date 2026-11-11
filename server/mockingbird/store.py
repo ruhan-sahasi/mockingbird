@@ -141,15 +141,19 @@ class Store(Protocol):
         ...
 
     async def delete_demo_data_older_than(
-        self, days: int, *, vapi_deleted: Collection[str] = (), keep: Collection[str] = ()
+        self, days: int, *, audio_deleted: Collection[str], vapi_deleted: Collection[str] = ()
     ) -> int:
         """Delete demo interviews created more than `days` days ago, with their turns, scores
-        and quotes. Full-mode interviews are kept, and so are the interview ids in `keep` (the
-        ones whose recording could not be deleted). Returns how many interviews it deleted.
+        and quotes. Full-mode interviews are kept. Returns how many interviews it deleted.
 
-        A demo that holds a Vapi call id is deleted only when that id is in `vapi_deleted`, the
-        calls whose copy at Vapi is gone. The id is the only way to delete that copy, so the row
-        keeps it until then."""
+        Two allowlists say what is safe to delete, and a row goes only when both agree. An
+        interview must be in `audio_deleted`, the ids whose recording is gone from storage: the
+        row is the only thing that names the folder, so deleting it first would orphan the audio.
+        And a demo that holds a Vapi call id must have that id in `vapi_deleted`, the calls whose
+        copy at Vapi is gone, for the same reason. They are allowlists, not denylists, because the
+        purge lists the old interviews before it deletes anything and this method reads the clock
+        again: an interview that turned 7 days old in between was never offered for deletion, and
+        a denylist would delete its row with its audio still in storage."""
         ...
 
 
@@ -321,17 +325,17 @@ class MemoryStore:
         ]
 
     async def delete_demo_data_older_than(
-        self, days: int, *, vapi_deleted: Collection[str] = (), keep: Collection[str] = ()
+        self, days: int, *, audio_deleted: Collection[str], vapi_deleted: Collection[str] = ()
     ) -> int:
         cutoff = self._clock() - timedelta(days=days)
         gone = set(vapi_deleted)
-        kept = set(keep)
+        cleaned = set(audio_deleted)
         old = [
             i.id
             for i in self._interviews.values()
             if i.mode == "demo"
             and i.created_at < cutoff
-            and i.id not in kept
+            and i.id in cleaned
             and (i.vapi_call_id is None or i.vapi_call_id in gone)
         ]
         for id in old:
@@ -573,18 +577,18 @@ class PostgresStore:
         return [row["id"] for row in rows]
 
     async def delete_demo_data_older_than(
-        self, days: int, *, vapi_deleted: Collection[str] = (), keep: Collection[str] = ()
+        self, days: int, *, audio_deleted: Collection[str], vapi_deleted: Collection[str] = ()
     ) -> int:
         cutoff = self._clock() - timedelta(days=days)
         # The turns, scores and quotes go with their interview (on delete cascade).
         return await self._pool.fetchval(
             "with gone as (delete from interviews where mode = 'demo' and created_at < $1"
             "   and (vapi_call_id is null or vapi_call_id = any($2::text[]))"
-            "   and id <> all($3::text[])"
+            "   and id = any($3::text[])"
             " returning 1) select count(*) from gone",
             cutoff,
             list(vapi_deleted),
-            list(keep),
+            list(audio_deleted),
         )
 
 
