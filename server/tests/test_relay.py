@@ -21,11 +21,11 @@ from websockets.frames import Close
 from mockingbird.relay import (
     FLUSH,
     PING,
+    TIMING_PER_S,
     Relay,
     SocketClosed,
     StarletteSocket,
     WebsocketsSocket,
-    _is_end_request,
 )
 from mockingbird.vapi_types import SpeechUpdate, StatusUpdate, UserInterrupted
 
@@ -743,6 +743,174 @@ async def test_logs_never_hold_frame_contents(caplog):
     assert not [line for line in logged if CALL_ID in line]
 
 
+# --- Timing messages from the browser (Review Focus 2) ---
+
+
+class StepClock:
+    """Seconds, moved by hand, for the relay's timing rate limit."""
+
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def timing(ms: float = 1420, **more) -> str:
+    return frame(type="timing", stop_to_audible_ms=ms, **more)
+
+
+async def relayed(browser: FakeSocket, vapi: FakeSocket, *texts: str, mic: bytes = MIC_1) -> None:
+    """Send the browser's text frames, then a mic frame, and wait for that frame to reach Vapi.
+    The relay reads the browser's frames in order, so by then it has dealt with every text."""
+    for text in texts:
+        browser.incoming.put_nowait(text)
+    browser.incoming.put_nowait(mic)
+    assert await vapi.next_sent() == mic
+
+
+async def test_timing_messages_reach_on_browser_message_and_nothing_else_does():
+    passed: list = []
+    relay, browser, vapi = make_relay(on_browser_message=passed.append, clock=StepClock())
+    task = await start(relay)
+
+    await relayed(
+        browser,
+        vapi,
+        "not json",
+        "",
+        "null",
+        "[1, 2]",
+        '"timing"',
+        frame(kind="timing"),
+        frame(type="Timing", stop_to_audible_ms=1),
+        frame(type="timings", stop_to_audible_ms=2),
+        frame(type=["timing"], stop_to_audible_ms=3),
+        frame(type="add-message", message="hi"),
+        timing(1420),
+        frame(type="timing", interrupt_to_silence_ms=180),
+        frame(type="timing", stop_to_audible_ms=-5),  # the tracer judges the numbers, not the relay
+    )
+    await relay.end("plan_done")
+    await finished(task)
+
+    assert passed == [
+        {"type": "timing", "stop_to_audible_ms": 1420},
+        {"type": "timing", "interrupt_to_silence_ms": 180},
+        {"type": "timing", "stop_to_audible_ms": -5},
+    ]
+    assert vapi.frames() == [MIC_1, END_CALL]  # none of it reached Vapi
+
+
+async def test_end_still_ends_the_call_with_on_browser_message_set():
+    passed: list = []
+    relay, browser, vapi = make_relay(on_browser_message=passed.append)
+    task = await start(relay)
+
+    browser.incoming.put_nowait(timing())
+    browser.incoming.put_nowait(frame(type="end"))
+
+    assert await finished(task) == "browser_closed"
+    assert passed == [json.loads(timing())]
+    assert_hung_up_in_order(vapi.log, "browser_closed")
+
+
+async def test_more_than_10_timing_messages_a_second_are_cut():
+    passed: list = []
+    clock = StepClock()
+    relay, browser, vapi = make_relay(on_browser_message=passed.append, clock=clock)
+    task = await start(relay)
+
+    await relayed(browser, vapi, *(timing(n) for n in range(15)), mic=MIC_1)
+    assert [m["stop_to_audible_ms"] for m in passed] == list(range(10))
+
+    # The window rolls: a second after the first ten passed there is room again, for ten more at
+    # most. A message that was dropped does not count against it.
+    clock.now = 100.5
+    await relayed(browser, vapi, timing(100), mic=MIC_2)
+    clock.now = 101.0
+    await relayed(browser, vapi, *(timing(200 + n) for n in range(12)), mic=MIC_3)
+    await relay.end("plan_done")
+    await finished(task)
+
+    assert [m["stop_to_audible_ms"] for m in passed] == [*range(10), *range(200, 210)]
+    assert TIMING_PER_S == 10
+
+
+async def test_a_steady_stream_under_the_limit_all_passes():
+    passed: list = []
+    clock = StepClock()
+    relay, browser, vapi = make_relay(on_browser_message=passed.append, clock=clock)
+    task = await start(relay)
+
+    for n in range(30):
+        await relayed(browser, vapi, timing(n))
+        clock.now += 0.125  # 8 a second, in steps a float holds exactly
+    await relay.end("plan_done")
+    await finished(task)
+
+    assert len(passed) == 30
+
+
+async def test_a_flood_of_malformed_or_huge_text_never_disturbs_the_relay(caplog):
+    caplog.set_level(logging.DEBUG, logger="mockingbird.relay")
+    passed: list = []
+    relay, browser, vapi = make_relay(on_browser_message=passed.append, clock=StepClock())
+    task = await start(relay)
+
+    await relayed(
+        browser,
+        vapi,
+        "[" * 100_000,  # nested too deep for the JSON parser: it raises RecursionError
+        '{"type": "timing", "stop_to_audible_ms": ' + "9" * 5000 + "}",  # too many digits
+        '{"type": "timing", "stop_to_audible_ms": NaN}',
+        '{"type": "timing", "stop_to_audible_ms": 1e999}',
+        timing(1, pad="x" * 1_000_000),
+        *(timing(n) for n in range(500)),
+    )
+    vapi.incoming.put_nowait(VOICE_1)
+    assert await browser.next_sent() == VOICE_1
+    await relay.end("plan_done")
+    assert await finished(task) == "plan_done"
+
+    assert len(passed) == 10  # the first ten that parsed, the rest of the flood cut
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+async def test_on_browser_message_failing_does_not_stop_relaying(caplog):
+    caplog.set_level(logging.DEBUG, logger="mockingbird.relay")
+
+    def on_browser_message(message: dict) -> None:
+        raise RuntimeError(f"tracer bug {CALL_ID}")
+
+    relay, browser, vapi = make_relay(on_browser_message=on_browser_message, clock=StepClock())
+    task = await start(relay)
+
+    await relayed(browser, vapi, timing(), mic=MIC_1)
+    await relayed(browser, vapi, timing(), mic=MIC_2)
+    vapi.incoming.put_nowait(VOICE_1)
+    assert await browser.next_sent() == VOICE_1
+    await relay.end("plan_done")
+    assert await finished(task) == "plan_done"
+
+    logged = [r.getMessage() + (r.exc_text or "") for r in caplog.records]
+    failures = [line for line in logged if "on_browser_message failed" in line]
+    assert len(failures) == 2
+    assert all("RuntimeError" in line for line in failures)
+    assert not [line for line in logged if CALL_ID in line or "tracer bug" in line]
+
+
+async def test_timing_messages_are_dropped_without_on_browser_message():
+    relay, browser, vapi = make_relay()
+    task = await start(relay)
+
+    await relayed(browser, vapi, timing(), mic=MIC_1)
+    await relay.end("plan_done")
+    await finished(task)
+
+    assert vapi.frames() == [MIC_1, END_CALL]
+
+
 # --- Adapters ---
 
 
@@ -938,7 +1106,18 @@ def test_the_text_frames_are_the_ones_the_browser_expects():
     # web/src/protocol.test.ts and interviewSession.test.ts read the same file.
     assert json.loads(FLUSH) == WIRE["server_to_browser"]["flush"]
     assert json.loads(PING) == WIRE["server_to_browser"]["ping"]
-    assert _is_end_request(json.dumps(WIRE["browser_to_server"]["end"]))
+
+
+async def test_the_browser_frames_are_the_ones_the_relay_reads():
+    passed: list = []
+    relay, browser, vapi = make_relay(on_browser_message=passed.append)
+    task = await start(relay)
+
+    browser.incoming.put_nowait(json.dumps(WIRE["browser_to_server"]["timing"]))
+    browser.incoming.put_nowait(json.dumps(WIRE["browser_to_server"]["end"]))
+
+    assert await finished(task) == "browser_closed"
+    assert passed == [WIRE["browser_to_server"]["timing"]]
 
 
 @pytest.mark.parametrize("reason", ["cap", "browser_closed", "vapi_closed", "plan_done"])

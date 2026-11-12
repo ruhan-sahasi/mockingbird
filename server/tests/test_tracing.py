@@ -267,3 +267,120 @@ def test_stamps_before_start_are_ignored(clock):
     after = tracer.new_trace()
     assert after.user_stopped_ms is None  # the stop before start() was never kept
     assert after.request_ms == 0.0
+
+
+# --- the browser's own numbers (Review Focus 2) ---
+
+
+def spoken_reply(tracer: CallTracer) -> TurnTrace:
+    """A reply Vapi started speaking, so it is the current trace."""
+    trace = tracer.new_trace()
+    tracer.assistant_started(trace)
+    return trace
+
+
+def browser_numbers(trace: TurnTrace) -> tuple:
+    return trace.browser_stop_to_audible_ms, trace.interrupt_to_silence_ms
+
+
+def test_browser_timing_lands_on_the_reply_being_spoken(tracer):
+    earlier = spoken_reply(tracer)
+    trace = spoken_reply(tracer)
+    tracer.browser_timing(
+        {"type": "timing", "stop_to_audible_ms": 1420, "interrupt_to_silence_ms": 180.5}
+    )
+    assert browser_numbers(trace) == (1420.0, 180.5)
+    assert browser_numbers(earlier) == (None, None)
+
+
+def test_browser_timing_takes_each_number_on_its_own(tracer):
+    trace = spoken_reply(tracer)
+    tracer.browser_timing({"type": "timing", "stop_to_audible_ms": 1420})
+    assert browser_numbers(trace) == (1420.0, None)
+    tracer.browser_timing({"type": "timing", "interrupt_to_silence_ms": 180})
+    assert browser_numbers(trace) == (1420.0, 180.0)
+
+
+@pytest.mark.parametrize("value", [0, 0.0, 60000, 60000.0, 1, 59999.9])
+def test_browser_timing_takes_0_to_60000_ms_inclusive(tracer, value):
+    trace = spoken_reply(tracer)
+    tracer.browser_timing({"stop_to_audible_ms": value, "interrupt_to_silence_ms": value})
+    assert browser_numbers(trace) == (value, value)
+    assert all(type(n) is float for n in browser_numbers(trace))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        -5,
+        -0.001,
+        60000.001,
+        1e9,
+        10**400,  # an int too big for a float: compared, never converted
+        "300",
+        None,
+        True,
+        False,
+        [300],
+        {"ms": 300},
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+    ],
+)
+def test_browser_timing_ignores_a_value_that_is_not_0_to_60000_ms(tracer, value):
+    trace = spoken_reply(tracer)
+    tracer.browser_timing({"stop_to_audible_ms": value, "interrupt_to_silence_ms": value})
+    assert browser_numbers(trace) == (None, None)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {},
+        {"type": "timing"},
+        {"type": "timing", "browser_stop_to_audible_ms": 300},  # the trace's name, not the wire's
+        {"type": "timing", "user_stopped_ms": 300, "cut_in": True, "turn_idx": 0},
+        {"type": "timing", "STOP_TO_AUDIBLE_MS": 300},
+    ],
+)
+def test_browser_timing_ignores_missing_and_other_keys(tracer, message):
+    trace = spoken_reply(tracer)
+    before = TurnTrace(**vars(trace))
+    tracer.browser_timing(message)
+    assert trace == before
+
+
+def test_a_bad_number_does_not_stop_the_good_one_beside_it(tracer):
+    trace = spoken_reply(tracer)
+    tracer.browser_timing({"stop_to_audible_ms": -5, "interrupt_to_silence_ms": 180})
+    assert browser_numbers(trace) == (None, 180.0)
+
+
+def test_the_first_valid_number_for_a_reply_wins(tracer):
+    trace = spoken_reply(tracer)
+    tracer.browser_timing({"stop_to_audible_ms": "soon"})
+    tracer.browser_timing({"stop_to_audible_ms": 1420, "interrupt_to_silence_ms": 180})
+    tracer.browser_timing({"stop_to_audible_ms": 900, "interrupt_to_silence_ms": 90})
+    assert browser_numbers(trace) == (1420.0, 180.0)
+
+
+def test_browser_timing_with_no_reply_spoken_yet_is_ignored(clock):
+    before_start = CallTracer(clock)
+    before_start.browser_timing({"stop_to_audible_ms": 1420})  # before start(): never raises
+
+    tracer = CallTracer(clock)
+    tracer.start()
+    tracer.browser_timing({"stop_to_audible_ms": 1420})
+    trace = spoken_reply(tracer)
+    assert browser_numbers(trace) == (None, None)  # it was not kept for the next reply either
+
+
+def test_browser_timing_for_the_opening_line_is_never_counted(tracer):
+    tracer.assistant_started(None)
+    tracer.browser_timing({"stop_to_audible_ms": 1420, "interrupt_to_silence_ms": 180})
+    assert tracer.committed() == []
+
+    trace = spoken_reply(tracer)
+    trace.turn_idx = 2
+    assert browser_numbers(trace) == (None, None)

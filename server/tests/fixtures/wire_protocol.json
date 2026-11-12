@@ -6,7 +6,8 @@
     "ended": { "type": "ended", "reason": "browser_closed" }
   },
   "browser_to_server": {
-    "end": { "type": "end" }
+    "end": { "type": "end" },
+    "timing": { "type": "timing", "stop_to_audible_ms": 1420 }
   },
   "ended_reasons": ["cap", "browser_closed", "vapi_closed", "plan_done", "error"],
   "close_codes": {

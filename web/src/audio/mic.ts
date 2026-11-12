@@ -1,17 +1,24 @@
-// The mic: getUserMedia into the capture worklet, which hands back 16 kHz int16 frames.
+// The mic: getUserMedia into the capture worklet, which hands back 16 kHz int16 frames, and says
+// when the candidate starts and stops speaking.
 
+import type { CaptureMessage } from './capture.worklet'
 import { openWorkletContext } from './context'
 import captureUrl from './capture.worklet.ts?worker&url'
+import type { VadEvent } from './vad'
 
 export type Mic = { stop(): void }
 
 /**
  * Ask for the mic and start capturing. `onFrame` gets one 320-sample frame every 20 ms from now
- * until `stop()`, silent ones included. Rejects with getUserMedia's own error when the mic is
- * refused or missing (a DOMException named NotAllowedError, NotFoundError and so on), and with
- * AudioBlockedError when the browser will not start audio.
+ * until `stop()`, silent ones included, and `onVad` hears each time the candidate starts or stops
+ * speaking (vad.ts). Rejects with getUserMedia's own error when the mic is refused or missing (a
+ * DOMException named NotAllowedError, NotFoundError and so on), and with AudioBlockedError when
+ * the browser will not start audio.
  */
-export async function startMic(onFrame: (pcm: Int16Array<ArrayBuffer>) => void): Promise<Mic> {
+export async function startMic(
+  onFrame: (pcm: Int16Array<ArrayBuffer>) => void,
+  onVad?: (e: VadEvent) => void,
+): Promise<Mic> {
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: {
       echoCancellation: true,
@@ -43,8 +50,14 @@ export async function startMic(onFrame: (pcm: Int16Array<ArrayBuffer>) => void):
       channelCount: 1,
       channelCountMode: 'explicit',
     })
-    // A posted frame always arrives on an ArrayBuffer of its own, never a shared one.
-    node.port.onmessage = (event: MessageEvent<Int16Array<ArrayBuffer>>) => onFrame(event.data)
+    node.port.onmessage = (event: MessageEvent<CaptureMessage>) => {
+      const message = event.data
+      if (message.type === 'frame') onFrame(message.pcm)
+      else {
+        const { speaking, loudMs, quietMs } = message
+        onVad?.({ speaking, loudMs, quietMs })
+      }
+    }
     // If the worklet throws, frames stop, and the server ends the call 2 s later. Say why here.
     node.onprocessorerror = () => console.error('the mic worklet stopped with an error')
     source.connect(node)

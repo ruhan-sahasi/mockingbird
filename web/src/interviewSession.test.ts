@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { ApiError, type LimitReason, type StartResult } from './api'
 import { AudioBlockedError } from './audio/context'
+import type { VadEvent } from './audio/vad'
 import {
   CALL_FAILED,
   DROPPED,
@@ -24,7 +25,7 @@ const WIRE = JSON.parse(
   readFileSync(new URL('../../server/tests/fixtures/wire_protocol.json', import.meta.url), 'utf8'),
 ) as {
   server_to_browser: Record<'flush' | 'ping' | 'ended', object>
-  browser_to_server: { end: object }
+  browser_to_server: { end: object; timing: object }
   close_codes: { token_rejected: number; call_not_started: number }
 }
 
@@ -93,7 +94,10 @@ function setup(overrides: Partial<SessionDeps> = {}, started: StartResult = STAR
     ended: [] as string[],
     timers: [] as { run: () => void; ms: number }[],
     onFrame: null as ((pcm: Int16Array<ArrayBuffer>) => void) | null,
+    onVad: null as ((e: VadEvent) => void) | null,
     onSpeaking: null as ((on: boolean) => void) | null,
+    clock: 4321,
+    outputLatencyMs: 0,
     micStopped: 0,
     pushed: [] as Int16Array[],
     flushed: 0,
@@ -107,9 +111,10 @@ function setup(overrides: Partial<SessionDeps> = {}, started: StartResult = STAR
     },
   }
   const deps: SessionDeps = {
-    startMic: async (onFrame) => {
+    startMic: async (onFrame, onVad) => {
       h.calls.push('startMic')
       h.onFrame = onFrame
+      h.onVad = onVad ?? null
       return { stop: () => void h.micStopped++ }
     },
     createPlayer: async (onSpeaking) => {
@@ -119,6 +124,7 @@ function setup(overrides: Partial<SessionDeps> = {}, started: StartResult = STAR
         push: (pcm) => void h.pushed.push(pcm),
         flush: () => void h.flushed++,
         close: () => void h.playerClosed++,
+        outputLatencyMs: () => h.outputLatencyMs,
       }
     },
     startInterview: async () => {
@@ -130,7 +136,7 @@ function setup(overrides: Partial<SessionDeps> = {}, started: StartResult = STAR
       h.socket = new FakeSocket(path, handlers)
       return h.socket
     },
-    now: () => 4321,
+    now: () => h.clock,
     setTimeout: (run, ms) => void h.timers.push({ run, ms }),
     ...overrides,
   }
@@ -302,6 +308,74 @@ describe('the server', () => {
     h.onSpeaking!(true)
     h.onSpeaking!(false)
     expect(h.speaking).toEqual([true, false])
+  })
+})
+
+describe('turn timing', () => {
+  /** The timing frames the page sent, as the objects they hold. */
+  const timings = (socket: FakeSocket) =>
+    socket
+      .texts()
+      .map((t) => JSON.parse(t))
+      .filter((m) => m.type === 'timing')
+
+  it('sends end of speech to the interviewer being heard, as a text frame', async () => {
+    const { h } = await live()
+    h.outputLatencyMs = 20
+
+    h.clock = 500
+    h.onVad!({ speaking: true })
+    h.clock = 1000
+    h.onVad!({ speaking: false, quietMs: 300 })
+    expect(timings(h.socket!)).toEqual([])
+    h.clock = 2100
+    h.onSpeaking!(true)
+
+    expect(timings(h.socket!)).toEqual([{ type: 'timing', stop_to_audible_ms: 1420 }])
+    // The same frame the server's tests feed the relay and the tracer.
+    expect(timings(h.socket!)).toEqual([WIRE.browser_to_server.timing])
+    expect(h.speaking).toEqual([true]) // the page still hears it too
+  })
+
+  it('sends a cut-in to silence once the server flushes and the interviewer quiets', async () => {
+    const { h } = await live()
+    h.outputLatencyMs = 20
+    h.clock = 4000
+    h.onSpeaking!(true)
+    h.clock = 5000
+    h.onVad!({ speaking: true, loudMs: 60 })
+    h.clock = 5100
+    h.socket!.text(WIRE.server_to_browser.flush)
+    expect(h.flushed).toBe(1)
+    h.clock = 5180
+    h.onSpeaking!(false)
+
+    // From 4940, when the cut-in began, to 5200, when the speakers went quiet.
+    expect(timings(h.socket!)).toEqual([{ type: 'timing', interrupt_to_silence_ms: 260 }])
+  })
+
+  it('sends nothing before the socket is open', async () => {
+    const { h } = setup()
+    await settle()
+    h.clock = 1000
+    h.onVad!({ speaking: false, quietMs: 300 })
+    h.clock = 2100
+    h.onSpeaking!(true)
+    h.socket!.open()
+
+    expect(h.socket!.sent).toEqual([])
+  })
+
+  it('sends nothing once the page has left', async () => {
+    const { h, session } = await live()
+    h.clock = 1000
+    h.onVad!({ speaking: false, quietMs: 300 })
+    session.stop()
+    h.socket!.readyState = WebSocket.OPEN // a socket that has not finished closing
+    h.clock = 2100
+    h.onSpeaking!(true)
+
+    expect(timings(h.socket!)).toEqual([])
   })
 })
 

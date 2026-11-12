@@ -976,6 +976,10 @@ def test_a_spoken_reply_is_traced_hop_by_hop_and_stored(client, app, fakes):
         client.portal.call(fakes.vapi_socket.deliver, ASSISTANT_STARTED)
         client.portal.call(fakes.vapi_socket.deliver, VOICE)
         assert ws.receive_bytes() == VOICE
+        # The browser times the reply itself and reports it on the same socket. A number out of
+        # range is dropped, and a second report of the same number does not replace the first.
+        ws.send_json({"type": "timing", "stop_to_audible_ms": 1420, "interrupt_to_silence_ms": -5})
+        ws.send_json({"type": "timing", "stop_to_audible_ms": 900, "interrupt_to_silence_ms": 180})
         hang_up(app, ws, interview_id)
 
     since = datetime.now(UTC) - timedelta(days=1)
@@ -990,9 +994,8 @@ def test_a_spoken_reply_is_traced_hop_by_hop_and_stored(client, app, fakes):
     assert trace.first_token_ms <= trace.first_chunk_ms <= trace.assistant_started_ms
     assert trace.assistant_started_ms <= trace.first_audio_ms
     assert trace.cut_in is False
-    # The browser's two numbers come in a later step.
-    assert trace.browser_stop_to_audible_ms is None
-    assert trace.interrupt_to_silence_ms is None
+    assert trace.browser_stop_to_audible_ms == 1420.0
+    assert trace.interrupt_to_silence_ms == 180.0
 
 
 class StepClock:

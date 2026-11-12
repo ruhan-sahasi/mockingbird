@@ -7,7 +7,10 @@ import { createPlayer } from './player'
 
 class FakeContext {
   static made: FakeContext[] = []
+  static latency: { outputLatency?: number; baseLatency?: number } = {}
   state = 'suspended'
+  outputLatency = FakeContext.latency.outputLatency
+  baseLatency = FakeContext.latency.baseLatency
   closed = 0
   destination = {}
   audioWorklet = { addModule: async () => {} }
@@ -42,6 +45,7 @@ class FakeNode {
 
 beforeEach(() => {
   FakeContext.made = []
+  FakeContext.latency = {}
   FakeNode.made = []
   FakeNode.fail = null
   vi.stubGlobal('AudioContext', FakeContext)
@@ -72,5 +76,16 @@ describe('createPlayer', () => {
 
     player.close()
     expect(FakeContext.made.map((c) => c.closed)).toEqual([1])
+  })
+
+  it.each([
+    ['the output latency', { outputLatency: 0.025, baseLatency: 0.01 }, 25],
+    ['the base latency when there is no output latency', { baseLatency: 0.01 }, 10],
+    ['the base latency when the output latency is 0', { outputLatency: 0, baseLatency: 0.01 }, 10],
+    ['0 when the browser gives neither', {}, 0],
+  ])('gives %s in ms', async (_case, latency, ms) => {
+    FakeContext.latency = latency
+    const player = await createPlayer()
+    expect(player.outputLatencyMs()).toBeCloseTo(ms, 9)
   })
 })

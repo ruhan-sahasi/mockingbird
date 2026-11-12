@@ -9,7 +9,13 @@ order with the audio. The relay reads those events itself:
 - `speech-update` and other `status-update` frames go to `on_event`;
 - every other type (transcripts, model output and so on) is logged by type and dropped.
 Nothing the browser sends as text ever reaches Vapi, because Vapi takes control messages on this
-socket. The only text the browser may send is `{"type": "end"}`.
+socket. The browser may send two kinds of text, each a JSON object:
+- `{"type": "end"}`: the End button, so the relay ends with "browser_closed";
+- `{"type": "timing", ...}`: the browser's own timing of a turn, handed to `on_browser_message`.
+  The browser is not trusted, so at most TIMING_PER_S of them are passed on in any one second
+  and the rest are dropped. The relay does not read the numbers; the tracer judges them.
+Any other text is dropped, and so is text that is not a JSON object, deeply nested JSON included
+(Review Focus 2).
 
 `run()` holds two pumps (one per direction), a cap timer and a browser ping under one
 TaskGroup. `end(reason)` starts the hang-up and stops that group. The hang-up runs as its own
@@ -41,7 +47,9 @@ frame's contents or an exception's message.
 import asyncio
 import json
 import logging
+import time
 import traceback
+from collections import deque
 from collections.abc import Awaitable, Callable
 from typing import Protocol
 
@@ -80,6 +88,13 @@ OnEnd = Callable[[str], Awaitable[None]]
 # What the route's `on_audio` is given: "candidate" or "interviewer", and one audio frame. It is
 # synchronous and must not block.
 OnAudio = Callable[[str, bytes], None]
+# What the route's `on_browser_message` is given: one timing message from the browser, as the
+# JSON object it sent. It is synchronous and must not block.
+OnBrowserMessage = Callable[[dict], None]
+
+# At most this many timing messages from the browser are passed on in any one second. The rest
+# are dropped. A page sends one or two per turn, so only a broken or hostile one gets near it.
+TIMING_PER_S = 10
 
 
 class SocketClosed(Exception):
@@ -185,7 +200,9 @@ class Relay:
 
     `cap_s` is the call's time cap, `on_event` hears Vapi's live events, `on_end` hears why the
     call ended just before the browser does, `on_audio(direction, frame)` is given every audio
-    frame just before it goes on, and the browser gets a ping every `ping_every_s`.
+    frame just before it goes on, `on_browser_message` is given the browser's timing messages,
+    and the browser gets a ping every `ping_every_s`. `clock` (seconds, like time.monotonic)
+    times the limit of TIMING_PER_S.
     The browser counts as gone once `browser_timeout_s` passes with no frame from it, or with
     a send to it not done. Its mic frames come every 20 ms, so the 2 s
     default is 100 missing frames: enough to ride out a busy page or a few TCP retransmits, while
@@ -202,9 +219,11 @@ class Relay:
         on_event: OnEvent | None = None,
         on_end: OnEnd | None = None,
         on_audio: OnAudio | None = None,
+        on_browser_message: OnBrowserMessage | None = None,
         ping_every_s: float = 20.0,
         browser_timeout_s: float = 2.0,
         hang_up_timeout_s: float = 1.0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._browser = browser
         self._vapi = vapi
@@ -212,9 +231,13 @@ class Relay:
         self._on_event = on_event
         self._on_end = on_end
         self._on_audio = on_audio
+        self._on_browser_message = on_browser_message
         self._ping_every_s = ping_every_s
         self._browser_timeout_s = browser_timeout_s
         self._hang_up_timeout_s = hang_up_timeout_s
+        self._clock = clock
+        # When the latest timing messages were passed on, up to TIMING_PER_S of them.
+        self._timings_passed: deque[float] = deque(maxlen=TIMING_PER_S)
         self._reason: str | None = None
         self._stopping = asyncio.Event()
         self._hang_up_task: asyncio.Task | None = None
@@ -311,11 +334,17 @@ class Relay:
                 except SocketClosed:
                     await self.end("vapi_closed")
                     return
-            elif _is_end_request(frame):
-                await self.end("browser_closed")
-                return
             else:
-                log.debug("dropped a browser text frame that is not an end request")
+                message = _json_object(frame)
+                kind = None if message is None else message.get("type")
+                if kind == "end":
+                    await self.end("browser_closed")
+                    return
+                if kind == "timing":
+                    self._pass_timing(message)
+                else:
+                    # Never the frame itself: the browser wrote it, so it could hold anything.
+                    log.debug("dropped a browser text frame that is not an end or timing message")
         await self.end("browser_closed")
 
     async def _next_browser_frame(self) -> bytes | str | None:
@@ -381,6 +410,31 @@ class Relay:
                 where.lineno,
             )
 
+    def _pass_timing(self, message: dict) -> None:
+        """Give one timing message to `on_browser_message`, unless TIMING_PER_S were passed on
+        in the second before it. The window rolls: it holds the times of the latest TIMING_PER_S
+        passed on, and a message goes through once the oldest of those is a second old. A
+        dropped one is not counted, so a flood cannot hold the window shut. A failing callback
+        must not cut the interview off, so it is logged by type and where, never by message."""
+        if self._on_browser_message is None:
+            return
+        now = self._clock()
+        passed = self._timings_passed
+        if len(passed) == TIMING_PER_S and now - passed[0] < 1.0:
+            log.debug("dropped a browser timing message: more than %s in a second", TIMING_PER_S)
+            return
+        passed.append(now)
+        try:
+            self._on_browser_message(message)
+        except Exception as exc:
+            where = traceback.extract_tb(exc.__traceback__)[-1]
+            log.error(
+                "on_browser_message failed: %s at %s:%s; relaying goes on",
+                type(exc).__name__,
+                where.filename,
+                where.lineno,
+            )
+
     def _tap(self, direction: str, frame: bytes) -> None:
         """Give one audio frame to `on_audio`, just before it goes on. A failing callback must not
         cut the interview off, so it is logged by type and where, never by message (ruling R19)."""
@@ -420,9 +474,11 @@ class Relay:
         return False
 
 
-def _is_end_request(text: str) -> bool:
+def _json_object(text: str) -> dict | None:
+    """`text` as the JSON object it holds, or None if it holds anything else or is not JSON.
+    JSON nested too deep for the parser raises RecursionError, so that counts as not JSON too."""
     try:
         message = json.loads(text)
-    except ValueError:
-        return False
-    return isinstance(message, dict) and message.get("type") == "end"
+    except (ValueError, RecursionError):
+        return None
+    return message if isinstance(message, dict) else None
