@@ -3,6 +3,13 @@
 Audio on both sockets is raw pcm_s16le, mono, 16 kHz, in 20 ms frames of 640 bytes. Each track
 keeps what it is given, up to a cap, so a call that runs long or a browser that sends oversized
 frames cannot grow memory without bound.
+
+Each track's `start_ms` places it on the relay's clock, in ms since the call went live: sample k
+was captured at start_ms + k / 16 ms. It is worked back from the track's newest frame, not taken
+from its first one. The page sends mic frames from the moment its socket opens, while the call
+is still being set up, and those frames wait in the socket's buffers until the relay starts and
+reads them all at once. So the candidate track's first frame arrives near 0 ms whatever it
+holds, and only the frames after that backlog arrive as they are captured.
 """
 
 import logging
@@ -18,6 +25,7 @@ log = logging.getLogger(__name__)
 SAMPLE_RATE = 16000
 FRAME_BYTES = 640  # one 20 ms frame of 16 kHz s16le mono
 FRAMES_PER_SECOND = 50
+BYTES_PER_MS = SAMPLE_RATE * 2 / 1000
 # The cap leaves room past the call's own time cap for the hang-up to finish.
 CAP_MARGIN_S = 60
 
@@ -53,18 +61,26 @@ class TrackRecorder:
         self.max_frames = max_frames
         self.frames = 0
         self.dropped = 0
-        self.first_frame_ms: float | None = None
+        self.first_frame_ms: float | None = None  # when the first frame kept arrived
+        self.last_frame_ms: float | None = None  # when the newest frame kept arrived
+        # When the track's first sample was captured: the newest frame's arrival, less the
+        # length of all the audio kept before it. None until a frame is kept.
+        self.start_ms: float | None = None
         self._max_bytes = max_frames * FRAME_BYTES
+        self._kept_bytes = 0
         self._buf = bytearray()
 
     def append(self, frame: bytes, at_ms: float) -> None:
-        if self.frames >= self.max_frames or len(self._buf) + len(frame) > self._max_bytes:
+        if self.frames >= self.max_frames or self._kept_bytes + len(frame) > self._max_bytes:
             self.dropped += 1
             return
         if self.first_frame_ms is None:
             self.first_frame_ms = at_ms
         self._buf += frame
+        self._kept_bytes += len(frame)
         self.frames += 1
+        self.last_frame_ms = at_ms
+        self.start_ms = at_ms - (self._kept_bytes - len(frame)) / BYTES_PER_MS
 
     def pcm(self) -> bytes:
         return bytes(self._buf)
@@ -114,6 +130,8 @@ class CallRecorder:
                 "frames": track.frames,
                 "dropped": track.dropped,
                 "first_frame_ms": track.first_frame_ms,
+                "last_frame_ms": track.last_frame_ms,
+                "start_ms": track.start_ms,
             }
             for name, track in self.tracks()
         }

@@ -1,5 +1,7 @@
 """The recorder keeps both audio tracks in memory and turns them into WAV files."""
 
+import pytest
+
 from mockingbird.recording import CallRecorder, TrackRecorder, upload_recording, wav_bytes
 
 FRAME = b"\x00" * 640
@@ -56,9 +58,52 @@ def test_call_recorder_routes_directions_and_stamps_first_frame():
     assert r.interviewer.pcm() == b"\x01" * 640
     assert r.candidate.pcm() == b"\x02" * 640 + b"\x03" * 640
     assert r.metadata() == {
-        "candidate": {"frames": 2, "dropped": 0, "first_frame_ms": 500},
-        "interviewer": {"frames": 1, "dropped": 0, "first_frame_ms": 250},
+        "candidate": {
+            "frames": 2,
+            "dropped": 0,
+            "first_frame_ms": 500,
+            "last_frame_ms": pytest.approx(520),
+            "start_ms": pytest.approx(500),
+        },
+        "interviewer": {
+            "frames": 1,
+            "dropped": 0,
+            "first_frame_ms": 250,
+            "last_frame_ms": 250,
+            "start_ms": 250,
+        },
     }
+
+
+def test_a_track_starts_where_its_newest_frame_says_not_where_its_backlog_arrived():
+    # The page sends mic frames while the call is being set up. They wait in the socket's
+    # buffers and reach the relay all at once when it starts, so five frames arrive at 1 ms.
+    # The frames after them arrive as they are captured, 20 ms apart, so the newest one dates
+    # the whole track: eight frames ending with one that arrived at 61 ms began at -79 ms.
+    t = TrackRecorder(max_frames=100)
+    for _ in range(5):
+        t.append(FRAME, at_ms=1)
+    for at_ms in (21, 41, 61):
+        t.append(FRAME, at_ms=at_ms)
+    assert (t.first_frame_ms, t.last_frame_ms) == (1, 61)
+    assert t.start_ms == 61 + 20 - 8 * 20
+
+
+def test_a_track_start_counts_the_audio_in_frames_of_any_size():
+    t = TrackRecorder(max_frames=100)
+    t.append(b"\x00" * 320, at_ms=0)  # 10 ms
+    t.append(b"\x00" * 1280, at_ms=50)  # 40 ms, after 10 ms of audio before it
+    assert t.start_ms == 40
+
+
+def test_a_track_start_ignores_dropped_frames_and_survives_a_release():
+    t = TrackRecorder(max_frames=2)
+    for at_ms in (0, 20, 40):
+        t.append(FRAME, at_ms=at_ms)
+    assert (t.frames, t.dropped, t.last_frame_ms, t.start_ms) == (2, 1, 20, 0)
+    t.release()
+    assert t.start_ms == 0 and t.pcm() == b""
+    assert TrackRecorder(max_frames=1).start_ms is None
 
 
 def test_call_recorder_ignores_audio_before_start():

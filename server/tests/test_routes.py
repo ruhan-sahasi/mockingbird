@@ -138,7 +138,8 @@ class FakeAudioStore:
 
 
 class FakeVapi:
-    """Vapi's REST API. `delete_errors` makes delete_call fail for the calls named in it."""
+    """Vapi's REST API. `delete_errors` makes delete_call fail for the calls named in it, and
+    `create_delay` makes creating a call take that long, as it does against the real API."""
 
     def __init__(self) -> None:
         self.call_id = CALL_ID
@@ -146,9 +147,12 @@ class FakeVapi:
         self.error: Exception | None = None
         self.deleted: list[str] = []
         self.delete_errors: dict[str, Exception] = {}
+        self.create_delay = 0.0
 
     async def create_call(self, assistant: dict) -> VapiCall:
         self.assistants.append(assistant)
+        if self.create_delay:
+            await asyncio.sleep(self.create_delay)
         if self.error is not None:
             raise self.error
         return VapiCall(self.call_id, SOCKET_URL)
@@ -574,6 +578,30 @@ def test_a_call_records_and_uploads_both_tracks(client, app, fakes):
     assert recording["status"] == "uploaded"
     assert recording["candidate"]["frames"] == 5
     assert recording["interviewer"]["frames"] == 3
+
+
+def test_mic_frames_sent_before_the_call_went_live_do_not_shift_the_candidate_track(
+    client, app, fakes
+):
+    # The page sends mic frames as soon as its socket opens, while the call is still being set
+    # up. They wait in the socket and reach the relay all at once when it starts, so the first
+    # one arrives near 0 ms whatever it holds. The track is dated from its newest frame instead.
+    fakes.vapi.create_delay = 0.3
+    body = start(client)
+    interview_id = body["interview_id"]
+
+    with client.websocket_connect(body["ws_path"]) as ws:
+        for _ in range(5):
+            ws.send_bytes(MIC)  # before the call is live
+        wait_until(lambda: fakes.vapi_socket.sent.count(MIC) == 5)
+        hang_up(app, ws, interview_id)
+
+    wait_until(lambda: get(client, fakes.store, interview_id).recording is not None)
+    candidate = get(client, fakes.store, interview_id).recording["candidate"]
+    assert candidate["frames"] == 5
+    assert candidate["start_ms"] == pytest.approx(candidate["last_frame_ms"] - 4 * 20)
+    # The five 20 ms frames hold 100 ms of audio, captured before the burst that delivered them.
+    assert candidate["start_ms"] < candidate["first_frame_ms"]
 
 
 def test_a_finished_calls_audio_is_freed_without_waiting_for_the_garbage_collector(
