@@ -1,6 +1,6 @@
 """The recorder keeps both audio tracks in memory and turns them into WAV files."""
 
-from mockingbird.recording import CallRecorder, TrackRecorder, wav_bytes
+from mockingbird.recording import CallRecorder, TrackRecorder, upload_recording, wav_bytes
 
 FRAME = b"\x00" * 640
 
@@ -72,3 +72,49 @@ def test_full_mode_cap_fits_twenty_minutes():
     r = CallRecorder(clock=lambda: 0.0, cap_s=1200)
     assert r.candidate.max_frames == (1200 + 60) * 50
     assert r.interviewer.max_frames == (1200 + 60) * 50
+
+
+class FakeStores:
+    """The interview store and the audio store an upload writes to. `put_error` fails every
+    upload."""
+
+    def __init__(self, put_error: Exception | None = None) -> None:
+        self.files: dict[str, bytes] = {}
+        self.recording: dict | None = None
+        self.put_error = put_error
+
+    async def put_wav(self, path: str, data: bytes) -> None:
+        if self.put_error is not None:
+            raise self.put_error
+        self.files[path] = data
+
+    async def update_interview(self, interview_id: str, *, recording: dict) -> None:
+        self.recording = recording
+
+
+def recorded_call() -> CallRecorder:
+    r = CallRecorder(clock=lambda: 0.0, cap_s=60)
+    r.start()
+    r.on_audio("candidate", b"\x01" * 640)
+    r.on_audio("interviewer", b"\x02" * 640)
+    return r
+
+
+async def test_an_upload_lets_go_of_the_audio_and_keeps_the_counts():
+    # Whatever still holds the recorder after the call, its audio is not held with it.
+    r, stores = recorded_call(), FakeStores()
+    await upload_recording(stores, stores, "i1", r)
+
+    assert stores.files["interviews/i1/candidate.wav"] == wav_bytes(b"\x01" * 640)
+    assert stores.files["interviews/i1/interviewer.wav"] == wav_bytes(b"\x02" * 640)
+    assert r.candidate.pcm() == r.interviewer.pcm() == b""
+    assert stores.recording["status"] == "uploaded"
+    assert stores.recording["candidate"]["frames"] == 1
+
+
+async def test_a_failed_upload_lets_go_of_both_tracks_too():
+    r, stores = recorded_call(), FakeStores(put_error=RuntimeError("storage is down"))
+    await upload_recording(stores, stores, "i1", r)
+
+    assert stores.recording == {"status": "upload_failed"}
+    assert r.candidate.pcm() == r.interviewer.pcm() == b""

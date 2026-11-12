@@ -69,6 +69,17 @@ class TrackRecorder:
     def pcm(self) -> bytes:
         return bytes(self._buf)
 
+    def take_wav(self) -> bytes:
+        """The track as a WAV file. The track lets go of its audio as it builds it, so the WAV is
+        the only copy left. The counts and times stay, for `metadata()`."""
+        wav = wav_bytes(self._buf)
+        self.release()
+        return wav
+
+    def release(self) -> None:
+        """Let go of the audio. The counts and times stay, for `metadata()`."""
+        self._buf = bytearray()
+
 
 class CallRecorder:
     """Both tracks of one call, with times measured from `start()` on `clock` (in seconds)."""
@@ -89,6 +100,14 @@ class CallRecorder:
         track = self.candidate if direction == "candidate" else self.interviewer
         track.append(frame, (self._clock() - self._t0) * 1000)
 
+    def tracks(self) -> tuple[tuple[str, TrackRecorder], ...]:
+        return (("candidate", self.candidate), ("interviewer", self.interviewer))
+
+    def release(self) -> None:
+        """Let go of both tracks' audio. The counts and times stay, for `metadata()`."""
+        for _, track in self.tracks():
+            track.release()
+
     def metadata(self) -> dict:
         return {
             name: {
@@ -96,7 +115,7 @@ class CallRecorder:
                 "dropped": track.dropped,
                 "first_frame_ms": track.first_frame_ms,
             }
-            for name, track in (("candidate", self.candidate), ("interviewer", self.interviewer))
+            for name, track in self.tracks()
         }
 
 
@@ -108,17 +127,23 @@ async def upload_recording(
     Never raises: a call that cannot be recorded still has its report. On any failure the
     interview's `recording` says `upload_failed` and the log gets the exception type only,
     because a storage error can carry the project URL or the service key (ruling R19).
+
+    The recorder lets go of its audio as it goes, and all of it by the end whatever happened, so
+    a finished call's audio is never kept in memory after its upload, by anything that still
+    holds the recorder.
     """
     try:
         base = f"interviews/{interview_id}"
-        # One track at a time, each WAV built once, so a 20-minute track (about 40 MB) is never
-        # held in more than one extra copy at once.
-        await audio.put_wav(f"{base}/candidate.wav", wav_bytes(recorder.candidate.pcm()))
-        await audio.put_wav(f"{base}/interviewer.wav", wav_bytes(recorder.interviewer.pcm()))
+        # One track at a time. Building a track's WAV lets go of its audio, so a 20-minute track
+        # (about 40 MB) is held twice only while its WAV is built, and once while it uploads.
+        for name, track in recorder.tracks():
+            await audio.put_wav(f"{base}/{name}.wav", track.take_wav())
         recording = {"status": "uploaded", **recorder.metadata()}
     except Exception as exc:
         log.error("could not upload the recording: %s", type(exc).__name__)
         recording = {"status": "upload_failed"}
+    finally:
+        recorder.release()
     try:
         await store.update_interview(interview_id, recording=recording)
     except Exception as exc:

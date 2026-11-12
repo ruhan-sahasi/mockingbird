@@ -9,8 +9,10 @@ Vapi's text frames here have the shapes recorded in fixtures/vapi/ws_text_frames
 """
 
 import asyncio
+import gc
 import json
 import logging
+import weakref
 from pathlib import Path
 
 import pytest
@@ -709,6 +711,31 @@ async def test_on_audio_exception_does_not_stop_relaying(caplog):
     logged = [r.getMessage() + (r.exc_text or "") for r in caplog.records]
     assert any("RuntimeError" in line for line in logged)
     assert not [line for line in logged if CALL_ID in line or "recorder bug" in line]
+
+
+async def test_a_relay_that_ended_is_freed_without_the_garbage_collector():
+    # The callbacks reach everything the call holds, its recorded audio included. The way run()
+    # stops its TaskGroup leaves a loop of references that only the garbage collector frees,
+    # unless run() breaks it, so this runs with the collector off.
+    class Recorder:
+        def on_audio(self, direction: str, frame: bytes) -> None:
+            pass
+
+    recorder = Recorder()
+    alive = weakref.ref(recorder)
+    gc.disable()
+    try:
+        relay, browser, vapi = make_relay(on_audio=recorder.on_audio)
+        del recorder
+        task = await start(relay)
+        browser.incoming.put_nowait(MIC_1)
+        assert await vapi.next_sent() == MIC_1
+        await relay.end("plan_done")
+        assert await finished(task) == "plan_done"
+        del relay, task
+        assert alive() is None
+    finally:
+        gc.enable()
 
 
 async def test_logs_never_hold_frame_contents(caplog):

@@ -14,6 +14,7 @@ whatever the route is still doing.
 
 import asyncio
 import functools
+import gc
 import io
 import json
 import logging
@@ -21,6 +22,7 @@ import queue
 import threading
 import time
 import wave
+import weakref
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -572,6 +574,35 @@ def test_a_call_records_and_uploads_both_tracks(client, app, fakes):
     assert recording["status"] == "uploaded"
     assert recording["candidate"]["frames"] == 5
     assert recording["interviewer"]["frames"] == 3
+
+
+def test_a_finished_calls_audio_is_freed_without_waiting_for_the_garbage_collector(
+    client, app, fakes
+):
+    # The session and its relay point at each other (the relay's live events read the session),
+    # and both reach the recorder. Unless the clean-up breaks that loop, a finished call's audio,
+    # tens of MB, stays in memory until Python's next full garbage collection. So this runs with
+    # the collector off: only reference counting can free the recorder.
+    body = start(client)
+    interview_id = body["interview_id"]
+    gc.disable()
+    try:
+        with client.websocket_connect(body["ws_path"]) as ws:
+            client.portal.call(fakes.vapi_socket.wait_reading)
+            recorder = weakref.ref(app.state.registry.by_interview(interview_id).recorder)
+            for _ in range(5):
+                ws.send_bytes(MIC)
+            wait_until(lambda: fakes.vapi_socket.sent.count(MIC) == 5)
+            client.portal.call(fakes.vapi_socket.deliver, VOICE)
+            assert ws.receive_bytes() == VOICE
+            hang_up(app, ws, interview_id)
+
+        wait_until(lambda: get(client, fakes.store, interview_id).recording is not None)
+        wait_until(lambda: not app.state.background)
+        wait_until(lambda: recorder() is None)
+    finally:
+        gc.enable()
+    assert get(client, fakes.store, interview_id).recording["status"] == "uploaded"
 
 
 def test_upload_failure_still_builds_the_report(client, app, fakes, caplog):

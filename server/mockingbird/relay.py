@@ -252,8 +252,12 @@ class Relay:
                 tg.create_task(self._end_at_cap())
                 tg.create_task(self._ping_browser())
                 tg.create_task(self._stop_when_ending())
-        except* _Stopped:
-            pass
+        except* _Stopped as stopped:
+            # Python 3.12's TaskGroup keeps the group it raises in a local of its own frame,
+            # which that group's traceback holds: a loop only the garbage collector frees. The
+            # traceback also reaches this frame and the route's, so everything the call holds,
+            # its recorded audio included, would wait for that. Clearing the frames breaks it.
+            traceback.clear_frames(stopped.__traceback__)
         finally:
             # Normally end() has already started the hang-up, and this waits for it to finish.
             # Otherwise a task failed or run() was cancelled, and this hangs up now.
