@@ -15,6 +15,10 @@ that is never spoken leaves no trace. The candidate's words are another matter: 
 ends before the interviewer replies to their newest answer, `finalize()` still records that
 answer, so it is graded with the rest.
 
+A draft can carry a latency `TurnTrace` (tracing.py). The trace is only carried, never stamped
+here: when the draft's reply is written down as an interviewer turn, the trace gets that turn's
+idx, which is what makes it count. A draft that is never spoken leaves its trace without one.
+
 The history is append-only and always settles into a shape the Claude API accepts: it starts with
 a user message, and every system message sits right after a user message and right before an
 assistant message. That holds because a user, system and assistant message are only ever added
@@ -31,6 +35,7 @@ from typing import Literal
 from mockingbird.claude import BrainError, ClaudeStreamer
 from mockingbird.models import Turn
 from mockingbird.plan import InterviewPlan, Move, MoveKind
+from mockingbird.tracing import TurnTrace
 
 log = logging.getLogger(__name__)
 
@@ -203,6 +208,7 @@ class _Draft:
     instruction: str | None  # the system message Claude was sent; None for the wrap-up
     chunks: list[str] = field(default_factory=list)  # everything produced so far
     produced: bool = False  # the whole line has been produced, not cut short
+    trace: TurnTrace | None = None  # this reply's latency stamps, if the caller traces it
 
 
 class Brain:
@@ -226,6 +232,7 @@ class Brain:
         # the whole answer so far, so the newest one has all of it that Vapi heard. finalize()
         # records it when the call ends before the interviewer replied to it.
         self._unanswered: _Draft | None = None
+        self._committing_trace: TurnTrace | None = None
 
     @property
     def history(self) -> list[dict]:
@@ -242,6 +249,11 @@ class Brain:
         """True once the wrap-up has been spoken. A drafted wrap-up does not count."""
         return self._plan.finished
 
+    @property
+    def committing_trace(self) -> TurnTrace | None:
+        """The trace of the draft the last successful `commit_spoken()` adopted, or None."""
+        return self._committing_trace
+
     def start(self) -> str:
         """Start the clock, seed the history, and return the opening line."""
         if self._started_at is not None:
@@ -254,13 +266,18 @@ class Brain:
         return opening
 
     async def draft(
-        self, candidate_text: str, spoken_assistant_text: str | None
+        self,
+        candidate_text: str,
+        spoken_assistant_text: str | None,
+        trace: TurnTrace | None = None,
     ) -> AsyncIterator[str]:
         """Draft the next line for what the candidate has said so far, and stream it.
 
         `candidate_text` is the whole answer so far. `spoken_assistant_text` is the words Vapi
-        says it spoke of the last reply, or None. Nothing real changes here: the move is worked
-        out on a copy of the plan, and the reply is held as a draft until `commit_spoken()`.
+        says it spoke of the last reply, or None. `trace` rides along with the draft, and gets
+        the interviewer turn's idx if the reply is spoken. Nothing real changes here: the move is
+        worked out on a copy of the plan, and the reply is held as a draft until
+        `commit_spoken()`.
 
         The first three steps run before the first await, so a draft that was cancelled a
         moment ago can never interleave with them. The caller cancels the old task before it
@@ -290,6 +307,7 @@ class Brain:
             candidate_text=candidate_text,
             heard=candidate_text if candidate_text.strip() else NO_SPEECH_NOTE,
             instruction=None if move.kind is MoveKind.WRAP_UP else _instruction(move),
+            trace=trace,
         )
         self._pending = draft
         self._unanswered = draft
@@ -370,6 +388,7 @@ class Brain:
         self._unanswered = None  # the pending draft is the newest one, and its answer is a turn now
         self._plan = draft.plan
         self._committed = draft
+        self._committing_trace = draft.trace
         self._add_turn("candidate", draft.candidate_text, draft.answering_idx)
         return True
 
@@ -417,12 +436,14 @@ class Brain:
         if draft.instruction is not None:
             self._history.append({"role": "system", "content": draft.instruction})
         self._history.append({"role": "assistant", "content": text})
-        self._add_turn(
+        turn = self._add_turn(
             "interviewer",
             text,
             draft.move.question_idx,
             interrupted=cut_short or not draft.produced,
         )
+        if draft.trace is not None:
+            draft.trace.turn_idx = turn.idx
 
     def _add_turn(
         self,
@@ -430,5 +451,7 @@ class Brain:
         text: str,
         question_idx: int,
         interrupted: bool = False,
-    ) -> None:
-        self._turns.append(Turn(len(self._turns), speaker, text, question_idx, interrupted))
+    ) -> Turn:
+        turn = Turn(len(self._turns), speaker, text, question_idx, interrupted)
+        self._turns.append(turn)
+        return turn

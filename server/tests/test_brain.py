@@ -22,6 +22,7 @@ from mockingbird.brain import (
 from mockingbird.claude import AnthropicStreamer, BrainError, make_anthropic_client
 from mockingbird.models import Turn
 from mockingbird.plan import DEMO, FULL, InterviewPlan, Move, MoveKind, PlanConfig, Question
+from mockingbird.tracing import TurnTrace
 
 CONNECT_NOTE = {"role": "user", "content": "(The call has connected.)"}
 LONG_ANSWER = "I led the migration " + "and kept every team informed " * 6  # well over 25 words
@@ -1032,6 +1033,58 @@ async def test_wrap_up_turn_belongs_to_the_question_in_progress():
         ("interviewer", 0),
     ]
     assert turns[-1].text == WRAP_UP_LINE
+
+
+# --- latency traces -----------------------------------------------------------
+
+
+async def traced(brain: Brain, text: str, spoken: str | None = None) -> TurnTrace:
+    """Draft a reply with a trace of its own, take all of it, and return the trace."""
+    trace = TurnTrace()
+    async for _ in brain.draft(text, spoken, trace=trace):
+        pass
+    return trace
+
+
+async def test_the_committed_drafts_trace_gets_its_interviewer_turns_idx():
+    brain, _ = started(DEMO, FakeStreamer(["Tell me more."], ["And then?"]))
+    assert brain.committing_trace is None
+
+    first = await traced(brain, "I led the migration.")
+    assert brain.commit_spoken() is True
+    assert brain.committing_trace is first
+    assert first.turn_idx is None  # the turn is written down only by the next draft
+
+    second = await traced(brain, "It shipped.", "Tell me more.")
+    assert brain.turns[first.turn_idx] == Turn(2, "interviewer", "Tell me more.", 0)
+    assert brain.commit_spoken() is True
+    assert brain.committing_trace is second
+
+    brain.finalize()
+    assert brain.turns[second.turn_idx] == Turn(4, "interviewer", "And then?", 0)
+
+
+async def test_a_dropped_drafts_trace_never_gets_a_turn_idx():
+    brain, _ = started(DEMO, FakeStreamer(["One."], ["Two."], ["Three."]))
+    dropped = await traced(brain, "I led")  # Vapi asked again before speaking it
+    spoken = await traced(brain, "I led the migration.")
+    assert brain.commit_spoken() is True
+    unspoken = await traced(brain, "It shipped.", "Two.")  # the call ends before it is spoken
+    brain.finalize()
+
+    assert dropped.turn_idx is None
+    assert spoken.turn_idx == 2
+    assert brain.turns[2].text == "Two."
+    assert unspoken.turn_idx is None
+    assert brain.committing_trace is spoken
+
+
+async def test_a_failed_commit_keeps_the_last_committing_trace():
+    brain, _ = started(DEMO, FakeStreamer(["Tell me more."]))
+    trace = await traced(brain, "I led the migration.")
+    assert brain.commit_spoken() is True
+    assert brain.commit_spoken() is False
+    assert brain.committing_trace is trace
 
 
 # --- any order of drafts, commits, cancels and finalizes ---------------------

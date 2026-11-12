@@ -51,8 +51,9 @@ from mockingbird.sessions import (
 )
 from mockingbird.sse import SSE_DONE
 from mockingbird.store import MemoryStore
+from mockingbird.tracing import CallTracer
 from mockingbird.vapi_client import VapiCall, VapiError
-from mockingbird.vapi_types import LlmRequest
+from mockingbird.vapi_types import LlmRequest, SpeechUpdate, UserInterrupted
 
 BRAIN_SECRET = "test-brain-secret"
 WEBHOOK_SECRET = "test-webhook-secret"
@@ -77,6 +78,7 @@ def frame(**fields) -> str:
 ASSISTANT_STARTED = frame(type="speech-update", status="started", role="assistant", turn=1)
 ASSISTANT_STOPPED = frame(type="speech-update", status="stopped", role="assistant", turn=1)
 USER_STARTED = frame(type="speech-update", status="started", role="user", turn=2)
+USER_STOPPED = frame(type="speech-update", status="stopped", role="user", turn=2)
 
 
 class FakeStreamer:
@@ -952,6 +954,167 @@ def test_overlapping_llm_requests_commit_only_the_spoken_one(client, app, fakes)
         assert [m["content"] for m in history if m["role"] == "assistant"][1:] == [DEFAULT_LINE]
 
         hang_up(app, ws, interview_id)
+
+
+# --- latency tracing ---------------------------------------------------------------------------
+
+
+def test_a_spoken_reply_is_traced_hop_by_hop_and_stored(client, app, fakes):
+    body = start(client)
+    interview_id = body["interview_id"]
+
+    with client.websocket_connect(body["ws_path"]) as ws:
+        client.portal.call(fakes.vapi_socket.wait_reading)
+        # Vapi speaks the opening line itself, so no request was traced for it.
+        client.portal.call(fakes.vapi_socket.deliver, ASSISTANT_STARTED)
+        client.portal.call(fakes.vapi_socket.deliver, VOICE)
+        assert ws.receive_bytes() == VOICE
+        client.portal.call(fakes.vapi_socket.deliver, ASSISTANT_STOPPED)
+
+        client.portal.call(fakes.vapi_socket.deliver, USER_STOPPED)
+        assert said(ask(client, "I wrote the plan and shipped it.")) == DEFAULT_LINE
+        client.portal.call(fakes.vapi_socket.deliver, ASSISTANT_STARTED)
+        client.portal.call(fakes.vapi_socket.deliver, VOICE)
+        assert ws.receive_bytes() == VOICE
+        hang_up(app, ws, interview_id)
+
+    since = datetime.now(UTC) - timedelta(days=1)
+    [trace] = client.portal.call(fakes.store.list_latency_traces, since)
+    turns = client.portal.call(fakes.store.list_turns, interview_id)
+    assert (turns[trace.turn_idx].speaker, turns[trace.turn_idx].text) == (
+        "interviewer",
+        DEFAULT_LINE,
+    )
+    assert trace.user_stopped_ms is not None
+    assert trace.user_stopped_ms <= trace.request_ms <= trace.first_token_ms
+    assert trace.first_token_ms <= trace.first_chunk_ms <= trace.assistant_started_ms
+    assert trace.assistant_started_ms <= trace.first_audio_ms
+    assert trace.cut_in is False
+    # The browser's two numbers come in a later step.
+    assert trace.browser_stop_to_audible_ms is None
+    assert trace.interrupt_to_silence_ms is None
+
+
+class StepClock:
+    """Seconds, moved by hand, for a tracer driven straight from a test."""
+
+    def __init__(self) -> None:
+        self.now = 500.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+async def test_the_live_events_feed_the_calls_tracer():
+    session = make_session(make_interview_record("i1"))
+    session.brain.start()
+    clock = StepClock()
+    session.tracer = CallTracer(clock)
+    session.tracer.start()
+    on_event = routes_ws._live_events(session)
+
+    clock.now += 1.0
+    await on_event(SpeechUpdate(None, "user", "stopped"))
+    clock.now += 0.5
+    events = await collect(routes_vapi.start_reply(session, LlmRequest(CALL_ID, "I led it.", None)))
+    assert any(DEFAULT_LINE in event for event in events)
+    clock.now += 0.5
+    await on_event(SpeechUpdate(None, "assistant", "started"))
+    trace = session.brain.committing_trace
+    assert (trace.user_stopped_ms, trace.request_ms, trace.assistant_started_ms) == (
+        1000.0,
+        1500.0,
+        2000.0,
+    )
+    assert trace.first_token_ms == trace.first_chunk_ms == 1500.0
+
+    clock.now += 1.0  # inside the 1500 ms window
+    await on_event(UserInterrupted(None))
+    assert trace.cut_in is True
+
+    session.brain.finalize()
+    assert session.tracer.committed() == [trace]
+    assert trace.turn_idx == 2
+
+
+async def test_a_session_without_a_tracer_still_handles_every_live_event():
+    # Sessions built before the call goes live, and many tests, have no tracer.
+    session = make_session(make_interview_record("i1"))
+    session.brain.start()
+    on_event = routes_ws._live_events(session)
+
+    await on_event(SpeechUpdate(None, "user", "stopped"))
+    await collect(routes_vapi.start_reply(session, LlmRequest(CALL_ID, "I led it.", None)))
+    await on_event(SpeechUpdate(None, "assistant", "started"))
+    await on_event(UserInterrupted(None))
+
+    assert [t.speaker for t in session.brain.turns] == ["interviewer", "candidate"]
+
+
+def test_one_audio_listener_failing_never_starves_the_other(caplog):
+    heard = []
+
+    def broken(direction: str, frame: bytes) -> None:
+        raise RuntimeError("listener said secret-detail")
+
+    on_audio = routes_ws._fan_out(broken, lambda direction, frame: heard.append(direction))
+    on_audio("interviewer", VOICE)
+    on_audio("candidate", MIC)
+
+    assert heard == ["interviewer", "candidate"]
+    assert "RuntimeError" in caplog.text
+    assert "secret-detail" not in caplog.text
+
+
+@pytest.mark.parametrize("stamp", ["new_trace", "first_token", "first_chunk"])
+def test_a_tracer_that_breaks_never_cuts_off_the_reply(
+    client, app, fakes, monkeypatch, caplog, stamp
+):
+    def broken(self, *args):
+        raise RuntimeError("tracer said secret-detail")
+
+    monkeypatch.setattr(routes_ws, "CallTracer", type("Broken", (CallTracer,), {stamp: broken}))
+    body = start(client)
+    interview_id = body["interview_id"]
+
+    with client.websocket_connect(body["ws_path"]) as ws:
+        client.portal.call(fakes.vapi_socket.wait_reading)
+        assert said(ask(client, "I led the migration.")) == DEFAULT_LINE  # every chunk, then DONE
+        client.portal.call(fakes.vapi_socket.deliver, ASSISTANT_STARTED)
+        hang_up(app, ws, interview_id)
+
+    report_url = f"/api/interviews/{interview_id}/report"
+    wait_until(lambda: client.get(report_url).status_code == 200)
+    turns = client.portal.call(fakes.store.list_turns, interview_id)
+    assert [(t.speaker, t.text) for t in turns][1:] == [
+        ("candidate", "I led the migration."),
+        ("interviewer", DEFAULT_LINE),
+    ]
+    failures = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert failures == ["tracing a reply failed: RuntimeError"]
+    assert "secret-detail" not in caplog.text
+
+
+def test_a_trace_write_that_fails_is_logged_and_the_clean_up_goes_on(client, app, fakes, caplog):
+    async def failing_write(interview_id, traces):
+        raise RuntimeError("database said secret-detail")
+
+    fakes.store.add_latency_traces = failing_write
+    body = start(client)
+    interview_id = body["interview_id"]
+
+    with client.websocket_connect(body["ws_path"]) as ws:
+        client.portal.call(fakes.vapi_socket.wait_reading)
+        assert said(ask(client, "I led the migration.")) == DEFAULT_LINE
+        client.portal.call(fakes.vapi_socket.deliver, ASSISTANT_STARTED)
+        hang_up(app, ws, interview_id)
+
+    report_url = f"/api/interviews/{interview_id}/report"
+    wait_until(lambda: client.get(report_url).status_code == 200)
+    turns = client.portal.call(fakes.store.list_turns, interview_id)
+    assert [t.speaker for t in turns] == ["interviewer", "candidate", "interviewer"]
+    assert "could not save the latency traces: RuntimeError" in caplog.text
+    assert "secret-detail" not in caplog.text
 
 
 # --- POST /vapi/llm/{secret}/chat/completions --------------------------------------------------

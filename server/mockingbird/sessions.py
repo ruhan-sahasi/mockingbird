@@ -48,6 +48,7 @@ from mockingbird.models import Interview
 from mockingbird.recording import CallRecorder
 from mockingbird.relay import Relay
 from mockingbird.store import Store
+from mockingbird.tracing import CallTracer
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +77,7 @@ class LiveSession:
     token_expires_at: float  # by the registry's clock
     relay: Relay | None = None
     recorder: CallRecorder | None = None  # both tracks of the call, once it is live
+    tracer: CallTracer | None = None  # each reply's latency, from the moment the call is live
     call_id: str | None = field(default=None, repr=False)
     reply_task: asyncio.Task | None = None  # the brain reply now streaming to Vapi, if any
 

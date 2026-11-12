@@ -27,6 +27,7 @@ from typing import Any, Protocol, get_args
 import asyncpg
 
 from mockingbird.models import Interview, Mode, Status, Turn
+from mockingbird.tracing import TurnTrace
 
 Clock = Callable[[], datetime]
 
@@ -44,6 +45,8 @@ _INTERVIEW_COLUMNS = (
     "id, mode, status, visitor_hash, ip_hash, cap_s, questions, created_at,"
     " vapi_call_id, ended_reason, duration_s, recording"
 )
+# Every field of a TurnTrace, which is also a column of latency_traces of the same name.
+_TRACE_FIELDS = tuple(f.name for f in fields(TurnTrace))
 
 
 def utc_now() -> datetime:
@@ -99,6 +102,17 @@ class Store(Protocol):
 
     async def get_report(self, interview_id: str) -> dict | None: ...
 
+    async def add_latency_traces(self, interview_id: str, traces: list[TurnTrace]) -> None:
+        """Keep the latency traces of an interview's spoken replies, stamped with the store's
+        "now". All or nothing. Raises ValueError for a trace with no turn_idx, or one the
+        interview already has a trace for."""
+        ...
+
+    async def list_latency_traces(self, since: datetime) -> list[TurnTrace]:
+        """Every interview's traces kept at or after `since`, oldest first. Raises ValueError
+        if `since` has no timezone."""
+        ...
+
     async def seconds_used_today(self) -> int:
         """Demo seconds spent or promised today: `duration_s` of each finished demo interview,
         plus `cap_s` of each demo that is live right now, plus `cap_s` of each demo created today
@@ -143,8 +157,9 @@ class Store(Protocol):
     async def delete_demo_data_older_than(
         self, days: int, *, audio_deleted: Collection[str], vapi_deleted: Collection[str] = ()
     ) -> int:
-        """Delete demo interviews created more than `days` days ago, with their turns, scores
-        and quotes. Full-mode interviews are kept. Returns how many interviews it deleted.
+        """Delete demo interviews created more than `days` days ago, with their turns, scores,
+        quotes and latency traces. Full-mode interviews are kept. Returns how many interviews it
+        deleted.
 
         Two allowlists say what is safe to delete, and a row goes only when both agree. An
         interview must be in `audio_deleted`, the ids whose recording is gone from storage: the
@@ -197,6 +212,25 @@ def _check_fields(changes: dict[str, Any]) -> None:
         raise ValueError(f"cannot update interview field(s): {', '.join(sorted(unknown))}")
 
 
+def _check_traces(interview_id: str, traces: list[TurnTrace], taken: Collection[int]) -> None:
+    """Each trace needs a turn_idx, and no two may share one, in the write or already kept."""
+    seen = set(taken)
+    for trace in traces:
+        if trace.turn_idx is None:
+            raise ValueError("a latency trace needs a turn_idx")
+        if trace.turn_idx in seen:
+            raise ValueError(
+                f"interview {interview_id} already has a latency trace for turn_idx "
+                f"{trace.turn_idx}"
+            )
+        seen.add(trace.turn_idx)
+
+
+def _check_since(since: datetime) -> None:
+    if since.tzinfo is None:
+        raise ValueError("since must have a timezone")
+
+
 class MemoryStore:
     """Keeps everything in dicts. It hands out copies, as a database would, so changing what
     you got back never changes what is stored. It keeps the report as one piece and does not
@@ -207,6 +241,8 @@ class MemoryStore:
         self._interviews: dict[str, Interview] = {}
         self._turns: dict[str, dict[int, Turn]] = {}
         self._reports: dict[str, dict] = {}
+        # By interview, then turn_idx: when it was kept, and the trace.
+        self._traces: dict[str, dict[int, tuple[datetime, TurnTrace]]] = {}
 
     async def create_interview(self, i: Interview) -> None:
         _check_new(i)
@@ -262,6 +298,26 @@ class MemoryStore:
     async def get_report(self, interview_id: str) -> dict | None:
         report = self._reports.get(interview_id)
         return None if report is None else copy.deepcopy(report)
+
+    async def add_latency_traces(self, interview_id: str, traces: list[TurnTrace]) -> None:
+        if interview_id not in self._interviews:
+            raise KeyError(interview_id)
+        kept = self._traces.setdefault(interview_id, {})
+        _check_traces(interview_id, traces, kept)
+        now = self._clock()
+        for trace in traces:
+            kept[trace.turn_idx] = (now, replace(trace))
+
+    async def list_latency_traces(self, since: datetime) -> list[TurnTrace]:
+        _check_since(since)
+        rows = [
+            (kept_at, interview_id, turn_idx, trace)
+            for interview_id, traces in self._traces.items()
+            for turn_idx, (kept_at, trace) in traces.items()
+            if kept_at >= since
+        ]
+        rows.sort(key=lambda row: row[:3])
+        return [replace(trace) for *_, trace in rows]
 
     async def seconds_used_today(self) -> int:
         start, end = _utc_day(self._clock())
@@ -342,6 +398,7 @@ class MemoryStore:
             del self._interviews[id]
             self._turns.pop(id, None)
             self._reports.pop(id, None)
+            self._traces.pop(id, None)
         return len(old)
 
 
@@ -508,6 +565,38 @@ class PostgresStore:
         )
         return None if report is None else json.loads(report)
 
+    async def add_latency_traces(self, interview_id: str, traces: list[TurnTrace]) -> None:
+        # Checked here too, so a repeat within one write is refused before anything is sent.
+        _check_traces(interview_id, traces, ())
+        now = self._clock()
+        columns = ", ".join(_TRACE_FIELDS)
+        params = ", ".join(f"${n}" for n in range(3, len(_TRACE_FIELDS) + 3))
+        try:
+            # executemany is atomic: one refused row and none are kept.
+            await self._pool.executemany(
+                f"insert into latency_traces (interview_id, created_at, {columns})"
+                f" values ($1, $2, {params})",
+                [
+                    (interview_id, now, *(getattr(trace, name) for name in _TRACE_FIELDS))
+                    for trace in traces
+                ],
+            )
+        except asyncpg.ForeignKeyViolationError as exc:
+            raise KeyError(interview_id) from exc
+        except asyncpg.UniqueViolationError as exc:
+            raise ValueError(
+                f"interview {interview_id} already has a latency trace for one of these turn_idx"
+            ) from exc
+
+    async def list_latency_traces(self, since: datetime) -> list[TurnTrace]:
+        _check_since(since)
+        rows = await self._pool.fetch(
+            f"select {', '.join(_TRACE_FIELDS)} from latency_traces"
+            " where created_at >= $1 order by created_at, interview_id, turn_idx",
+            since,
+        )
+        return [TurnTrace(**row) for row in rows]
+
     async def seconds_used_today(self) -> int:
         start, end = _utc_day(self._clock())
         return await self._pool.fetchval(
@@ -580,7 +669,8 @@ class PostgresStore:
         self, days: int, *, audio_deleted: Collection[str], vapi_deleted: Collection[str] = ()
     ) -> int:
         cutoff = self._clock() - timedelta(days=days)
-        # The turns, scores and quotes go with their interview (on delete cascade).
+        # The turns, scores, quotes and latency traces go with their interview (on delete
+        # cascade).
         return await self._pool.fetchval(
             "with gone as (delete from interviews where mode = 'demo' and created_at < $1"
             "   and (vapi_call_id is null or vapi_call_id = any($2::text[]))"

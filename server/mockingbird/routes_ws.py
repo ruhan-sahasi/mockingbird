@@ -6,8 +6,14 @@ audio socket, the interview is marked live, and the relay runs until the call en
 is wrong, used already or expired gets the socket closed with code 4401 (Review Focus 5).
 
 While the call runs, the relay hands the route Vapi's live events (Amendment 1):
-- the interviewer started speaking: the brain commits the reply Vapi is speaking;
+- the candidate stopped speaking: the call's tracer notes when;
+- the interviewer started speaking: the brain commits the reply Vapi is speaking, and the tracer
+  starts timing that reply's audio (or, for a line no draft was committed for, such as the
+  opening line, an untimed trace that is never measured);
+- the candidate interrupted: the tracer checks whether it was a cut-in;
 - the interviewer stopped speaking after the wrap-up was committed: the call ends, "plan_done".
+Every audio frame the relay passes goes to the recorder and then the tracer, each on its own, so
+a failure in one never starves the other.
 
 When the call ends, the interview is marked ended with how long it ran and why. That happens in
 the relay's hang-up, before the browser is told the call ended, because the browser's next step
@@ -15,7 +21,8 @@ is to ask for the report, and a report is only "on its way" for an ended intervi
 the clean-up runs in a `finally`, as does the ended mark if the hang-up could not write it:
 `run()` can also raise (an ExceptionGroup when a relay task failed, CancelledError on shutdown),
 and the interview must not be left live. Its turns are saved, the session is removed and the
-report is graded in the background.
+report is graded in the background. The latency traces of the replies that became turns are
+saved once the brain has written its last turn down.
 
 A call that never went live (Vapi refused it, or its socket would not connect) is marked
 `abandoned` instead and gets no report: nobody was interviewed, so the visitor's demo is not
@@ -38,12 +45,20 @@ from fastapi import APIRouter, WebSocket
 from mockingbird.failures import describe
 from mockingbird.models import Turn
 from mockingbird.recording import CallRecorder, upload_recording
-from mockingbird.relay import LiveEvent, OnEvent, Relay, StarletteSocket, WebsocketsSocket
+from mockingbird.relay import (
+    LiveEvent,
+    OnAudio,
+    OnEvent,
+    Relay,
+    StarletteSocket,
+    WebsocketsSocket,
+)
 from mockingbird.report import build_report
 from mockingbird.sessions import LiveSession
 from mockingbird.store import Store
+from mockingbird.tracing import CallTracer
 from mockingbird.vapi_client import build_assistant
-from mockingbird.vapi_types import SpeechUpdate
+from mockingbird.vapi_types import SpeechUpdate, UserInterrupted
 
 log = logging.getLogger(__name__)
 
@@ -117,18 +132,21 @@ async def _run_call(websocket: WebSocket, session: LiveSession) -> None:
             call.websocket_url, close_timeout=VAPI_CLOSE_TIMEOUT_S
         )
         recorder = CallRecorder(time.monotonic, interview.cap_s)
+        tracer = CallTracer(time.monotonic)
         session.recorder = recorder
+        session.tracer = tracer
         session.relay = Relay(
             StarletteSocket(websocket),
             WebsocketsSocket(connection),
             cap_s=interview.cap_s,
             on_event=_live_events(session),
             on_end=ending.record,
-            on_audio=recorder.on_audio,
+            on_audio=_fan_out(recorder.on_audio, tracer.on_audio),
         )
         await state.store.update_interview(interview.id, status="live")
         ending.live_since = time.monotonic()
         recorder.start()
+        tracer.start()
         reason = await session.relay.run()
     except Exception as exc:
         # Mostly the type: a library's message can hold the socket URL, which holds the call id.
@@ -139,17 +157,42 @@ async def _run_call(websocket: WebSocket, session: LiveSession) -> None:
 
 def _live_events(session: LiveSession) -> OnEvent:
     async def on_event(event: LiveEvent) -> None:
+        tracer = session.tracer
         match event:
+            case SpeechUpdate(role="user", status="stopped"):
+                if tracer is not None:
+                    tracer.user_stopped()
             case SpeechUpdate(role="assistant", status="started"):
                 # Vapi speaks the reply to its latest request, which is the brain's pending draft.
-                session.brain.commit_spoken()
+                committed = session.brain.commit_spoken()
+                if tracer is not None:
+                    tracer.assistant_started(session.brain.committing_trace if committed else None)
             case SpeechUpdate(role="assistant", status="stopped") if session.brain.finished:
                 # The wrap-up line has been said (or cut off): the interview is over.
                 await session.relay.end("plan_done")
+            case UserInterrupted():
+                if tracer is not None:
+                    tracer.user_interrupted()
             case _:
                 log.debug("no action for a %s event", type(event).__name__)
 
     return on_event
+
+
+def _fan_out(*listeners: OnAudio) -> OnAudio:
+    """One audio tap for the relay that hands each frame to every listener in turn. Each is
+    tried on its own, so one that fails never starves the rest. The log names the listener and
+    the exception type only, never a message (ruling R19)."""
+
+    def on_audio(direction: str, frame: bytes) -> None:
+        for listener in listeners:
+            try:
+                listener(direction, frame)
+            except Exception as exc:
+                name = getattr(listener, "__qualname__", type(listener).__name__)
+                log.error("%s failed on a %s frame: %s", name, direction, type(exc).__name__)
+
+    return on_audio
 
 
 async def _clean_up(
@@ -179,6 +222,12 @@ async def _clean_up(
     # Normally the hang-up has marked it ended already, and this does nothing.
     await _attempt("mark the interview ended", ending.record(reason))
     await _attempt("save the turns", _save_turns(store, interview_id, session.brain.turns))
+    if session.tracer is not None:
+        # After finalize(), which gives the last spoken reply its turn idx.
+        await _attempt(
+            "save the latency traces",
+            store.add_latency_traces(interview_id, session.tracer.committed()),
+        )
     state.registry.remove(interview_id)
     if session.recorder is not None:
         _in_background(
