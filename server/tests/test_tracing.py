@@ -189,6 +189,40 @@ def test_an_interruption_within_1500_ms_of_the_start_is_a_cut_in(tracer, clock, 
     assert trace.cut_in is cut_in
 
 
+@pytest.mark.parametrize(("talk_over_ms", "cut_in"), [(0, True), (1500, True), (1500.5, False)])
+def test_the_browsers_talk_over_decides_the_cut_in_over_vapis_stand_in(
+    tracer, clock, talk_over_ms, cut_in
+):
+    # Vapi says user-interrupted 0.3 s into the reply as it started it, which stands in for a
+    # cut-in. Then the browser, which heard the reply start later than Vapi started it, says how
+    # far into what the candidate heard the cut-in came, and that is what counts.
+    trace = spoken_reply(tracer)
+    clock.advance(0.3)
+    tracer.user_interrupted()
+    assert trace.cut_in is True
+    tracer.browser_timing({"type": "timing", "talk_over_ms": talk_over_ms})
+    assert (trace.talk_over_ms, trace.cut_in) == (talk_over_ms, cut_in)
+
+
+def test_vapis_stand_in_never_overrules_the_browsers_talk_over(tracer, clock):
+    trace = spoken_reply(tracer)
+    tracer.browser_timing({"type": "timing", "talk_over_ms": 2400})
+    clock.advance(0.5)
+    tracer.user_interrupted()  # a second interruption, inside Vapi's window
+    assert trace.cut_in is False
+
+
+def test_the_first_talk_over_wins_and_a_bad_one_leaves_the_stand_in(tracer, clock):
+    trace = spoken_reply(tracer)
+    tracer.user_interrupted()
+    tracer.browser_timing({"type": "timing", "talk_over_ms": -5})
+    tracer.browser_timing({"type": "timing", "talk_over_ms": "300"})
+    assert (trace.talk_over_ms, trace.cut_in) == (None, True)
+    tracer.browser_timing({"type": "timing", "talk_over_ms": 2400})
+    tracer.browser_timing({"type": "timing", "talk_over_ms": 100})
+    assert (trace.talk_over_ms, trace.cut_in) == (2400, False)
+
+
 def test_the_opening_lines_untimed_trace_never_appears_in_committed(tracer, clock):
     # Vapi speaks the opening line itself, so no request was traced for it. Its events attach to
     # an untimed trace that no turn ever claims (Review Focus 3).

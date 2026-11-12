@@ -43,6 +43,8 @@ export type Timing = {
   stop_to_audible_ms?: number
   // From the candidate talking over the interviewer to the interviewer going quiet.
   interrupt_to_silence_ms?: number
+  // From the interviewer's reply first being heard to the candidate starting to talk over it.
+  talk_over_ms?: number
 }
 
 /** The text frame that reports a turn's timing to the server, with only the numbers measured. */
@@ -54,5 +56,6 @@ export function timingMessage(timing: Timing): string {
   if (timing.interrupt_to_silence_ms !== undefined) {
     message.interrupt_to_silence_ms = timing.interrupt_to_silence_ms
   }
+  if (timing.talk_over_ms !== undefined) message.talk_over_ms = timing.talk_over_ms
   return JSON.stringify(message)
 }

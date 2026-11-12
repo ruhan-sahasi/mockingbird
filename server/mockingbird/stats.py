@@ -9,7 +9,8 @@ each spread says how many turns it is over, as `n`.
   but never stand in for it.
 - `hops_ms` is the median of each server hop, worked out within each turn from its two stamps.
 - `cut_in_rate` is the share of spoken replies the candidate talked over within 1.5 s of their
-  start (tracing.py's CUT_IN_WINDOW_MS).
+  start (tracing.py's CUT_IN_WINDOW_MS), as the browser timed it from what the candidate heard,
+  or as two Vapi events stand in for it when the browser sent nothing.
 - `interrupt_to_silence_ms` is the browser's measure of how long the interviewer keeps sounding
   after the candidate talks over it. Ducking the interviewer audio in the browser is not built,
   and `consider_ducking` says when its p95 is long enough that it should be.

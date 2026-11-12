@@ -362,6 +362,7 @@ async def test_latency_traces_round_trip_and_are_listed_from_a_time_on(store, cl
         first_audio_ms=2160.0,
         browser_stop_to_audible_ms=1300.0,
         interrupt_to_silence_ms=180.0,
+        talk_over_ms=900.0,
         cut_in=True,
     )
     untimed = TurnTrace(turn_idx=4, request_ms=9000.0)  # every other hop missing

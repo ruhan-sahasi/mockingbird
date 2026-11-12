@@ -183,6 +183,48 @@ describe('interrupt to silence', () => {
   })
 })
 
+describe('talk over', () => {
+  it('runs from the reply leaving the speakers to the backdated cut-in, sent at the flush', () => {
+    const { at } = setup(20)
+    at(4000).interviewerAudible(true) // first heard at 4020
+    at(5000).vad({ speaking: true, loudMs: 60 }) // began at 4940
+    expect(at(5300).flushed()).toEqual({ talk_over_ms: 920 })
+  })
+
+  it('runs from the start of the reply, not from the sentence after a pause in it', () => {
+    const { at } = setup(20)
+    at(4000).interviewerAudible(true)
+    at(6000).interviewerAudible(false) // a pause between two sentences
+    at(6500).interviewerAudible(true)
+    at(7000).vad({ speaking: true, loudMs: 60 })
+    expect(at(7300).flushed()).toEqual({ talk_over_ms: 2920 })
+  })
+
+  it('runs from the next reply once the candidate has spoken while the interviewer was quiet', () => {
+    const { at } = setup(20)
+    at(4000).interviewerAudible(true)
+    at(6000).interviewerAudible(false)
+    at(6200).vad({ speaking: true, loudMs: 60 }) // the candidate answers
+    at(7000).vad({ speaking: false, quietMs: 300 })
+    at(8000).interviewerAudible(true) // the next reply, first heard at 8020
+    at(8500).vad({ speaking: true, loudMs: 60 })
+    expect(at(8700).flushed()).toEqual({ talk_over_ms: 420 })
+  })
+
+  it('counts speech that began as the reply did as 0 ms in, never less', () => {
+    const { at } = setup(20)
+    at(4000).interviewerAudible(true) // first heard at 4020
+    at(4050).vad({ speaking: true, loudMs: 60 }) // backdated to 3990
+    expect(at(4300).flushed()).toEqual({ talk_over_ms: 0 })
+  })
+
+  it('gives nothing for a flush with no cut-in heard', () => {
+    const { at } = setup()
+    at(4000).interviewerAudible(true)
+    expect(at(5100).flushed()).toBeNull()
+  })
+})
+
 it('keeps the two numbers apart within one turn', () => {
   const { at } = setup(0)
   at(1000).vad({ speaking: false, quietMs: 300 })

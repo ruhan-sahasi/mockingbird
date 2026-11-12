@@ -350,8 +350,13 @@ describe('turn timing', () => {
     h.clock = 5180
     h.onSpeaking!(false)
 
-    // From 4940, when the cut-in began, to 5200, when the speakers went quiet.
-    expect(timings(h.socket!)).toEqual([{ type: 'timing', interrupt_to_silence_ms: 260 }])
+    // The flush sends how far into the reply the cut-in came: from 4020, when the reply first
+    // left the speakers, to 4940, when the cut-in began. Then, from 4940 to 5200, when the
+    // speakers went quiet.
+    expect(timings(h.socket!)).toEqual([
+      { type: 'timing', talk_over_ms: 920 },
+      { type: 'timing', interrupt_to_silence_ms: 260 },
+    ])
   })
 
   it('sends nothing before the socket is open', async () => {

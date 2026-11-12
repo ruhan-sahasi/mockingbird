@@ -149,8 +149,12 @@ reply (`server/mockingbird/tracing.py`).
 - first token to first chunk: that text goes out to Vapi.
 - first chunk to assistant started: Vapi says it started speaking the reply.
 - assistant started to first audio: the first loud interviewer frame passes through the relay.
-- **Cut-in rate**: the share of spoken replies the candidate talked over within 1.5 s of their
-  start. It stands in for the interviewer starting before the candidate had finished.
+- **Cut-in rate**: the share of spoken replies the candidate talked over within 1.5 s of hearing
+  them start. It stands in for the interviewer starting before the candidate had finished. The
+  page times it: when the server flushes a reply, it sends `talk_over_ms`, from the first sample
+  of the reply leaving the speakers to the start of the candidate talking over it, and the
+  server counts a cut-in at 1500 ms or less. For a reply the page sent no such number for, two
+  Vapi events stand in: `user-interrupted` within 1.5 s of `speech-update` assistant started.
 
 A turn missing a stamp, such as a reply the page sent no timing for, is left out of that number
 and never counts as 0 ms. The two browser numbers say how many turns they are over
@@ -174,6 +178,12 @@ the endpoint and the page are public.
   much short.
 - An energy threshold can hear a stop early or late in a noisy room, which moves stop to
   audible with it.
+- The Vapi stand-in for a cut-in sees only about the first 1 s of what the candidate heard, so
+  it undercounts. Vapi says the reply started 200 to 250 ms before the candidate hears it (the
+  player alone waits for 0.1 s of audio, `PREROLL_S`), and says the candidate interrupted only
+  after 0.2 s of their voice (`voiceSeconds` in `server/mockingbird/vapi_client.py`) plus its own
+  detection. Raising either one shrinks that window further, so it is used only when the page
+  sent no `talk_over_ms`.
 - The server puts a browser number on the reply Vapi is speaking when the number arrives. Tests
   check this against a fake Vapi only, so the first live call has to confirm it.
 

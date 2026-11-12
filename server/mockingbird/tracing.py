@@ -15,12 +15,22 @@ A `TurnTrace` holds one reply's stamps, in the order they happen:
 - `assistant_started_ms`: Vapi says it started speaking the reply;
 - `first_audio_ms`: the first audible interviewer frame passes through the relay.
 
-The browser's own two numbers, `browser_stop_to_audible_ms` and `interrupt_to_silence_ms`, are
-durations it measured itself and sent on the call's socket (`browser_timing`). They land on the
-reply Vapi is speaking when they arrive. The browser is not trusted: only a number of ms from 0
-to MAX_BROWSER_MS is kept, the first one for each field of a reply, and anything else is ignored
-(Review Focus 2). `cut_in` marks a reply the candidate interrupted within CUT_IN_WINDOW_MS of its
-start.
+The browser's own numbers, `browser_stop_to_audible_ms`, `interrupt_to_silence_ms` and
+`talk_over_ms`, are durations it measured itself and sent on the call's socket
+(`browser_timing`). They land on the reply Vapi is speaking when they arrive. The browser is not
+trusted: only a number of ms from 0 to MAX_BROWSER_MS is kept, the first one for each field of a
+reply, and anything else is ignored (Review Focus 2).
+
+`cut_in` marks a reply the candidate talked over within CUT_IN_WINDOW_MS of its start, the
+spec's proxy for the interviewer starting before the candidate had finished. The browser times
+that from the reply's first sample leaving the speakers to the candidate starting to talk
+(`talk_over_ms`), which is what the candidate lived. When the browser sent nothing, two Vapi
+events stand in: user-interrupted within CUT_IN_WINDOW_MS of assistant-started. That stand-in
+sees a shorter window, about the first 1 s of what the candidate heard, because Vapi says
+assistant-started 200 to 250 ms before the candidate hears the reply (more with a longer player
+pre-roll), and says user-interrupted only after 0.2 s of the candidate's voice (its
+stopSpeakingPlan voiceSeconds) plus its own detection, about 300 ms in. So the browser's number
+wins whenever there is one, even over a stand-in that came first.
 
 Vapi sends several requests per answer and speaks only the reply to the last one, so most traces
 are thrown away with their drafts. A trace counts once the brain writes its reply down as an
@@ -65,6 +75,7 @@ MAX_BROWSER_MS = 60000
 _BROWSER_FIELDS = {
     "stop_to_audible_ms": "browser_stop_to_audible_ms",
     "interrupt_to_silence_ms": "interrupt_to_silence_ms",
+    "talk_over_ms": "talk_over_ms",
 }
 
 
@@ -82,6 +93,7 @@ class TurnTrace:
     first_audio_ms: float | None = None
     browser_stop_to_audible_ms: float | None = None
     interrupt_to_silence_ms: float | None = None
+    talk_over_ms: float | None = None  # how far into the reply, as heard, the candidate cut in
     cut_in: bool = False
 
 
@@ -198,19 +210,21 @@ class CallTracer:
             turn.first_audio_ms = self._now_ms()
 
     def user_interrupted(self) -> None:
-        """The candidate talked over the current reply. Within CUT_IN_WINDOW_MS of its start,
-        that is a cut-in."""
+        """Vapi says the candidate talked over the current reply. Within CUT_IN_WINDOW_MS of
+        Vapi starting it, that stands in for a cut-in, unless the browser has timed one."""
         now = self._now_ms()
         turn = self._current
         if now is None or turn is None or turn.assistant_started_ms is None:
             return
-        if now - turn.assistant_started_ms <= CUT_IN_WINDOW_MS:
+        if turn.talk_over_ms is None and now - turn.assistant_started_ms <= CUT_IN_WINDOW_MS:
             turn.cut_in = True
 
     def browser_timing(self, msg: dict) -> None:
         """The browser's timing message: its numbers go onto the reply being spoken. A number
         that is missing or not 0 to MAX_BROWSER_MS ms is ignored, and so is one the reply already
-        has: the first report wins. With no reply spoken yet there is nothing to put it on."""
+        has: the first report wins. With no reply spoken yet there is nothing to put it on. The
+        talk over number, once kept, decides whether the reply was a cut-in, whatever Vapi's
+        stand-in said."""
         turn = self._current
         if turn is None:
             return
@@ -218,6 +232,8 @@ class CallTracer:
             ms = _browser_ms(msg.get(key))
             if ms is not None and getattr(turn, field) is None:
                 setattr(turn, field, ms)
+                if field == "talk_over_ms":
+                    turn.cut_in = ms <= CUT_IN_WINDOW_MS
 
     def committed(self) -> list[TurnTrace]:
         """The traces of the replies that became interviewer turns, in the order spoken."""

@@ -75,6 +75,8 @@ describe('StatsView', () => {
     const { text } = render(STATS)
     expect(text).toContain('4 interviewer replies traced in the last 7 days.')
     expect(text).toContain('Cut-in rate: 25%')
+    expect(text).toContain('within 1.5 s of hearing it start')
+    expect(text).toContain('they catch only about the first 1 s')
   })
 
   it('shows n/a for a number with nothing measured, never 0 ms', () => {

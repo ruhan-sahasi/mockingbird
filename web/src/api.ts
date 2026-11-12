@@ -63,7 +63,7 @@ export type Stats = {
     first_chunk_to_assistant_started: number | null
     assistant_started_to_first_audio: number | null
   }
-  // The share of spoken replies the candidate talked over within 1.5 s of their start.
+  // The share of spoken replies the candidate talked over within 1.5 s of hearing them start.
   cut_in_rate: number | null
   // Measured in the browser: talking over the interviewer to the interviewer going quiet.
   interrupt_to_silence_ms: Spread

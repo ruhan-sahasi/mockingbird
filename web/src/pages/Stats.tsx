@@ -108,7 +108,8 @@ export function StatsView({
           </table>
           <p className="stats-note">
             Cut-in rate: {percent(stats.cut_in_rate)}. A cut-in is the candidate talking over a
-            reply within 1.5 s of its start.
+            reply within 1.5 s of hearing it start, as the page times it. For a reply the page sent
+            no timing for, two Vapi events stand in, and they catch only about the first 1 s.
           </p>
           {stats.consider_ducking && (
             <p className="stats-note">

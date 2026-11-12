@@ -83,6 +83,7 @@ ASSISTANT_STARTED = frame(type="speech-update", status="started", role="assistan
 ASSISTANT_STOPPED = frame(type="speech-update", status="stopped", role="assistant", turn=1)
 USER_STARTED = frame(type="speech-update", status="started", role="user", turn=2)
 USER_STOPPED = frame(type="speech-update", status="stopped", role="user", turn=2)
+USER_INTERRUPTED = frame(type="user-interrupted", turnId="turn-2")
 
 
 class FakeStreamer:
@@ -1040,10 +1041,21 @@ def test_a_spoken_reply_is_traced_hop_by_hop_and_stored(client, app, fakes):
         client.portal.call(fakes.vapi_socket.deliver, ASSISTANT_STARTED)
         client.portal.call(fakes.vapi_socket.deliver, VOICE)
         assert ws.receive_bytes() == VOICE
+        # Vapi says the candidate talked over the reply at once, which stands in for a cut-in.
+        client.portal.call(fakes.vapi_socket.deliver, USER_INTERRUPTED)
+        assert ws.receive_json() == {"type": "flush"}
         # The browser times the reply itself and reports it on the same socket. A number out of
         # range is dropped, and a second report of the same number does not replace the first.
+        # Its talk over, 2.4 s into what the candidate heard, says it was no cut-in after all.
         ws.send_json({"type": "timing", "stop_to_audible_ms": 1420, "interrupt_to_silence_ms": -5})
-        ws.send_json({"type": "timing", "stop_to_audible_ms": 900, "interrupt_to_silence_ms": 180})
+        ws.send_json(
+            {
+                "type": "timing",
+                "stop_to_audible_ms": 900,
+                "interrupt_to_silence_ms": 180,
+                "talk_over_ms": 2400,
+            }
+        )
         hang_up(app, ws, interview_id)
 
     since = datetime.now(UTC) - timedelta(days=1)
@@ -1061,6 +1073,7 @@ def test_a_spoken_reply_is_traced_hop_by_hop_and_stored(client, app, fakes):
     assert trace.cut_in is False
     assert trace.browser_stop_to_audible_ms == 1420.0
     assert trace.interrupt_to_silence_ms == 180.0
+    assert trace.talk_over_ms == 2400.0
 
 
 class StepClock:
