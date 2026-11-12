@@ -29,6 +29,13 @@ def test_uvicorn_keeps_an_idle_connection_open_longer_than_the_alb_does():
     assert "--no-access-log" in cmd  # the access log would record the path secrets and tokens
 
 
+def test_uvicorn_refuses_a_browser_message_far_bigger_than_any_the_page_sends():
+    # uvicorn reads in WebSocket messages of up to 16 MiB by default. The page sends 640-byte mic
+    # frames and short text, so anything near that size is a page trying to stall the server.
+    cmd = json.loads(re.search(r"^CMD (\[.*\])$", read("Dockerfile"), re.MULTILINE).group(1))
+    assert int(cmd[cmd.index("--ws-max-size") + 1]) == 65536
+
+
 def secret_names_in_terraform() -> set[str]:
     block = re.search(r"secret_names = toset\(\[(.*?)\]\)", read("infra/secrets.tf"), re.S)
     return set(re.findall(r'"([A-Z_]+)"', block.group(1)))
