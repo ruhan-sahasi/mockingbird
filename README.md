@@ -305,8 +305,8 @@ terraform -chdir=infra init -backend=false
 terraform -chdir=infra validate
 ```
 
-Counts from a run on this branch on 2026-11-11: `uv run pytest -q` printed
-`786 passed, 66 skipped`, and `npm test` printed `280 passed (280)` across 19 test files. The
+Counts from a run on this branch on 2026-11-12: `uv run pytest -q` printed
+`807 passed, 66 skipped`, and `npm test` printed `288 passed (288)` across 19 test files. The
 66 skipped tests are the PostgresStore tests in `server/tests/test_store.py`, which run only when
 `TEST_DATABASE_URL` points at a Postgres database (a direct connection, for example
 `postgresql://postgres:postgres@localhost:5432/postgres`).
