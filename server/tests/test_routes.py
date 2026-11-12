@@ -14,11 +14,13 @@ whatever the route is still doing.
 
 import asyncio
 import functools
+import io
 import json
 import logging
 import queue
 import threading
 import time
+import wave
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +35,7 @@ from websockets.exceptions import ConnectionClosedOK
 
 from mockingbird import routes_vapi, routes_ws
 from mockingbird.app import create_app
+from mockingbird.audio_store import LocalAudioStore
 from mockingbird.brain import WRAP_UP_LINE, Brain
 from mockingbird.models import Interview
 from mockingbird.plan import DEMO, InterviewPlan, Question
@@ -103,6 +106,30 @@ class FakeStreamer:
         except asyncio.CancelledError:
             self.cancelled += 1
             raise
+
+
+class FakeAudioStore:
+    """The recordings store. `put_error` makes every upload fail; `delete_errors` makes a delete
+    fail for the prefixes named in it."""
+
+    def __init__(self) -> None:
+        self.files: dict[str, bytes] = {}
+        self.put_error: Exception | None = None
+        self.deleted: list[str] = []
+        self.delete_errors: dict[str, Exception] = {}
+
+    async def put_wav(self, path: str, data: bytes) -> None:
+        if self.put_error is not None:
+            raise self.put_error
+        self.files[path] = data
+
+    async def delete_prefix(self, prefix: str) -> None:
+        if prefix in self.delete_errors:
+            raise self.delete_errors[prefix]
+        self.deleted.append(prefix)
+
+    async def ensure_ready(self) -> None:
+        return None
 
 
 class FakeVapi:
@@ -211,6 +238,7 @@ def fakes(monkeypatch):
         vapi=FakeVapi(),
         streamer=FakeStreamer(),
         grader=FakeGrader(),
+        audio=FakeAudioStore(),
         vapi_socket=FakeVapiConnection(),
         connects=[],
     )
@@ -234,6 +262,7 @@ def app(settings, fakes):
         vapi=fakes.vapi,
         streamer_factory=lambda: fakes.streamer,
         grader=fakes.grader,
+        audio_store=fakes.audio,
     )
 
 
@@ -510,6 +539,105 @@ def test_ws_runs_the_call_and_cleans_up_after_it(client, app, fakes):
 
     # Vapi asking the brain about the call now gets the fixed line (Review Focus 2).
     assert said(ask(client, "Are you still there?")) == ENDED_LINE
+
+
+def decode_wav(data: bytes) -> tuple[int, int, int, bytes]:
+    with wave.open(io.BytesIO(data)) as w:
+        return w.getframerate(), w.getnchannels(), w.getsampwidth(), w.readframes(w.getnframes())
+
+
+def test_a_call_records_and_uploads_both_tracks(client, app, fakes):
+    body = start(client)
+    interview_id = body["interview_id"]
+
+    with client.websocket_connect(body["ws_path"]) as ws:
+        client.portal.call(fakes.vapi_socket.wait_reading)
+        for _ in range(5):
+            ws.send_bytes(MIC)
+        wait_until(lambda: fakes.vapi_socket.sent.count(MIC) == 5)
+        for _ in range(3):
+            client.portal.call(fakes.vapi_socket.deliver, VOICE)
+            assert ws.receive_bytes() == VOICE
+        hang_up(app, ws, interview_id)
+
+    wait_until(lambda: get(client, fakes.store, interview_id).recording is not None)
+    base = f"interviews/{interview_id}"
+    assert sorted(fakes.audio.files) == [f"{base}/candidate.wav", f"{base}/interviewer.wav"]
+    assert decode_wav(fakes.audio.files[f"{base}/candidate.wav"]) == (16000, 1, 2, MIC * 5)
+    assert decode_wav(fakes.audio.files[f"{base}/interviewer.wav"]) == (16000, 1, 2, VOICE * 3)
+    recording = get(client, fakes.store, interview_id).recording
+    assert recording["status"] == "uploaded"
+    assert recording["candidate"]["frames"] == 5
+    assert recording["interviewer"]["frames"] == 3
+
+
+def test_upload_failure_still_builds_the_report(client, app, fakes, caplog):
+    caplog.set_level(logging.DEBUG)
+    fakes.audio.put_error = RuntimeError("storage said secret-detail")
+    body = start(client)
+    interview_id = body["interview_id"]
+
+    with client.websocket_connect(body["ws_path"]) as ws:
+        client.portal.call(fakes.vapi_socket.wait_reading)
+        ws.send_bytes(MIC)
+        wait_until(lambda: MIC in fakes.vapi_socket.sent)
+        hang_up(app, ws, interview_id)
+
+    report_url = f"/api/interviews/{interview_id}/report"
+    wait_until(lambda: client.get(report_url).status_code == 200)
+    wait_until(lambda: get(client, fakes.store, interview_id).recording is not None)
+    assert get(client, fakes.store, interview_id).recording == {"status": "upload_failed"}
+    assert "RuntimeError" in caplog.text
+    assert "secret-detail" not in caplog.text
+
+
+def test_a_call_that_never_went_live_has_no_recording(client, app, fakes):
+    fakes.vapi.error = VapiError("Vapi returned 503: try again")
+    body = start(client)
+    closed_with(client, body["ws_path"])
+    wait_cleaned_up(app, body["interview_id"])
+    assert get(client, fakes.store, body["interview_id"]).recording is None
+    assert fakes.audio.files == {}
+
+
+def everything_under(folder: Path) -> list[str]:
+    if not folder.exists():
+        return []
+    return sorted(str(path.relative_to(folder)) for path in folder.rglob("*"))
+
+
+def test_a_test_call_records_into_its_tmp_folder_and_never_into_the_repo(settings, fakes, tmp_path):
+    # Without an injected audio store the app keeps recordings in RECORDINGS_DIR, "recordings"
+    # under the working directory by default. The settings fixture moves that into tmp_path, so
+    # running the tests never leaves WAV files in the repo (ruling P2-R22).
+    repo = Path(__file__).resolve().parents[2]
+    repo_folders = {repo / "recordings", repo / "server" / "recordings", Path.cwd() / "recordings"}
+    before = {folder: everything_under(folder) for folder in repo_folders}
+    app = create_app(
+        settings,
+        store=fakes.store,
+        vapi=fakes.vapi,
+        streamer_factory=lambda: fakes.streamer,
+        grader=fakes.grader,
+    )
+
+    with TestClient(app, base_url="https://testserver", headers={"origin": SITE}) as client:
+        audio = app.state.audio_store
+        assert isinstance(audio, LocalAudioStore)
+        assert audio._root.is_relative_to(tmp_path.resolve())
+        body = start(client)
+        interview_id = body["interview_id"]
+        with client.websocket_connect(body["ws_path"]) as ws:
+            client.portal.call(fakes.vapi_socket.wait_reading)
+            ws.send_bytes(MIC)
+            wait_until(lambda: MIC in fakes.vapi_socket.sent)
+            hang_up(app, ws, interview_id)
+        wait_until(lambda: get(client, fakes.store, interview_id).recording is not None)
+        assert get(client, fakes.store, interview_id).recording["status"] == "uploaded"
+
+    written = tmp_path / "recordings" / "interviews" / interview_id
+    assert sorted(path.name for path in written.iterdir()) == ["candidate.wav", "interviewer.wav"]
+    assert {folder: everything_under(folder) for folder in repo_folders} == before
 
 
 def test_the_interview_is_ended_before_the_browser_hears_the_call_ended(client, app, fakes):
@@ -1254,7 +1382,9 @@ async def test_the_sweeper_sweeps_every_minute_and_deletes_week_old_demo_data_ho
 
     clock = scripted_clock(0, 60, 3599, 3600, 3660, 7199, 7200)  # one reading per sweep
     sweeper = asyncio.create_task(
-        run_sweeper(SessionRegistry(), store, FakeVapi(), clock=clock, sleep=sleep)
+        run_sweeper(
+            SessionRegistry(), store, FakeVapi(), FakeAudioStore(), clock=clock, sleep=sleep
+        )
     )
     await until(lambda: store.sweeps >= 9)
     await stop(sweeper)
@@ -1270,7 +1400,9 @@ async def test_a_failing_sweep_or_purge_is_logged_and_the_sweeper_goes_on(caplog
     store.failing_purges = 1
     clock = scripted_clock(0, 60, 120, 3600)
     sweeper = asyncio.create_task(
-        run_sweeper(SessionRegistry(), store, FakeVapi(), clock=clock, sleep=no_wait)
+        run_sweeper(
+            SessionRegistry(), store, FakeVapi(), FakeAudioStore(), clock=clock, sleep=no_wait
+        )
     )
     await until(lambda: store.sweeps >= 5)
     await stop(sweeper)
@@ -1296,7 +1428,9 @@ async def test_cancelling_the_sweeper_stops_it_whatever_it_is_doing(when):
             return listed
 
     store = Store()
-    sweeper = asyncio.create_task(run_sweeper(SessionRegistry(), store, FakeVapi()))
+    sweeper = asyncio.create_task(
+        run_sweeper(SessionRegistry(), store, FakeVapi(), FakeAudioStore())
+    )
     if when == "mid_sweep":
         await until(lambda: store.sweeps == 1)
     else:
@@ -1339,13 +1473,84 @@ async def test_the_purge_deletes_each_old_demos_call_at_vapi_before_its_row():
             await super().delete_call(call_id)
 
     vapi = Vapi()
-    await purge_once(store, vapi)
+    await purge_once(store, vapi, FakeAudioStore())
 
     assert sorted(vapi.deleted) == ["call-a", "call-b"]
     for gone in ("old-a", "old-b", "old-no-call"):
         assert await store.get_interview(gone) is None
     for kept in ("recent", "old-full"):
         assert await store.get_interview(kept) is not None
+
+
+async def test_purge_deletes_recordings_before_rows():
+    store = MemoryStore()
+    for interview in (
+        old_demo("old-a", "call-a"),
+        old_demo("recent", "call-recent", days=6),
+        old_demo("old-full", "call-full", mode="full"),
+    ):
+        await store.create_interview(interview)
+
+    class Audio(FakeAudioStore):
+        async def delete_prefix(self, prefix: str) -> None:
+            assert await store.get_interview("old-a") is not None  # the row comes after
+            await super().delete_prefix(prefix)
+
+    audio = Audio()
+    await purge_once(store, FakeVapi(), audio)
+
+    assert audio.deleted == ["interviews/old-a/"]
+    assert await store.get_interview("old-a") is None
+    assert await store.get_interview("recent") is not None
+    assert await store.get_interview("old-full") is not None
+
+
+async def test_an_interview_that_turns_old_mid_purge_keeps_its_row_until_its_audio_is_deleted():
+    # Every store call reads the clock, and the clock moves an hour per read. This interview is
+    # not 7 days old when the purge lists the recordings to delete, but is by the time the rows
+    # go. Its folder was never deleted, so its row must stay: it is the only thing that names it.
+    base = datetime.now(UTC)
+    reads = iter(range(1, 100))
+    store = MemoryStore(clock=lambda: base + timedelta(hours=next(reads)))
+    crossing = old_demo("crossing", "call-crossing")
+    crossing.created_at = base - timedelta(days=7) + timedelta(minutes=150)
+    await store.create_interview(crossing)
+    audio = FakeAudioStore()
+    vapi = FakeVapi()
+
+    await purge_once(store, vapi, audio)
+
+    assert audio.deleted == []
+    assert await store.get_interview("crossing") is not None
+
+    await purge_once(store, vapi, audio)  # an hour later: now it is listed first
+
+    assert audio.deleted == ["interviews/crossing/"]
+    assert "call-crossing" in vapi.deleted
+    assert await store.get_interview("crossing") is None
+
+
+async def test_purge_keeps_rows_when_storage_delete_fails(caplog):
+    caplog.set_level(logging.DEBUG)
+    store = MemoryStore()
+    await store.create_interview(old_demo("stuck", "call-stuck"))
+    await store.create_interview(old_demo("fine", "call-fine"))
+    audio = FakeAudioStore()
+    audio.delete_errors = {"interviews/stuck/": RuntimeError("bucket said secret-detail")}
+    vapi = FakeVapi()
+
+    await purge_once(store, vapi, audio)
+
+    assert await store.get_interview("fine") is None
+    stuck = await store.get_interview("stuck")
+    assert stuck is not None and stuck.vapi_call_id == "call-stuck"
+    assert "RuntimeError" in caplog.text
+    assert "secret-detail" not in caplog.text
+
+    audio.delete_errors = {}
+    await purge_once(store, vapi, audio)  # an hour later
+    assert audio.deleted == ["interviews/fine/", "interviews/stuck/"]
+    assert await store.get_interview("stuck") is None
 
 
 async def test_a_call_vapi_would_not_delete_keeps_its_row_for_the_next_purge(caplog):
@@ -1359,7 +1564,7 @@ async def test_a_call_vapi_would_not_delete_keeps_its_row_for_the_next_purge(cap
         secret_id: VapiError("Vapi returned 503: try again"),
     }
 
-    await purge_once(store, vapi)
+    await purge_once(store, vapi, FakeAudioStore())
 
     assert vapi.deleted == ["call-fine"]
     assert await store.get_interview("fine") is None
@@ -1369,7 +1574,7 @@ async def test_a_call_vapi_would_not_delete_keeps_its_row_for_the_next_purge(cap
     assert secret_id not in caplog.text
 
     vapi.delete_errors = {}
-    await purge_once(store, vapi)  # an hour later
+    await purge_once(store, vapi, FakeAudioStore())  # an hour later
     assert vapi.deleted == ["call-fine", secret_id]
     assert await store.get_interview("stuck") is None
 
@@ -1381,7 +1586,7 @@ async def test_a_purge_whose_vapi_delete_breaks_logs_only_the_error_type(caplog)
     vapi = FakeVapi()
     vapi.delete_errors = {"call-stuck": RuntimeError("bug near call-stuck")}
 
-    await purge_once(store, vapi)
+    await purge_once(store, vapi, FakeAudioStore())
 
     assert await store.get_interview("stuck") is not None
     assert "RuntimeError" in caplog.text

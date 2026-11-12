@@ -39,3 +39,6 @@ class Interview:
     vapi_call_id: str | None = field(default=None, repr=False)
     ended_reason: str | None = None
     duration_s: int | None = None
+    # The state of the call recording: its upload status and frame counts. None until a live
+    # call's upload has been tried.
+    recording: dict | None = None

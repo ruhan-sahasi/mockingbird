@@ -24,8 +24,12 @@ def test_settings() -> Settings:
 
 
 @pytest.fixture
-def settings() -> Settings:
-    return test_settings()
+def settings(tmp_path) -> Settings:
+    """test_settings() with RECORDINGS_DIR in this test's tmp folder. An app built without an
+    injected audio store keeps recordings in a local folder, and the default, "recordings", is
+    relative to the working directory, which is the repo. Every test that starts the app gets
+    these settings (or a copy of them), so a test call never writes WAV files into the repo."""
+    return test_settings().model_copy(update={"recordings_dir": str(tmp_path / "recordings")})
 
 
 @pytest.fixture

@@ -199,7 +199,8 @@ def test_new_settings_defaults(settings):
     assert settings.supabase_url is None
     assert settings.supabase_service_key is None
     assert settings.recordings_bucket == "recordings"
-    assert settings.recordings_dir == "recordings"
+    # The settings fixture moves the folder into tmp_path, so the default is read from the class.
+    assert Settings.model_fields["recordings_dir"].default == "recordings"
 
 
 def test_no_secret_appears_in_the_settings_repr():

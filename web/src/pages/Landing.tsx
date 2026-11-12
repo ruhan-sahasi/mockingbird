@@ -11,7 +11,7 @@ type Props = {
 }
 
 const CONSENT =
-  'Your voice is sent to Vapi and Claude to run and grade this interview. Nothing is shared publicly.'
+  'Your voice is recorded and sent to Vapi and Claude to run and grade this interview. Recordings are deleted after 7 days. Nothing is shared publicly.'
 const PHONE = 'Mockingbird needs a laptop or desktop browser with a mic. Open this link there.'
 const LIMITS: Record<LimitReason, string> = {
   visitor_limit: "You've used today's demo. Come back tomorrow.",

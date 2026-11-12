@@ -327,6 +327,42 @@ async def test_a_turn_idx_cannot_be_used_twice(store):
     assert [t.text for t in await store.list_turns("i1")] == ["first"]
 
 
+async def test_the_recording_round_trips_and_is_a_copy(store):
+    await store.create_interview(make_interview())
+    assert (await store.get_interview("i1")).recording is None
+
+    recording = {"status": "uploaded", "candidate": {"frames": 5, "first_frame_ms": None}}
+    await store.update_interview("i1", recording=recording)
+    recording["status"] = "changed after the write"
+    got = await store.get_interview("i1")
+    assert got.recording == {
+        "status": "uploaded",
+        "candidate": {"frames": 5, "first_frame_ms": None},
+    }
+    got.recording["status"] = "changed after the read"
+    assert (await store.get_interview("i1")).recording["status"] == "uploaded"
+
+    await store.update_interview("i1", recording={"status": "upload_failed"})
+    assert (await store.get_interview("i1")).recording == {"status": "upload_failed"}
+
+
+async def test_demo_interviews_older_than_lists_old_demo_ids_and_the_purge_honours_audio_deleted(
+    store,
+):
+    await store.create_interview(make_interview(id="old-a", created_at=NOW - timedelta(days=8)))
+    await store.create_interview(make_interview(id="old-b", created_at=NOW - timedelta(days=8)))
+    await store.create_interview(
+        make_interview(id="old-full", mode="full", created_at=NOW - timedelta(days=8))
+    )
+    await store.create_interview(make_interview(id="new", created_at=NOW - timedelta(days=6)))
+
+    assert sorted(await store.demo_interviews_older_than(7)) == ["old-a", "old-b"]
+
+    assert await store.delete_demo_data_older_than(7, audio_deleted=["old-a"]) == 1
+    assert await store.get_interview("old-a") is None
+    assert await store.get_interview("old-b") is not None
+
+
 # --- reports -----------------------------------------------------------------------------------
 
 
@@ -578,7 +614,8 @@ async def test_delete_demo_data_older_than_removes_old_demos_and_keeps_the_rest(
         await store.add_turn(i.id, make_turn(0, text=f"turn of {i.id}"))
         await store.save_report(i.id, REPORT)
 
-    assert await store.delete_demo_data_older_than(7) == 1
+    everyone = ["old-demo", "recent-demo", "old-full"]
+    assert await store.delete_demo_data_older_than(7, audio_deleted=everyone) == 1
 
     assert await store.get_interview("old-demo") is None
     assert await store.list_turns("old-demo") == []
@@ -588,14 +625,16 @@ async def test_delete_demo_data_older_than_removes_old_demos_and_keeps_the_rest(
         assert [t.text for t in await store.list_turns(kept.id)] == [f"turn of {kept.id}"]
         assert await store.get_report(kept.id) == REPORT
 
-    assert await store.delete_demo_data_older_than(7) == 0
+    assert await store.delete_demo_data_older_than(7, audio_deleted=everyone) == 0
 
 
 async def test_delete_demo_data_older_than_counts_every_interview_it_deletes(store):
     for n in range(3):
         await store.create_interview(make_interview(f"old-{n}", created_at=NOW - timedelta(days=9)))
     await store.create_interview(make_interview("new"))
-    assert await store.delete_demo_data_older_than(7) == 3
+    assert (
+        await store.delete_demo_data_older_than(7, audio_deleted=["old-0", "old-1", "old-2"]) == 3
+    )
 
 
 async def test_an_interview_exactly_seven_days_old_is_kept(store):
@@ -603,7 +642,7 @@ async def test_an_interview_exactly_seven_days_old_is_kept(store):
     await store.create_interview(
         make_interview("past-edge", created_at=NOW - timedelta(days=7, seconds=1))
     )
-    assert await store.delete_demo_data_older_than(7) == 1
+    assert await store.delete_demo_data_older_than(7, audio_deleted=["edge", "past-edge"]) == 1
     assert await store.get_interview("edge") is not None
     assert await store.get_interview("past-edge") is None
 
@@ -631,14 +670,37 @@ async def test_an_old_demo_that_holds_a_call_id_is_deleted_only_once_vapi_delete
     await store.create_interview(make_interview("still-at-vapi", created_at=old, vapi_call_id="b"))
     await store.create_interview(make_interview("no-call", created_at=old))
 
-    assert await store.delete_demo_data_older_than(7, vapi_deleted=["a"]) == 2
+    everyone = ["deleted-at-vapi", "still-at-vapi", "no-call"]
+    assert (
+        await store.delete_demo_data_older_than(7, audio_deleted=everyone, vapi_deleted=["a"]) == 2
+    )
 
     assert await store.get_interview("deleted-at-vapi") is None
     assert await store.get_interview("no-call") is None
     assert (await store.get_interview("still-at-vapi")).vapi_call_id == "b"
     assert await store.demo_calls_older_than(7) == ["b"]
-    assert await store.delete_demo_data_older_than(7) == 0  # by default no call counts as deleted
-    assert await store.delete_demo_data_older_than(7, vapi_deleted=["b"]) == 1
+    # By default no call counts as deleted.
+    assert await store.delete_demo_data_older_than(7, audio_deleted=everyone) == 0
+    assert (
+        await store.delete_demo_data_older_than(7, audio_deleted=everyone, vapi_deleted=["b"]) == 1
+    )
+
+
+async def test_an_old_demo_is_deleted_only_once_its_recording_is_deleted(store):
+    # The row is the only thing that names the recording's folder, so it stays until the audio
+    # is gone. An id the caller never listed (it turned 7 days old after the list was read) is
+    # not deleted either.
+    old = NOW - timedelta(days=8)
+    for id in ("audio-gone", "audio-stuck", "never-listed"):
+        await store.create_interview(make_interview(id, created_at=old))
+
+    assert await store.delete_demo_data_older_than(7, audio_deleted=["audio-gone"]) == 1
+
+    assert await store.get_interview("audio-gone") is None
+    assert await store.get_interview("audio-stuck") is not None
+    assert await store.get_interview("never-listed") is not None
+    assert await store.delete_demo_data_older_than(7, audio_deleted=[]) == 0
+    assert await store.delete_demo_data_older_than(7, audio_deleted=["audio-stuck"]) == 1
 
 
 # --- the Vapi call id is a credential while a call is live -------------------------------------
@@ -657,7 +719,7 @@ async def test_the_store_never_logs_the_vapi_call_id(store, caplog):
     await store.get_interview_by_call(CALL_ID)
     await store.list_live_interviews()
     await store.seconds_used_today()
-    await store.delete_demo_data_older_than(7)
+    await store.delete_demo_data_older_than(7, audio_deleted=[])
     assert CALL_ID not in caplog.text
 
 
@@ -905,7 +967,7 @@ async def test_deleting_old_demo_data_also_deletes_its_scores_and_quotes(pg_pool
         await store.add_turn(id, make_turn(0))
         await store.save_report(id, REPORT)
 
-    assert await store.delete_demo_data_older_than(7) == 1
+    assert await store.delete_demo_data_older_than(7, audio_deleted=["old", "old-full"]) == 1
 
     for table in ("turns", "scores"):
         ids = {r[0] for r in await pg_pool.fetch(f"select interview_id from {table}")}
@@ -944,9 +1006,19 @@ async def test_the_real_migration_creates_the_four_tables(pg_pool):
         )
     }
     assert tables == {"schema_migrations", "interviews", "turns", "scores", "quotes"}
-    assert "001_init.sql" in [p.name for p in MIGRATIONS_DIR.glob("*.sql")]
+    shipped = sorted(p.name for p in MIGRATIONS_DIR.glob("*.sql"))
+    assert "001_init.sql" in shipped
     async with pg_pool.acquire() as conn:
-        assert await applied_names(conn) == ["001_init.sql"]
+        # Every shipped migration, so a new one does not break this test.
+        assert await applied_names(conn) == shipped
+    columns = {
+        r[0]
+        for r in await pg_pool.fetch(
+            "select column_name from information_schema.columns"
+            " where table_schema = current_schema() and table_name = 'interviews'"
+        )
+    }
+    assert "recording" in columns
 
 
 @needs_postgres
