@@ -18,6 +18,7 @@ from mockingbird.brain import (
     STABLE_SYSTEM,
     WRAP_UP_LINE,
     Brain,
+    FixedLine,
 )
 from mockingbird.claude import AnthropicStreamer, BrainError, make_anthropic_client
 from mockingbird.models import Turn
@@ -656,7 +657,10 @@ async def test_an_unexpected_streamer_exception_still_speaks_the_fallback():
     brain, _ = started(DEMO, streamer)
     fallback = FALLBACK_LINE[MoveKind.FOLLOW_UP]
 
-    assert await say(brain, "I led the migration.") == ["So tell me", " " + fallback]
+    claude, said_by_brain = await say(brain, "I led the migration.")
+    assert [claude, said_by_brain] == ["So tell me", " " + fallback]
+    # Only the brain's own line is marked, so the route times Claude's first text, not it.
+    assert not isinstance(claude, FixedLine) and isinstance(said_by_brain, FixedLine)
     assert_history_valid(settled(brain))
     assert await say(brain, LONG_ANSWER) == [fallback]
     assert_history_valid(settled(brain))
@@ -687,7 +691,9 @@ async def test_wrap_up_uses_fixed_line_without_calling_claude():
     streamer = FakeStreamer()
     brain, clock = started(DEMO, streamer)
     clock.advance(DEMO.total_s - DEMO.wrap_up_reserve_s)  # exactly at the reserve
-    assert await say(brain, "That is how it went.") == [WRAP_UP_LINE]
+    [line] = await say(brain, "That is how it went.")
+    assert line == WRAP_UP_LINE
+    assert isinstance(line, FixedLine)  # so the route never times it as Claude's first token
     assert streamer.calls == []
     assert brain.finished
     assert WRAP_UP_LINE == (

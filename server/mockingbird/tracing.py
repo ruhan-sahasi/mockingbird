@@ -6,7 +6,8 @@ A `TurnTrace` holds one reply's stamps, in the order they happen:
 
 - `user_stopped_ms`: Vapi says the candidate stopped speaking;
 - `request_ms`: Vapi's brain request for the reply arrives;
-- `first_token_ms`: the brain yields the reply's first text;
+- `first_token_ms`: the brain yields Claude's first text of the reply. A reply that starts with
+  a line the brain says itself (the wrap-up, or a fallback when Claude wrote nothing) has none;
 - `first_chunk_ms`: the first text goes out to Vapi;
 - `assistant_started_ms`: Vapi says it started speaking the reply;
 - `first_audio_ms`: the first audible interviewer frame passes through the relay.

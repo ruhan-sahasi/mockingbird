@@ -1100,6 +1100,67 @@ async def test_the_live_events_feed_the_calls_tracer():
     assert trace.turn_idx == 2
 
 
+class SlowStreamer:
+    """Claude, taking 400 ms on `clock` to its first text, then saying DEFAULT_LINE. With
+    `silent`, it writes nothing at all, so the brain says its fallback line."""
+
+    def __init__(self, clock: StepClock, silent: bool = False) -> None:
+        self.clock = clock
+        self.silent = silent
+
+    def stream(self, *, system, messages):
+        return self._play()
+
+    async def _play(self):
+        self.clock.now += 0.4
+        if not self.silent:
+            yield DEFAULT_LINE
+
+
+def traced_session(silent: bool = False) -> tuple[LiveSession, StepClock]:
+    """A started session whose brain, tracer and Claude all run on one hand-moved clock."""
+    clock = StepClock()
+    plan = InterviewPlan(DEMO, [Question("q0", "Tell me about a time.", "ownership")])
+    brain = Brain(plan, SlowStreamer(clock, silent), clock)
+    session = LiveSession(make_interview_record("i1"), brain, token="", token_expires_at=0.0)
+    brain.start()
+    session.tracer = CallTracer(clock)
+    session.tracer.start()
+    return session, clock
+
+
+async def speak_reply(session: LiveSession, answer: str) -> TurnTrace:
+    """Vapi asks for a reply to `answer` and starts speaking it. Returns its trace."""
+    await collect(routes_vapi.start_reply(session, LlmRequest(CALL_ID, answer, None)))
+    await routes_ws._live_events(session)(SpeechUpdate(None, "assistant", "started"))
+    return session.brain.committing_trace
+
+
+async def test_the_wrap_up_line_is_never_timed_as_claudes_first_token():
+    # The wrap-up never goes to Claude, so it takes no time to write. Counted as Claude's first
+    # token it would drag that hop's median toward 0: with one follow-up, to 0 itself.
+    session, clock = traced_session()
+    follow_up = await speak_reply(session, "I led the migration.")
+    clock.now += DEMO.total_s  # past the wrap-up reserve
+    wrap_up = await speak_reply(session, "We shipped it.")
+    assert session.brain.finished
+
+    assert follow_up.first_token_ms - follow_up.request_ms == pytest.approx(400)
+    assert wrap_up.first_token_ms is None
+    assert wrap_up.request_ms is not None and wrap_up.first_chunk_ms is not None
+    session.brain.finalize()
+    hops = summarize_traces(session.tracer.committed())["hops_ms"]
+    assert hops["request_to_first_token"] == pytest.approx(400)
+    assert hops["first_chunk_to_assistant_started"] is not None
+
+
+async def test_a_fallback_line_after_claude_wrote_nothing_is_never_timed_as_its_first_token():
+    session, _ = traced_session(silent=True)
+    trace = await speak_reply(session, "I led the migration.")
+    assert trace.first_token_ms is None
+    assert trace.first_chunk_ms is not None  # the fallback line still went out to Vapi
+
+
 async def test_a_session_without_a_tracer_still_handles_every_live_event():
     # Sessions built before the call goes live, and many tests, have no tracer.
     session = make_session(make_interview_record("i1"))

@@ -16,7 +16,10 @@ The draft runs as its own task, feeding a queue that the response streams from, 
 next request can cancel it. When Vapi drops the stream, the draft is cancelled too.
 
 Each request gets a latency trace from the call's tracer when it arrives. The trace rides on the
-draft, and is stamped when the brain yields the first text and when that text goes out to Vapi.
+draft, and is stamped when the brain yields Claude's first text and when the first text goes out
+to Vapi. A reply whose first text is a line the brain says itself (the wrap-up, or the fallback
+when Claude failed before writing anything) gets no first-token stamp: that line takes no time
+to write, and timing it as Claude's would drag Claude's measured time to first token toward 0.
 Measuring must never cut off the interviewer's line, so each stamp is guarded: a tracing bug is
 logged by type only, and the reply streams on without that stamp.
 
@@ -39,7 +42,7 @@ from functools import partial
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from mockingbird.brain import Brain
+from mockingbird.brain import Brain, FixedLine
 from mockingbird.sessions import LiveSession
 from mockingbird.sse import SSE_DONE, sse_chunk
 from mockingbird.store import Store
@@ -160,7 +163,8 @@ async def _draft(
         async with contextlib.aclosing(draft) as reply:
             first = True
             async for chunk in reply:
-                if first and tracer is not None and trace is not None:
+                claude_wrote_it = not isinstance(chunk, FixedLine)
+                if first and claude_wrote_it and tracer is not None and trace is not None:
                     _stamp(tracer.first_token, trace)
                 first = False
                 chunks.put_nowait(chunk)

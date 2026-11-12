@@ -138,6 +138,8 @@ reply (`server/mockingbird/tracing.py`).
 **Measured on the server**, on its monotonic clock (`server/mockingbird/tracing.py`):
 
 - request to first token: Vapi asks the brain for a reply, and Claude streams its first text.
+  The wrap-up line never goes to Claude, and neither does a fallback line said when Claude wrote
+  nothing, so a reply that starts with one is left out of this hop and the next.
 - first token to first chunk: that text goes out to Vapi.
 - first chunk to assistant started: Vapi says it started speaking the reply.
 - assistant started to first audio: the first loud interviewer frame passes through the relay.
