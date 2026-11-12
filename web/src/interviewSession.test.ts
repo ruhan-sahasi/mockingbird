@@ -339,17 +339,19 @@ describe('turn timing', () => {
 
   it('sends a cut-in to silence once the server flushes and the interviewer quiets', async () => {
     const { h } = await live()
+    h.outputLatencyMs = 20
     h.clock = 4000
     h.onSpeaking!(true)
     h.clock = 5000
-    h.onVad!({ speaking: true })
+    h.onVad!({ speaking: true, loudMs: 60 })
     h.clock = 5100
     h.socket!.text(WIRE.server_to_browser.flush)
     expect(h.flushed).toBe(1)
     h.clock = 5180
     h.onSpeaking!(false)
 
-    expect(timings(h.socket!)).toEqual([{ type: 'timing', interrupt_to_silence_ms: 180 }])
+    // From 4940, when the cut-in began, to 5200, when the speakers went quiet.
+    expect(timings(h.socket!)).toEqual([{ type: 'timing', interrupt_to_silence_ms: 260 }])
   })
 
   it('sends nothing before the socket is open', async () => {

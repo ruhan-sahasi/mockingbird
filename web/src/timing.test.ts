@@ -36,12 +36,30 @@ describe('stop to audible', () => {
     expect(at(2900).interviewerAudible(true)).toBeNull()
   })
 
-  it('runs from the latest stop', () => {
+  it('runs from the last stop, when the candidate paused mid-answer and went on', () => {
     const { at } = setup(0)
     at(1000).vad({ speaking: false, quietMs: 300 })
-    at(1400).vad({ speaking: true })
+    at(1400).vad({ speaking: true, loudMs: 60 })
     at(2000).vad({ speaking: false, quietMs: 300 })
     expect(at(2500).interviewerAudible(true)).toEqual({ stop_to_audible_ms: 800 })
+  })
+
+  it('gives nothing when the candidate speaks again after a stop and is talked over', () => {
+    // A mid-answer pause, then the interviewer cuts in while the candidate is still talking.
+    const { at } = setup(0)
+    at(1000).vad({ speaking: false, quietMs: 300 })
+    at(1400).vad({ speaking: true, loudMs: 60 })
+    expect(at(2000).interviewerAudible(true)).toBeNull()
+  })
+
+  it('ignores a stop heard while the interviewer is speaking', () => {
+    // A cough over the reply, then a pause in the reply's audio and the rest of it.
+    const { at } = setup(0)
+    at(4000).interviewerAudible(true)
+    at(4500).vad({ speaking: true, loudMs: 60 })
+    at(4800).vad({ speaking: false, quietMs: 300 })
+    expect(at(5000).interviewerAudible(false)).toBeNull()
+    expect(at(5600).interviewerAudible(true)).toBeNull()
   })
 
   it('reads the output latency when the interviewer is heard', () => {
@@ -57,12 +75,38 @@ describe('stop to audible', () => {
 })
 
 describe('interrupt to silence', () => {
-  it('runs from the candidate cutting in to the interviewer going quiet after the flush', () => {
+  it('runs from the backdated cut-in to the last sample leaving the speakers', () => {
+    // Speech began 60 ms before the VAD said so (4940), and the speakers go quiet 20 ms after the
+    // player does (5200).
     const { at } = setup(20)
     at(4000).interviewerAudible(true)
-    at(5000).vad({ speaking: true })
+    at(5000).vad({ speaking: true, loudMs: 60 })
     at(5100).flushed()
-    expect(at(5180).interviewerAudible(false)).toEqual({ interrupt_to_silence_ms: 180 })
+    expect(at(5180).interviewerAudible(false)).toEqual({ interrupt_to_silence_ms: 260 })
+  })
+
+  it('runs from the first cut-in: speaking again does not move it', () => {
+    const { at } = setup(20)
+    at(4000).interviewerAudible(true)
+    at(5000).vad({ speaking: true, loudMs: 60 })
+    at(5300).vad({ speaking: false, quietMs: 300 })
+    at(5500).vad({ speaking: true, loudMs: 60 })
+    at(5600).flushed()
+    expect(at(5680).interviewerAudible(false)).toEqual({ interrupt_to_silence_ms: 760 })
+  })
+
+  it('reads the output latency when the interviewer goes quiet', () => {
+    const clock = { now: 0 }
+    let latency = 0
+    const timer = new TurnTimer({ now: () => clock.now, outputLatencyMs: () => latency })
+    clock.now = 4000
+    timer.interviewerAudible(true)
+    clock.now = 5000
+    timer.vad({ speaking: true, loudMs: 60 })
+    timer.flushed()
+    latency = 150 // a Bluetooth headset
+    clock.now = 5180
+    expect(timer.interviewerAudible(false)).toEqual({ interrupt_to_silence_ms: 390 })
   })
 
   it('gives nothing when the interviewer stops on its own, with no flush', () => {

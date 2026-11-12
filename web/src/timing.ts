@@ -6,7 +6,15 @@
 //   stretch of quiet, so the stop is backdated by that stretch. The worklet hears the reply start
 //   before the speakers play it, so the output latency is added.
 // - interrupt to silence: from the candidate starting to talk over the interviewer to the
-//   interviewer going quiet, once the server has told the page to flush the reply.
+//   interviewer going quiet, once the server has told the page to flush the reply. The VAD
+//   reports speech only after a few loud frames, so the cut-in is backdated by them. The player
+//   goes quiet while the speakers are still playing what it handed over, so the output latency
+//   is added here too.
+//
+// Only the end of an answer starts a stop to audible measurement: the candidate's last stop with
+// no speech after it, heard while the interviewer is quiet. A stop while the interviewer is
+// speaking ends a cough or an "mm-hmm" over the reply, not an answer. Speech after a stop means
+// the stop was a pause mid-answer, so if the interviewer then cuts in, nothing is timed.
 //
 // The VAD's events (audio/vad.ts) and the player's speaking events come in, and each number
 // comes out once, from the call that completes it. The server ties it to the reply it is
@@ -25,18 +33,27 @@ export type TurnTimerClock = {
 export class TurnTimer {
   private readonly clock: TurnTimerClock
   private audible = false // whether the interviewer is speaking, as the player last said
-  private stoppedAt: number | null = null // the candidate's latest stop not yet answered
-  private interruptAt: number | null = null // when the candidate talked over the interviewer
+  private stoppedAt: number | null = null // the end of the candidate's answer, not yet answered
+  private interruptAt: number | null = null // when the candidate first talked over the interviewer
   private flushPending = false // the server flushed the reply, and it has not gone quiet yet
 
   constructor(clock: TurnTimerClock) {
     this.clock = clock
   }
 
-  /** The candidate started or stopped speaking. A later stop replaces an earlier one. */
+  /**
+   * The candidate started or stopped speaking. A stop counts only while the interviewer is quiet.
+   * Speaking drops any pending stop, and while the interviewer is heard it is a cut-in, of which
+   * the first one counts until the interviewer goes quiet.
+   */
   vad(e: VadEvent): void {
-    if (!e.speaking) this.stoppedAt = this.clock.now() - (e.quietMs ?? 0)
-    else if (this.audible) this.interruptAt = this.clock.now()
+    const at = this.clock.now()
+    if (!e.speaking) {
+      if (!this.audible) this.stoppedAt = at - (e.quietMs ?? 0)
+      return
+    }
+    this.stoppedAt = null
+    if (this.audible && this.interruptAt === null) this.interruptAt = at - (e.loudMs ?? 0)
   }
 
   /**
@@ -61,7 +78,8 @@ export class TurnTimer {
     this.interruptAt = null
     this.flushPending = false
     if (!flushPending || interruptAt === null) return null
-    return { interrupt_to_silence_ms: this.clock.now() - interruptAt }
+    const silentAt = this.clock.now() + this.clock.outputLatencyMs()
+    return { interrupt_to_silence_ms: silentAt - interruptAt }
   }
 
   /** The server told the page to flush the reply, because the candidate talked over it. */

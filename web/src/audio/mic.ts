@@ -53,7 +53,10 @@ export async function startMic(
     node.port.onmessage = (event: MessageEvent<CaptureMessage>) => {
       const message = event.data
       if (message.type === 'frame') onFrame(message.pcm)
-      else onVad?.({ speaking: message.speaking, quietMs: message.quietMs })
+      else {
+        const { speaking, loudMs, quietMs } = message
+        onVad?.({ speaking, loudMs, quietMs })
+      }
     }
     // If the worklet throws, frames stop, and the server ends the call 2 s later. Say why here.
     node.onprocessorerror = () => console.error('the mic worklet stopped with an error')

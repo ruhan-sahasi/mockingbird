@@ -125,7 +125,7 @@ describe('the capture worklet', () => {
     expect(frames(posted)).toHaveLength(59)
     const vad = posted.flatMap((p, i) => (messageOf(p).type === 'vad' ? [{ i, ...p }] : []))
     expect(vad.map((p) => p.message)).toEqual([
-      { type: 'vad', speaking: true },
+      { type: 'vad', speaking: true, loudMs: 60 },
       { type: 'vad', speaking: false, quietMs: 300 },
     ])
     // Frames 0 to 22 come before the first, and frames 23 to 44 between the two.

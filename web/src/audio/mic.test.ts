@@ -95,12 +95,12 @@ describe('startMic', () => {
     const pcm = new Int16Array(320)
 
     deliver({ type: 'frame', pcm })
-    deliver({ type: 'vad', speaking: true })
+    deliver({ type: 'vad', speaking: true, loudMs: 60 })
     deliver({ type: 'vad', speaking: false, quietMs: 300 })
 
     expect(frames).toEqual([pcm])
     expect(frames[0]).toBe(pcm)
-    expect(vad).toEqual([{ speaking: true }, { speaking: false, quietMs: 300 }])
+    expect(vad).toEqual([{ speaking: true, loudMs: 60 }, { speaking: false, quietMs: 300 }])
   })
 
   it('needs no onVad: frames still flow without one', async () => {

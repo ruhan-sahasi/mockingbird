@@ -2,13 +2,16 @@
 // it on every 20 ms frame of the mic, and the page times the interview's turns from what it says
 // (timing.ts).
 //
-// Speaking starts after a few loud frames in a row, so a click or a cough does not count. It
-// stops only after a stretch of quiet, so the gaps between words do not count either. That
-// stretch has already passed when the stop is reported, so the event says how long it was, and
-// the page backdates the stop by that much.
+// Speaking starts after a few loud frames in a row, so a click does not count. It stops only
+// after a stretch of quiet, so the gaps between words do not count either. Either way the
+// change happened before it is reported: the loud frames or the quiet stretch have already
+// passed. So each event says how long that was, and the page backdates the change by that much.
 
-/** A change in whether the candidate is speaking. `quietMs` comes with a stop. */
-export type VadEvent = { speaking: boolean; quietMs?: number }
+/**
+ * A change in whether the candidate is speaking. A start carries `loudMs` and a stop carries
+ * `quietMs`: how long ago, in ms, the change really happened.
+ */
+export type VadEvent = { speaking: boolean; loudMs?: number; quietMs?: number }
 
 export type VadOptions = {
   /** A frame this loud or louder, as RMS on the float scale of -1 to 1, is speech. */
@@ -44,7 +47,7 @@ export class EnergyVad {
       this.quietFor = 0
       if (this.speaking || this.loudFrames < this.startFrames) return null
       this.speaking = true
-      return { speaking: true }
+      return { speaking: true, loudMs: this.startFrames * this.frameMs }
     }
     this.loudFrames = 0
     if (!this.speaking) return null
