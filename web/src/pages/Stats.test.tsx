@@ -8,6 +8,7 @@ const STATS: Stats = {
   turns: 4,
   stop_to_audible_ms: { p50: 1420.4, p95: 2100, n: 3 },
   hops_ms: {
+    last_candidate_audio_to_request: 912.5,
     request_to_first_token: 410.2,
     first_token_to_first_chunk: 2,
     first_chunk_to_assistant_started: 380,
@@ -22,6 +23,7 @@ const EMPTY: Stats = {
   turns: 0,
   stop_to_audible_ms: { p50: null, p95: null, n: 0 },
   hops_ms: {
+    last_candidate_audio_to_request: null,
     request_to_first_token: null,
     first_token_to_first_chunk: null,
     first_chunk_to_assistant_started: null,
@@ -62,6 +64,7 @@ describe('StatsView', () => {
 
   it('shows the median of each server hop', () => {
     const { rows } = render(STATS)
+    expect(rows).toContain('Last candidate speech at the server to brain request | 913 ms')
     expect(rows).toContain('Brain request to first token from Claude | 410 ms')
     expect(rows).toContain('First token to first chunk sent to Vapi | 2 ms')
     expect(rows).toContain('First chunk to Vapi starting to speak | 380 ms')
@@ -72,6 +75,8 @@ describe('StatsView', () => {
     const { text } = render(STATS)
     expect(text).toContain('4 interviewer replies traced in the last 7 days.')
     expect(text).toContain('Cut-in rate: 25%')
+    expect(text).toContain('within 1.5 s of hearing it start')
+    expect(text).toContain('they catch only about the first 1 s')
   })
 
   it('shows n/a for a number with nothing measured, never 0 ms', () => {

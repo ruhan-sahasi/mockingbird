@@ -14,6 +14,7 @@ whatever the route is still doing.
 
 import asyncio
 import functools
+import gc
 import io
 import json
 import logging
@@ -21,6 +22,7 @@ import queue
 import threading
 import time
 import wave
+import weakref
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -67,7 +69,8 @@ ENDED_LINE = "Sorry, this interview has ended."
 DEFAULT_LINE = "Tell me more about that."
 HANG = object()  # a script step that never finishes, like a Claude reply still streaming
 
-MIC = bytes([1]) * 640  # one 20 ms frame from the browser
+MIC = bytes([1]) * 640  # one 20 ms frame from the browser, too quiet to count as speech
+SPEECH = bytes([0, 40]) * 320  # one 20 ms frame of the candidate talking (every sample 10240)
 VOICE = bytes([101]) * 640  # one 20 ms frame of the interviewer's voice
 
 
@@ -80,6 +83,7 @@ ASSISTANT_STARTED = frame(type="speech-update", status="started", role="assistan
 ASSISTANT_STOPPED = frame(type="speech-update", status="stopped", role="assistant", turn=1)
 USER_STARTED = frame(type="speech-update", status="started", role="user", turn=2)
 USER_STOPPED = frame(type="speech-update", status="stopped", role="user", turn=2)
+USER_INTERRUPTED = frame(type="user-interrupted", turnId="turn-2")
 
 
 class FakeStreamer:
@@ -136,7 +140,8 @@ class FakeAudioStore:
 
 
 class FakeVapi:
-    """Vapi's REST API. `delete_errors` makes delete_call fail for the calls named in it."""
+    """Vapi's REST API. `delete_errors` makes delete_call fail for the calls named in it, and
+    `create_delay` makes creating a call take that long, as it does against the real API."""
 
     def __init__(self) -> None:
         self.call_id = CALL_ID
@@ -144,9 +149,12 @@ class FakeVapi:
         self.error: Exception | None = None
         self.deleted: list[str] = []
         self.delete_errors: dict[str, Exception] = {}
+        self.create_delay = 0.0
 
     async def create_call(self, assistant: dict) -> VapiCall:
         self.assistants.append(assistant)
+        if self.create_delay:
+            await asyncio.sleep(self.create_delay)
         if self.error is not None:
             raise self.error
         return VapiCall(self.call_id, SOCKET_URL)
@@ -574,6 +582,59 @@ def test_a_call_records_and_uploads_both_tracks(client, app, fakes):
     assert recording["interviewer"]["frames"] == 3
 
 
+def test_mic_frames_sent_before_the_call_went_live_do_not_shift_the_candidate_track(
+    client, app, fakes
+):
+    # The page sends mic frames as soon as its socket opens, while the call is still being set
+    # up. They wait in the socket and reach the relay all at once when it starts, so the first
+    # one arrives near 0 ms whatever it holds. The track is dated from its newest frame instead.
+    fakes.vapi.create_delay = 0.3
+    body = start(client)
+    interview_id = body["interview_id"]
+
+    with client.websocket_connect(body["ws_path"]) as ws:
+        for _ in range(5):
+            ws.send_bytes(MIC)  # before the call is live
+        wait_until(lambda: fakes.vapi_socket.sent.count(MIC) == 5)
+        hang_up(app, ws, interview_id)
+
+    wait_until(lambda: get(client, fakes.store, interview_id).recording is not None)
+    candidate = get(client, fakes.store, interview_id).recording["candidate"]
+    assert candidate["frames"] == 5
+    assert candidate["start_ms"] == pytest.approx(candidate["last_frame_ms"] - 4 * 20)
+    # The five 20 ms frames hold 100 ms of audio, captured before the burst that delivered them.
+    assert candidate["start_ms"] < candidate["first_frame_ms"]
+
+
+def test_a_finished_calls_audio_is_freed_without_waiting_for_the_garbage_collector(
+    client, app, fakes
+):
+    # The session and its relay point at each other (the relay's live events read the session),
+    # and both reach the recorder. Unless the clean-up breaks that loop, a finished call's audio,
+    # tens of MB, stays in memory until Python's next full garbage collection. So this runs with
+    # the collector off: only reference counting can free the recorder.
+    body = start(client)
+    interview_id = body["interview_id"]
+    gc.disable()
+    try:
+        with client.websocket_connect(body["ws_path"]) as ws:
+            client.portal.call(fakes.vapi_socket.wait_reading)
+            recorder = weakref.ref(app.state.registry.by_interview(interview_id).recorder)
+            for _ in range(5):
+                ws.send_bytes(MIC)
+            wait_until(lambda: fakes.vapi_socket.sent.count(MIC) == 5)
+            client.portal.call(fakes.vapi_socket.deliver, VOICE)
+            assert ws.receive_bytes() == VOICE
+            hang_up(app, ws, interview_id)
+
+        wait_until(lambda: get(client, fakes.store, interview_id).recording is not None)
+        wait_until(lambda: not app.state.background)
+        wait_until(lambda: recorder() is None)
+    finally:
+        gc.enable()
+    assert get(client, fakes.store, interview_id).recording["status"] == "uploaded"
+
+
 def test_upload_failure_still_builds_the_report(client, app, fakes, caplog):
     caplog.set_level(logging.DEBUG)
     fakes.audio.put_error = RuntimeError("storage said secret-detail")
@@ -972,15 +1033,29 @@ def test_a_spoken_reply_is_traced_hop_by_hop_and_stored(client, app, fakes):
         assert ws.receive_bytes() == VOICE
         client.portal.call(fakes.vapi_socket.deliver, ASSISTANT_STOPPED)
 
+        ws.send_bytes(SPEECH)  # the end of the candidate's answer
+        ws.send_bytes(MIC)
+        wait_until(lambda: MIC in fakes.vapi_socket.sent)
         client.portal.call(fakes.vapi_socket.deliver, USER_STOPPED)
         assert said(ask(client, "I wrote the plan and shipped it.")) == DEFAULT_LINE
         client.portal.call(fakes.vapi_socket.deliver, ASSISTANT_STARTED)
         client.portal.call(fakes.vapi_socket.deliver, VOICE)
         assert ws.receive_bytes() == VOICE
+        # Vapi says the candidate talked over the reply at once, which stands in for a cut-in.
+        client.portal.call(fakes.vapi_socket.deliver, USER_INTERRUPTED)
+        assert ws.receive_json() == {"type": "flush"}
         # The browser times the reply itself and reports it on the same socket. A number out of
         # range is dropped, and a second report of the same number does not replace the first.
+        # Its talk over, 2.4 s into what the candidate heard, says it was no cut-in after all.
         ws.send_json({"type": "timing", "stop_to_audible_ms": 1420, "interrupt_to_silence_ms": -5})
-        ws.send_json({"type": "timing", "stop_to_audible_ms": 900, "interrupt_to_silence_ms": 180})
+        ws.send_json(
+            {
+                "type": "timing",
+                "stop_to_audible_ms": 900,
+                "interrupt_to_silence_ms": 180,
+                "talk_over_ms": 2400,
+            }
+        )
         hang_up(app, ws, interview_id)
 
     since = datetime.now(UTC) - timedelta(days=1)
@@ -991,12 +1066,14 @@ def test_a_spoken_reply_is_traced_hop_by_hop_and_stored(client, app, fakes):
         DEFAULT_LINE,
     )
     assert trace.user_stopped_ms is not None
+    assert trace.last_candidate_audio_ms <= trace.user_stopped_ms
     assert trace.user_stopped_ms <= trace.request_ms <= trace.first_token_ms
     assert trace.first_token_ms <= trace.first_chunk_ms <= trace.assistant_started_ms
     assert trace.assistant_started_ms <= trace.first_audio_ms
     assert trace.cut_in is False
     assert trace.browser_stop_to_audible_ms == 1420.0
     assert trace.interrupt_to_silence_ms == 180.0
+    assert trace.talk_over_ms == 2400.0
 
 
 class StepClock:
@@ -1039,6 +1116,67 @@ async def test_the_live_events_feed_the_calls_tracer():
     session.brain.finalize()
     assert session.tracer.committed() == [trace]
     assert trace.turn_idx == 2
+
+
+class SlowStreamer:
+    """Claude, taking 400 ms on `clock` to its first text, then saying DEFAULT_LINE. With
+    `silent`, it writes nothing at all, so the brain says its fallback line."""
+
+    def __init__(self, clock: StepClock, silent: bool = False) -> None:
+        self.clock = clock
+        self.silent = silent
+
+    def stream(self, *, system, messages):
+        return self._play()
+
+    async def _play(self):
+        self.clock.now += 0.4
+        if not self.silent:
+            yield DEFAULT_LINE
+
+
+def traced_session(silent: bool = False) -> tuple[LiveSession, StepClock]:
+    """A started session whose brain, tracer and Claude all run on one hand-moved clock."""
+    clock = StepClock()
+    plan = InterviewPlan(DEMO, [Question("q0", "Tell me about a time.", "ownership")])
+    brain = Brain(plan, SlowStreamer(clock, silent), clock)
+    session = LiveSession(make_interview_record("i1"), brain, token="", token_expires_at=0.0)
+    brain.start()
+    session.tracer = CallTracer(clock)
+    session.tracer.start()
+    return session, clock
+
+
+async def speak_reply(session: LiveSession, answer: str) -> TurnTrace:
+    """Vapi asks for a reply to `answer` and starts speaking it. Returns its trace."""
+    await collect(routes_vapi.start_reply(session, LlmRequest(CALL_ID, answer, None)))
+    await routes_ws._live_events(session)(SpeechUpdate(None, "assistant", "started"))
+    return session.brain.committing_trace
+
+
+async def test_the_wrap_up_line_is_never_timed_as_claudes_first_token():
+    # The wrap-up never goes to Claude, so it takes no time to write. Counted as Claude's first
+    # token it would drag that hop's median toward 0: with one follow-up, to 0 itself.
+    session, clock = traced_session()
+    follow_up = await speak_reply(session, "I led the migration.")
+    clock.now += DEMO.total_s  # past the wrap-up reserve
+    wrap_up = await speak_reply(session, "We shipped it.")
+    assert session.brain.finished
+
+    assert follow_up.first_token_ms - follow_up.request_ms == pytest.approx(400)
+    assert wrap_up.first_token_ms is None
+    assert wrap_up.request_ms is not None and wrap_up.first_chunk_ms is not None
+    session.brain.finalize()
+    hops = summarize_traces(session.tracer.committed())["hops_ms"]
+    assert hops["request_to_first_token"] == pytest.approx(400)
+    assert hops["first_chunk_to_assistant_started"] is not None
+
+
+async def test_a_fallback_line_after_claude_wrote_nothing_is_never_timed_as_its_first_token():
+    session, _ = traced_session(silent=True)
+    trace = await speak_reply(session, "I led the migration.")
+    assert trace.first_token_ms is None
+    assert trace.first_chunk_ms is not None  # the fallback line still went out to Vapi
 
 
 async def test_a_session_without_a_tracer_still_handles_every_live_event():

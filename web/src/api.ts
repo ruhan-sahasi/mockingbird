@@ -57,12 +57,13 @@ export type Stats = {
   stop_to_audible_ms: Spread
   // The median of each server hop.
   hops_ms: {
+    last_candidate_audio_to_request: number | null
     request_to_first_token: number | null
     first_token_to_first_chunk: number | null
     first_chunk_to_assistant_started: number | null
     assistant_started_to_first_audio: number | null
   }
-  // The share of spoken replies the candidate talked over within 1.5 s of their start.
+  // The share of spoken replies the candidate talked over within 1.5 s of hearing them start.
   cut_in_rate: number | null
   // Measured in the browser: talking over the interviewer to the interviewer going quiet.
   interrupt_to_silence_ms: Spread

@@ -4,25 +4,44 @@ One `CallTracer` runs per live call. Every stamp is in milliseconds since `start
 route calls when the call goes live, on the clock it is given (the server's monotonic clock).
 A `TurnTrace` holds one reply's stamps, in the order they happen:
 
-- `user_stopped_ms`: Vapi says the candidate stopped speaking;
+- `last_candidate_audio_ms`: the relay passes the candidate's last frame of speech before the
+  request, by the same energy test the browser uses to hear speech;
+- `user_stopped_ms`: Vapi says the candidate stopped speaking. Vapi says so only once it has
+  decided the answer is over, often just after it asked for the reply;
 - `request_ms`: Vapi's brain request for the reply arrives;
-- `first_token_ms`: the brain yields the reply's first text;
+- `first_token_ms`: the brain yields Claude's first text of the reply. A reply that starts with
+  a line the brain says itself (the wrap-up, or a fallback when Claude wrote nothing) has none;
 - `first_chunk_ms`: the first text goes out to Vapi;
 - `assistant_started_ms`: Vapi says it started speaking the reply;
 - `first_audio_ms`: the first audible interviewer frame passes through the relay.
 
-The browser's own two numbers, `browser_stop_to_audible_ms` and `interrupt_to_silence_ms`, are
-durations it measured itself and sent on the call's socket (`browser_timing`). They land on the
-reply Vapi is speaking when they arrive. The browser is not trusted: only a number of ms from 0
-to MAX_BROWSER_MS is kept, the first one for each field of a reply, and anything else is ignored
-(Review Focus 2). `cut_in` marks a reply the candidate interrupted within CUT_IN_WINDOW_MS of its
-start.
+The browser's own numbers, `browser_stop_to_audible_ms`, `interrupt_to_silence_ms` and
+`talk_over_ms`, are durations it measured itself and sent on the call's socket
+(`browser_timing`). They land on the reply Vapi is speaking when they arrive. The browser is not
+trusted: only a number of ms from 0 to MAX_BROWSER_MS is kept, the first one for each field of a
+reply, and anything else is ignored (Review Focus 2).
+
+`cut_in` marks a reply the candidate talked over within CUT_IN_WINDOW_MS of its start, the
+spec's proxy for the interviewer starting before the candidate had finished. The browser times
+that from the reply's first sample leaving the speakers to the candidate starting to talk
+(`talk_over_ms`), which is what the candidate lived. When the browser sent nothing, two Vapi
+events stand in: user-interrupted within CUT_IN_WINDOW_MS of assistant-started. That stand-in
+sees a shorter window, about the first 1 s of what the candidate heard, because Vapi says
+assistant-started 200 to 250 ms before the candidate hears the reply (more with a longer player
+pre-roll), and says user-interrupted only after 0.2 s of the candidate's voice (its
+stopSpeakingPlan voiceSeconds) plus its own detection, about 300 ms in. So the browser's number
+wins whenever there is one, even over a stand-in that came first.
 
 Vapi sends several requests per answer and speaks only the reply to the last one, so most traces
 are thrown away with their drafts. A trace counts once the brain writes its reply down as an
 interviewer turn and gives it that turn's idx. The opening line has no request, so Vapi starting
 to speak it gets an untimed trace that no turn ever claims: its audio and interruptions land
 there instead of on a reply they do not belong to, and it is never measured (Review Focus 3).
+
+The time from the candidate's last speech to the request is Vapi's wait to decide the answer
+is over plus its speech to text, so it is the only server hop that holds them. Like the stop,
+the candidate's latest speech is kept until Vapi next starts speaking a line, and then forgotten,
+so a reply with no candidate speech since the line before it has no such stamp.
 
 The candidate's latest stop is pending until Vapi next starts speaking a line. Every draft of
 the answer gets a copy of it. Vapi can say the candidate stopped only after the request for the
@@ -41,6 +60,12 @@ from dataclasses import dataclass
 # An interviewer frame this loud, as RMS on the int16 scale, is audible. Vapi streams silence
 # between replies, so loudness is what finds the first frame of speech.
 AUDIBLE_RMS = 300
+# A candidate frame this loud, as RMS on the int16 scale, is speech: the browser's own speech
+# threshold, 0.02 on the -1 to 1 scale (web/src/audio/vad.ts), times 32768.
+SPEECH_RMS = 655
+# Only this much of a candidate frame is measured: one 20 ms frame, all the page ever sends. The
+# page is not trusted, and a bigger frame must not cost the event loop more.
+_SPEECH_RMS_BYTES = 640
 # An interruption this soon after Vapi started speaking a reply marks it as a cut-in: the
 # interviewer most likely started before the candidate had finished.
 CUT_IN_WINDOW_MS = 1500
@@ -50,6 +75,7 @@ MAX_BROWSER_MS = 60000
 _BROWSER_FIELDS = {
     "stop_to_audible_ms": "browser_stop_to_audible_ms",
     "interrupt_to_silence_ms": "interrupt_to_silence_ms",
+    "talk_over_ms": "talk_over_ms",
 }
 
 
@@ -58,6 +84,7 @@ class TurnTrace:
     """One reply's stamps, in ms since the call went live. Each is None until it is stamped."""
 
     turn_idx: int | None = None  # the interviewer turn this reply became, once it is written down
+    last_candidate_audio_ms: float | None = None
     user_stopped_ms: float | None = None
     request_ms: float | None = None
     first_token_ms: float | None = None
@@ -66,6 +93,7 @@ class TurnTrace:
     first_audio_ms: float | None = None
     browser_stop_to_audible_ms: float | None = None
     interrupt_to_silence_ms: float | None = None
+    talk_over_ms: float | None = None  # how far into the reply, as heard, the candidate cut in
     cut_in: bool = False
 
 
@@ -98,6 +126,7 @@ class CallTracer:
         self._clock = clock
         self._t0: float | None = None
         self._user_stopped_ms: float | None = None  # the latest stop since Vapi last spoke a line
+        self._candidate_spoke_ms: float | None = None  # the latest speech since Vapi last spoke
         self._current: TurnTrace | None = None  # the reply Vapi is speaking, or spoke last
         self._spoken: list[TurnTrace] = []  # the timed replies Vapi started speaking, in order
 
@@ -120,8 +149,13 @@ class CallTracer:
     def new_trace(self) -> TurnTrace:
         """A trace for a brain request that just arrived, with a copy of the pending candidate
         stop. Vapi sends several requests per answer, so every draft of one answer gets the same
-        stop, and the stop stays pending: it is cleared only when Vapi starts speaking a line."""
-        return TurnTrace(user_stopped_ms=self._user_stopped_ms, request_ms=self._now_ms())
+        stop, and the stop stays pending: it is cleared only when Vapi starts speaking a line. The
+        candidate's latest speech is copied the same way."""
+        return TurnTrace(
+            last_candidate_audio_ms=self._candidate_spoke_ms,
+            user_stopped_ms=self._user_stopped_ms,
+            request_ms=self._now_ms(),
+        )
 
     def first_token(self, trace: TurnTrace) -> None:
         if trace.first_token_ms is None:
@@ -144,6 +178,7 @@ class CallTracer:
         if now is None:
             return
         pending, self._user_stopped_ms = self._user_stopped_ms, None
+        self._candidate_spoke_ms = None
         if trace is None:
             trace = TurnTrace()
         else:
@@ -155,9 +190,14 @@ class CallTracer:
         self._current = trace
 
     def on_audio(self, direction: str, frame: bytes) -> None:
-        """The relay's audio tap. The first audible interviewer frame after the current reply
-        started is its first audio. Once that is found nothing is measured until the next reply,
-        so the steady-state cost of a frame is a few comparisons."""
+        """The relay's audio tap. A candidate frame of speech is the candidate's latest speech.
+        The first audible interviewer frame after the current reply started is its first audio.
+        Once that is found no interviewer frame is measured until the next reply, so the
+        steady-state cost of one is a few comparisons."""
+        if direction == "candidate":
+            if _rms(frame[:_SPEECH_RMS_BYTES]) >= SPEECH_RMS:
+                self._candidate_spoke_ms = self._now_ms()
+            return
         turn = self._current
         if (
             direction != "interviewer"
@@ -170,19 +210,21 @@ class CallTracer:
             turn.first_audio_ms = self._now_ms()
 
     def user_interrupted(self) -> None:
-        """The candidate talked over the current reply. Within CUT_IN_WINDOW_MS of its start,
-        that is a cut-in."""
+        """Vapi says the candidate talked over the current reply. Within CUT_IN_WINDOW_MS of
+        Vapi starting it, that stands in for a cut-in, unless the browser has timed one."""
         now = self._now_ms()
         turn = self._current
         if now is None or turn is None or turn.assistant_started_ms is None:
             return
-        if now - turn.assistant_started_ms <= CUT_IN_WINDOW_MS:
+        if turn.talk_over_ms is None and now - turn.assistant_started_ms <= CUT_IN_WINDOW_MS:
             turn.cut_in = True
 
     def browser_timing(self, msg: dict) -> None:
         """The browser's timing message: its numbers go onto the reply being spoken. A number
         that is missing or not 0 to MAX_BROWSER_MS ms is ignored, and so is one the reply already
-        has: the first report wins. With no reply spoken yet there is nothing to put it on."""
+        has: the first report wins. With no reply spoken yet there is nothing to put it on. The
+        talk over number, once kept, decides whether the reply was a cut-in, whatever Vapi's
+        stand-in said."""
         turn = self._current
         if turn is None:
             return
@@ -190,6 +232,8 @@ class CallTracer:
             ms = _browser_ms(msg.get(key))
             if ms is not None and getattr(turn, field) is None:
                 setattr(turn, field, ms)
+                if field == "talk_over_ms":
+                    turn.cut_in = ms <= CUT_IN_WINDOW_MS
 
     def committed(self) -> list[TurnTrace]:
         """The traces of the replies that became interviewer turns, in the order spoken."""

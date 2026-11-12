@@ -88,6 +88,10 @@ describe('timingMessage', () => {
     ).toEqual({ type: 'timing', stop_to_audible_ms: 1420, interrupt_to_silence_ms: 180 })
   })
 
+  it('carries how far into the reply the candidate talked over it', () => {
+    expect(timingMessage({ talk_over_ms: 920 })).toBe('{"type":"timing","talk_over_ms":920}')
+  })
+
   it('leaves out a number that was not measured', () => {
     expect(timingMessage({ interrupt_to_silence_ms: 180 })).toBe(
       '{"type":"timing","interrupt_to_silence_ms":180}',

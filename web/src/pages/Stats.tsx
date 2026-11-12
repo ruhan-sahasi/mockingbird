@@ -37,6 +37,7 @@ export default function Stats() {
 }
 
 const HOPS: [keyof StatsData['hops_ms'], string][] = [
+  ['last_candidate_audio_to_request', 'Last candidate speech at the server to brain request'],
   ['request_to_first_token', 'Brain request to first token from Claude'],
   ['first_token_to_first_chunk', 'First token to first chunk sent to Vapi'],
   ['first_chunk_to_assistant_started', 'First chunk to Vapi starting to speak'],
@@ -107,7 +108,8 @@ export function StatsView({
           </table>
           <p className="stats-note">
             Cut-in rate: {percent(stats.cut_in_rate)}. A cut-in is the candidate talking over a
-            reply within 1.5 s of its start.
+            reply within 1.5 s of hearing it start, as the page times it. For a reply the page sent
+            no timing for, two Vapi events stand in, and they catch only about the first 1 s.
           </p>
           {stats.consider_ducking && (
             <p className="stats-note">

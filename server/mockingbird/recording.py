@@ -3,6 +3,13 @@
 Audio on both sockets is raw pcm_s16le, mono, 16 kHz, in 20 ms frames of 640 bytes. Each track
 keeps what it is given, up to a cap, so a call that runs long or a browser that sends oversized
 frames cannot grow memory without bound.
+
+Each track's `start_ms` places it on the relay's clock, in ms since the call went live: sample k
+was captured at start_ms + k / 16 ms. It is worked back from the track's newest frame, not taken
+from its first one. The page sends mic frames from the moment its socket opens, while the call
+is still being set up, and those frames wait in the socket's buffers until the relay starts and
+reads them all at once. So the candidate track's first frame arrives near 0 ms whatever it
+holds, and only the frames after that backlog arrive as they are captured.
 """
 
 import logging
@@ -18,6 +25,7 @@ log = logging.getLogger(__name__)
 SAMPLE_RATE = 16000
 FRAME_BYTES = 640  # one 20 ms frame of 16 kHz s16le mono
 FRAMES_PER_SECOND = 50
+BYTES_PER_MS = SAMPLE_RATE * 2 / 1000
 # The cap leaves room past the call's own time cap for the hang-up to finish.
 CAP_MARGIN_S = 60
 
@@ -53,21 +61,40 @@ class TrackRecorder:
         self.max_frames = max_frames
         self.frames = 0
         self.dropped = 0
-        self.first_frame_ms: float | None = None
+        self.first_frame_ms: float | None = None  # when the first frame kept arrived
+        self.last_frame_ms: float | None = None  # when the newest frame kept arrived
+        # When the track's first sample was captured: the newest frame's arrival, less the
+        # length of all the audio kept before it. None until a frame is kept.
+        self.start_ms: float | None = None
         self._max_bytes = max_frames * FRAME_BYTES
+        self._kept_bytes = 0
         self._buf = bytearray()
 
     def append(self, frame: bytes, at_ms: float) -> None:
-        if self.frames >= self.max_frames or len(self._buf) + len(frame) > self._max_bytes:
+        if self.frames >= self.max_frames or self._kept_bytes + len(frame) > self._max_bytes:
             self.dropped += 1
             return
         if self.first_frame_ms is None:
             self.first_frame_ms = at_ms
         self._buf += frame
+        self._kept_bytes += len(frame)
         self.frames += 1
+        self.last_frame_ms = at_ms
+        self.start_ms = at_ms - (self._kept_bytes - len(frame)) / BYTES_PER_MS
 
     def pcm(self) -> bytes:
         return bytes(self._buf)
+
+    def take_wav(self) -> bytes:
+        """The track as a WAV file. The track lets go of its audio as it builds it, so the WAV is
+        the only copy left. The counts and times stay, for `metadata()`."""
+        wav = wav_bytes(self._buf)
+        self.release()
+        return wav
+
+    def release(self) -> None:
+        """Let go of the audio. The counts and times stay, for `metadata()`."""
+        self._buf = bytearray()
 
 
 class CallRecorder:
@@ -89,14 +116,24 @@ class CallRecorder:
         track = self.candidate if direction == "candidate" else self.interviewer
         track.append(frame, (self._clock() - self._t0) * 1000)
 
+    def tracks(self) -> tuple[tuple[str, TrackRecorder], ...]:
+        return (("candidate", self.candidate), ("interviewer", self.interviewer))
+
+    def release(self) -> None:
+        """Let go of both tracks' audio. The counts and times stay, for `metadata()`."""
+        for _, track in self.tracks():
+            track.release()
+
     def metadata(self) -> dict:
         return {
             name: {
                 "frames": track.frames,
                 "dropped": track.dropped,
                 "first_frame_ms": track.first_frame_ms,
+                "last_frame_ms": track.last_frame_ms,
+                "start_ms": track.start_ms,
             }
-            for name, track in (("candidate", self.candidate), ("interviewer", self.interviewer))
+            for name, track in self.tracks()
         }
 
 
@@ -108,17 +145,23 @@ async def upload_recording(
     Never raises: a call that cannot be recorded still has its report. On any failure the
     interview's `recording` says `upload_failed` and the log gets the exception type only,
     because a storage error can carry the project URL or the service key (ruling R19).
+
+    The recorder lets go of its audio as it goes, and all of it by the end whatever happened, so
+    a finished call's audio is never kept in memory after its upload, by anything that still
+    holds the recorder.
     """
     try:
         base = f"interviews/{interview_id}"
-        # One track at a time, each WAV built once, so a 20-minute track (about 40 MB) is never
-        # held in more than one extra copy at once.
-        await audio.put_wav(f"{base}/candidate.wav", wav_bytes(recorder.candidate.pcm()))
-        await audio.put_wav(f"{base}/interviewer.wav", wav_bytes(recorder.interviewer.pcm()))
+        # One track at a time. Building a track's WAV lets go of its audio, so a 20-minute track
+        # (about 40 MB) is held twice only while its WAV is built, and once while it uploads.
+        for name, track in recorder.tracks():
+            await audio.put_wav(f"{base}/{name}.wav", track.take_wav())
         recording = {"status": "uploaded", **recorder.metadata()}
     except Exception as exc:
         log.error("could not upload the recording: %s", type(exc).__name__)
         recording = {"status": "upload_failed"}
+    finally:
+        recorder.release()
     try:
         await store.update_interview(interview_id, recording=recording)
     except Exception as exc:

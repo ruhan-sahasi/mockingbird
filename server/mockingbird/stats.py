@@ -9,7 +9,8 @@ each spread says how many turns it is over, as `n`.
   but never stand in for it.
 - `hops_ms` is the median of each server hop, worked out within each turn from its two stamps.
 - `cut_in_rate` is the share of spoken replies the candidate talked over within 1.5 s of their
-  start (tracing.py's CUT_IN_WINDOW_MS).
+  start (tracing.py's CUT_IN_WINDOW_MS), as the browser timed it from what the candidate heard,
+  or as two Vapi events stand in for it when the browser sent nothing.
 - `interrupt_to_silence_ms` is the browser's measure of how long the interviewer keeps sounding
   after the candidate talks over it. Ducking the interviewer audio in the browser is not built,
   and `consider_ducking` says when its p95 is long enough that it should be.
@@ -23,6 +24,7 @@ from mockingbird.tracing import TurnTrace
 DUCKING_P95_MS = 300
 # Each server hop, by name, as the two stamps of a turn it runs between.
 HOPS = {
+    "last_candidate_audio_to_request": ("last_candidate_audio_ms", "request_ms"),
     "request_to_first_token": ("request_ms", "first_token_ms"),
     "first_token_to_first_chunk": ("first_token_ms", "first_chunk_ms"),
     "first_chunk_to_assistant_started": ("first_chunk_ms", "assistant_started_ms"),

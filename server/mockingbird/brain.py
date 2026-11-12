@@ -18,6 +18,9 @@ answer, so it is graded with the rest.
 A draft can carry a latency `TurnTrace` (tracing.py). The trace is only carried, never stamped
 here: when the draft's reply is written down as an interviewer turn, the trace gets that turn's
 idx, which is what makes it count. A draft that is never spoken leaves its trace without one.
+The text a draft yields is Claude's, except the wrap-up and fallback lines, which the brain says
+itself. Those come as `FixedLine`, so the caller can tell them apart and never time them as
+Claude's first token.
 
 The history is append-only and always settles into a shape the Claude API accepts: it starts with
 a user message, and every system message sits right after a user message and right before an
@@ -164,6 +167,11 @@ FALLBACK_LINE: dict[MoveKind, str] = {
 
 # Wrap-up never calls Claude, so the last thing the candidate hears is always this.
 WRAP_UP_LINE = "Thanks, that's all the time we have. Your report will be ready in about a minute."
+
+
+class FixedLine(str):
+    """Text the brain says itself, not text Claude wrote: the wrap-up line and the fallback
+    lines. It is a str, so it streams like any other text."""
 
 
 # A word is a run of letters and digits. A hyphen inside one ("twenty-five") keeps it a single
@@ -315,7 +323,7 @@ class Brain:
             if draft.instruction is None:
                 draft.chunks.append(WRAP_UP_LINE)
                 draft.produced = True
-                yield WRAP_UP_LINE
+                yield FixedLine(WRAP_UP_LINE)
                 return
 
             # The history is not touched: this list is the request, and it is a copy.
@@ -361,7 +369,7 @@ class Brain:
                 # after it, so the move (and the question, if it is a new one) is still carried
                 # out. Add a space if the partial text does not end in one.
                 lead = " " if said and not said[-1].isspace() else ""
-                fallback = lead + _fallback(move)
+                fallback = FixedLine(lead + _fallback(move))
                 draft.chunks.append(fallback)
             draft.produced = True
             if fallback is not None:

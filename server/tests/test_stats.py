@@ -7,6 +7,7 @@ from mockingbird.stats import percentile, summarize_traces
 from mockingbird.tracing import TurnTrace
 
 HOPS = {
+    "last_candidate_audio_to_request": ("last_candidate_audio_ms", "request_ms"),
     "request_to_first_token": ("request_ms", "first_token_ms"),
     "first_token_to_first_chunk": ("first_token_ms", "first_chunk_ms"),
     "first_chunk_to_assistant_started": ("first_chunk_ms", "assistant_started_ms"),
@@ -83,19 +84,21 @@ def test_interrupt_to_silence_skips_turns_that_were_not_interrupted():
 def test_each_hop_median_comes_from_the_differences_within_each_turn():
     traces = [
         spoken(
+            last_candidate_audio_ms=start - wait,
             request_ms=start,
             first_token_ms=start + token,
             first_chunk_ms=start + token + 5,
             assistant_started_ms=start + token + 5 + speak,
             first_audio_ms=start + token + 5 + speak + audio,
         )
-        for start, token, speak, audio in (
-            (0, 400, 500, 90),
-            (8000, 600, 300, 120),
-            (20000, 500, 700, 60),
+        for wait, start, token, speak, audio in (
+            (900, 1000, 400, 500, 90),
+            (700, 8000, 600, 300, 120),
+            (1200, 20000, 500, 700, 60),
         )
     ]
     assert summarize_traces(traces)["hops_ms"] == {
+        "last_candidate_audio_to_request": 900.0,
         "request_to_first_token": 500.0,
         "first_token_to_first_chunk": 5.0,
         "first_chunk_to_assistant_started": 500.0,

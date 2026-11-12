@@ -558,6 +558,7 @@ def test_only_an_answer_that_can_still_change_is_asked_for_again():
 # --- the stats -----------------------------------------------------------------------------------
 
 HOPS = {
+    "last_candidate_audio_to_request": 900.0,
     "request_to_first_token": 410.0,
     "first_token_to_first_chunk": 2.0,
     "first_chunk_to_assistant_started": 380.0,
@@ -592,9 +593,9 @@ def test_the_summary_line_includes_the_stats():
         "Stats (last day): stop-to-audible p50 1420 ms over 3 turns, cut-in rate 25%"
     )
     assert step(text, "Server hops") == (
-        "Server hops (last day, median): request to first token 410 ms, first token to first "
-        "chunk 2 ms, first chunk to assistant started 380 ms, assistant started to first audio "
-        "95 ms"
+        "Server hops (last day, median): last candidate speech to request 900 ms, request to "
+        "first token 410 ms, first token to first chunk 2 ms, first chunk to assistant started "
+        "380 ms, assistant started to first audio 95 ms"
     )
     assert "RESULT: PASS" in text
 

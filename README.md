@@ -113,8 +113,8 @@ flowchart LR
 The number that matters is how long the candidate waits: from the moment they stop talking to
 the moment they hear the interviewer. The browser measures it at both ends, and the server
 breaks it into hops. When a call ends, each interviewer reply that became a turn is saved as one
-row of `latency_traces` (`server/migrations/003_latency_traces.sql`), and `/api/stats` sums up
-the rows.
+row of `latency_traces` (`server/migrations/003_latency_traces.sql`, with more stamps added in
+`004_latency_traces_more_stamps.sql`), and `/api/stats` sums up the rows.
 
 **Measured in the browser.** Both ends of each number are stamped on the page clock,
 `performance.now()`, so no other clock has to agree with it (`web/src/timing.ts`).
@@ -129,7 +129,8 @@ the rows.
   timed. A stop while the interviewer is talking, or one followed by more speech, is not.
 - **Interrupt to silence**: from the candidate starting to talk over the interviewer to the
   interviewer going quiet, after the server tells the page to flush the reply. The start is
-  backdated by the three loud frames the threshold needs, and the output latency is added.
+  backdated by the three loud frames the threshold needs, and the output latency is added. Talk
+  over the reply that ends with no flush, such as an "mm-hmm" Vapi lets pass, is not a start.
 
 The page sends each number on the call socket as a `timing` message. The server ties it to the
 reply Vapi is speaking and keeps only numbers from 0 to 60000 ms, the first of each kind per
@@ -137,12 +138,23 @@ reply (`server/mockingbird/tracing.py`).
 
 **Measured on the server**, on its monotonic clock (`server/mockingbird/tracing.py`):
 
+- last candidate speech to request: the relay passes the candidate's last frame of speech, by the
+  same 0.02 threshold the browser uses, and then Vapi asks the brain for a reply. This is Vapi
+  deciding the answer is over plus its speech to text, usually the biggest part of the wait, and
+  the hop that Vapi's wait-before-reply setting tunes. A reply with no candidate speech since the
+  line before it is left out.
 - request to first token: Vapi asks the brain for a reply, and Claude streams its first text.
+  The wrap-up line never goes to Claude, and neither does a fallback line said when Claude wrote
+  nothing, so a reply that starts with one is left out of this hop and the next.
 - first token to first chunk: that text goes out to Vapi.
 - first chunk to assistant started: Vapi says it started speaking the reply.
 - assistant started to first audio: the first loud interviewer frame passes through the relay.
-- **Cut-in rate**: the share of spoken replies the candidate talked over within 1.5 s of their
-  start. It stands in for the interviewer starting before the candidate had finished.
+- **Cut-in rate**: the share of spoken replies the candidate talked over within 1.5 s of hearing
+  them start. It stands in for the interviewer starting before the candidate had finished. The
+  page times it: when the server flushes a reply, it sends `talk_over_ms`, from the first sample
+  of the reply leaving the speakers to the start of the candidate talking over it, and the
+  server counts a cut-in at 1500 ms or less. For a reply the page sent no such number for, two
+  Vapi events stand in: `user-interrupted` within 1.5 s of `speech-update` assistant started.
 
 A turn missing a stamp, such as a reply the page sent no timing for, is left out of that number
 and never counts as 0 ms. The two browser numbers say how many turns they are over
@@ -166,6 +178,12 @@ the endpoint and the page are public.
   much short.
 - An energy threshold can hear a stop early or late in a noisy room, which moves stop to
   audible with it.
+- The Vapi stand-in for a cut-in sees only about the first 1 s of what the candidate heard, so
+  it undercounts. Vapi says the reply started 200 to 250 ms before the candidate hears it (the
+  player alone waits for 0.1 s of audio, `PREROLL_S`), and says the candidate interrupted only
+  after 0.2 s of their voice (`voiceSeconds` in `server/mockingbird/vapi_client.py`) plus its own
+  detection. Raising either one shrinks that window further, so it is used only when the page
+  sent no `talk_over_ms`.
 - The server puts a browser number on the reply Vapi is speaking when the number arrives. Tests
   check this against a fake Vapi only, so the first live call has to confirm it.
 
@@ -287,8 +305,8 @@ terraform -chdir=infra init -backend=false
 terraform -chdir=infra validate
 ```
 
-Counts from a run on this branch on 2026-11-11: `uv run pytest -q` printed
-`786 passed, 66 skipped`, and `npm test` printed `280 passed (280)` across 19 test files. The
+Counts from a run on this branch on 2026-11-12: `uv run pytest -q` printed
+`807 passed, 66 skipped`, and `npm test` printed `288 passed (288)` across 19 test files. The
 66 skipped tests are the PostgresStore tests in `server/tests/test_store.py`, which run only when
 `TEST_DATABASE_URL` points at a Postgres database (a direct connection, for example
 `postgresql://postgres:postgres@localhost:5432/postgres`).

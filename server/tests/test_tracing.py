@@ -102,6 +102,51 @@ def test_first_audio_ignores_frames_before_assistant_started_and_silent_frames(t
     assert trace.first_audio_ms == 1000.0
 
 
+def test_a_request_takes_the_candidates_last_speech_before_it(tracer, clock):
+    # The time from it to the request is Vapi deciding the answer is over, plus its speech to
+    # text: the part of the wait no other hop holds.
+    clock.advance(1.0)
+    tracer.on_audio("candidate", LOUD)
+    clock.advance(0.02)
+    tracer.on_audio("candidate", pcm(-655))  # at the threshold: the browser's 0.02, as int16
+    clock.advance(0.02)
+    tracer.on_audio("candidate", pcm(654))  # just below it: a quiet room, not speech
+    tracer.on_audio("candidate", SILENT)
+    tracer.on_audio("interviewer", LOUD)  # the interviewer is never the candidate
+    clock.advance(0.66)
+    first = tracer.new_trace()
+    clock.advance(0.3)
+    second = tracer.new_trace()  # Vapi asks again for the same answer
+
+    assert first.last_candidate_audio_ms == second.last_candidate_audio_ms
+    assert first.last_candidate_audio_ms == pytest.approx(1020)
+    assert second.request_ms - second.last_candidate_audio_ms == pytest.approx(980)
+
+
+def test_the_candidates_speech_is_forgotten_once_vapi_speaks_a_line(tracer, clock):
+    tracer.on_audio("candidate", LOUD)
+    reply = tracer.new_trace()
+    tracer.assistant_started(reply)
+    clock.advance(5.0)
+    # No speech since: the next reply has nothing to measure from, rather than the old answer.
+    assert tracer.new_trace().last_candidate_audio_ms is None
+
+    tracer.on_audio("candidate", LOUD)
+    tracer.assistant_started(None)  # an untimed line clears it too
+    assert tracer.new_trace().last_candidate_audio_ms is None
+
+
+def test_only_one_frames_worth_of_a_candidate_frame_is_measured(tracer, monkeypatch):
+    # The page sends 640-byte frames. A bigger one from a broken or hostile page must not make
+    # the event loop work out the RMS of all of it.
+    measured = []
+    real = tracing._rms
+    monkeypatch.setattr(tracing, "_rms", lambda frame: measured.append(len(frame)) or real(frame))
+    tracer.on_audio("candidate", LOUD * 1000)
+    assert measured == [640]
+    assert tracer.new_trace().last_candidate_audio_ms == 0.0
+
+
 @pytest.mark.parametrize("frame", [b"", b"\x01", SILENT[:-1], SILENT + b"\x7f"])
 def test_a_short_empty_or_odd_frame_never_raises_and_is_not_audible(tracer, frame):
     trace = tracer.new_trace()
@@ -142,6 +187,40 @@ def test_an_interruption_within_1500_ms_of_the_start_is_a_cut_in(tracer, clock, 
     clock.advance(after_s)
     tracer.user_interrupted()
     assert trace.cut_in is cut_in
+
+
+@pytest.mark.parametrize(("talk_over_ms", "cut_in"), [(0, True), (1500, True), (1500.5, False)])
+def test_the_browsers_talk_over_decides_the_cut_in_over_vapis_stand_in(
+    tracer, clock, talk_over_ms, cut_in
+):
+    # Vapi says user-interrupted 0.3 s into the reply as it started it, which stands in for a
+    # cut-in. Then the browser, which heard the reply start later than Vapi started it, says how
+    # far into what the candidate heard the cut-in came, and that is what counts.
+    trace = spoken_reply(tracer)
+    clock.advance(0.3)
+    tracer.user_interrupted()
+    assert trace.cut_in is True
+    tracer.browser_timing({"type": "timing", "talk_over_ms": talk_over_ms})
+    assert (trace.talk_over_ms, trace.cut_in) == (talk_over_ms, cut_in)
+
+
+def test_vapis_stand_in_never_overrules_the_browsers_talk_over(tracer, clock):
+    trace = spoken_reply(tracer)
+    tracer.browser_timing({"type": "timing", "talk_over_ms": 2400})
+    clock.advance(0.5)
+    tracer.user_interrupted()  # a second interruption, inside Vapi's window
+    assert trace.cut_in is False
+
+
+def test_the_first_talk_over_wins_and_a_bad_one_leaves_the_stand_in(tracer, clock):
+    trace = spoken_reply(tracer)
+    tracer.user_interrupted()
+    tracer.browser_timing({"type": "timing", "talk_over_ms": -5})
+    tracer.browser_timing({"type": "timing", "talk_over_ms": "300"})
+    assert (trace.talk_over_ms, trace.cut_in) == (None, True)
+    tracer.browser_timing({"type": "timing", "talk_over_ms": 2400})
+    tracer.browser_timing({"type": "timing", "talk_over_ms": 100})
+    assert (trace.talk_over_ms, trace.cut_in) == (2400, False)
 
 
 def test_the_opening_lines_untimed_trace_never_appears_in_committed(tracer, clock):

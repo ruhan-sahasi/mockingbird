@@ -9,17 +9,22 @@ Vapi's text frames here have the shapes recorded in fixtures/vapi/ws_text_frames
 """
 
 import asyncio
+import gc
 import json
 import logging
+import weakref
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from starlette.websockets import WebSocket
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from websockets.frames import Close
 
+from mockingbird import relay as relay_module
 from mockingbird.relay import (
     FLUSH,
+    MAX_TEXT_CHARS,
     PING,
     TIMING_PER_S,
     Relay,
@@ -711,6 +716,31 @@ async def test_on_audio_exception_does_not_stop_relaying(caplog):
     assert not [line for line in logged if CALL_ID in line or "recorder bug" in line]
 
 
+async def test_a_relay_that_ended_is_freed_without_the_garbage_collector():
+    # The callbacks reach everything the call holds, its recorded audio included. The way run()
+    # stops its TaskGroup leaves a loop of references that only the garbage collector frees,
+    # unless run() breaks it, so this runs with the collector off.
+    class Recorder:
+        def on_audio(self, direction: str, frame: bytes) -> None:
+            pass
+
+    recorder = Recorder()
+    alive = weakref.ref(recorder)
+    gc.disable()
+    try:
+        relay, browser, vapi = make_relay(on_audio=recorder.on_audio)
+        del recorder
+        task = await start(relay)
+        browser.incoming.put_nowait(MIC_1)
+        assert await vapi.next_sent() == MIC_1
+        await relay.end("plan_done")
+        assert await finished(task) == "plan_done"
+        del relay, task
+        assert alive() is None
+    finally:
+        gc.enable()
+
+
 async def test_logs_never_hold_frame_contents(caplog):
     # Ruling R19: the call id is a credential. Socket frames do not carry it today, but the relay
     # logs only a frame's type, so it could not leak one that did.
@@ -875,6 +905,32 @@ async def test_a_flood_of_malformed_or_huge_text_never_disturbs_the_relay(caplog
 
     assert len(passed) == 10  # the first ten that parsed, the rest of the flood cut
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+async def test_a_text_frame_over_the_size_limit_is_dropped_before_it_is_parsed(monkeypatch):
+    # Parsing a 16 MiB frame takes a third of a second or more on the event loop every live call
+    # shares, so a page that sends long text must not get it parsed at all.
+    parsed: list[int] = []
+
+    def loads(text, *args, **kwargs):
+        parsed.append(len(text))
+        return json.loads(text, *args, **kwargs)
+
+    monkeypatch.setattr(relay_module, "json", SimpleNamespace(loads=loads, dumps=json.dumps))
+    passed: list = []
+    relay, browser, vapi = make_relay(on_browser_message=passed.append, clock=StepClock())
+    task = await start(relay)
+
+    room = MAX_TEXT_CHARS - len(timing(1, pad=""))  # the padding that fills a frame to the limit
+    at_limit, over = timing(1, pad="x" * room), timing(2, pad="x" * (room + 1))
+    assert (len(at_limit), len(over)) == (MAX_TEXT_CHARS, MAX_TEXT_CHARS + 1)
+    await relayed(browser, vapi, over, "[" * 100_000, at_limit, frame(type="end") + " " * 2000)
+    await relay.end("plan_done")
+    assert await finished(task) == "plan_done"
+
+    assert parsed == [MAX_TEXT_CHARS]  # only the frame at the limit was parsed
+    assert [m["stop_to_audible_ms"] for m in passed] == [1]
+    assert MAX_TEXT_CHARS < 2000
 
 
 async def test_on_browser_message_failing_does_not_stop_relaying(caplog):

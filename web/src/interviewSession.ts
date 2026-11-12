@@ -9,7 +9,7 @@
 //
 // It also times each turn (timing.ts): the mic's VAD says when the candidate stops and starts
 // speaking, the player says when the interviewer is heard and goes quiet, and the server's flush
-// marks a cut-in. Each number goes to the server as a timing text frame as soon as it is known,
+// marks a cut-in, and how far into the reply it came. Each number goes to the server as a timing text frame as soon as it is known,
 // if the socket is open then, and is dropped otherwise.
 //
 // The server's text frames and close codes are in server/tests/fixtures/wire_protocol.json, which
@@ -153,7 +153,7 @@ export function runInterview(deps: SessionDeps, events: SessionEvents): Session 
         if (typeof data === 'string') {
           const message = parseServerMessage(data)
           if (message?.type === 'flush') {
-            timer.flushed()
+            report(timer.flushed())
             player?.flush()
           } else if (message?.type === 'ended') leaveFor(() => events.onEnded(id))
           return

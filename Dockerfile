@@ -44,5 +44,7 @@ EXPOSE 8000
 # --no-access-log: the access log would record the Vapi paths' secrets and the socket's token.
 # --timeout-keep-alive 310: must stay above the ALB idle timeout (300 s, infra/alb.tf), or uvicorn
 # closes a connection the ALB still means to reuse, and the next request through it gets a 502.
+# --ws-max-size 65536: the browser sends 640-byte mic frames and text under 200 characters, so a
+# message of over 64 KiB is refused before the app sees it, not read in at up to 16 MiB.
 ENTRYPOINT ["/app/scripts/entrypoint.sh"]
-CMD ["uv", "run", "uvicorn", "mockingbird.app:app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--timeout-keep-alive", "310"]
+CMD ["uv", "run", "uvicorn", "mockingbird.app:app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--timeout-keep-alive", "310", "--ws-max-size", "65536"]

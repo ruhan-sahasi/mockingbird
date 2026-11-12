@@ -214,6 +214,9 @@ async def _clean_up(
     await _stop_reply(session)
     session.brain.finalize()
 
+    recorder = session.recorder
+    _let_go_of_the_call(session)
+
     if ending.live_since is None:
         await _attempt(
             "mark the interview abandoned",
@@ -232,11 +235,20 @@ async def _clean_up(
             store.add_latency_traces(interview_id, session.tracer.committed()),
         )
     state.registry.remove(interview_id)
-    if session.recorder is not None:
-        _in_background(
-            state, upload_recording(store, state.audio_store, interview_id, session.recorder)
-        )
+    if recorder is not None:
+        _in_background(state, upload_recording(store, state.audio_store, interview_id, recorder))
     _in_background(state, build_report(store, state.grader, interview_id))
+
+
+def _let_go_of_the_call(session: LiveSession) -> None:
+    """Drop the session's hold on the call's relay and recorder once the relay has ended.
+
+    The relay's live events read the session, so the session and its relay hold each other, and
+    both reach the recorder's audio, tens of MB. Reference counting cannot free a loop like that,
+    so without this a finished call's audio would wait for Python's next full garbage collection,
+    which on a busy server can be many calls away. The upload is handed the recorder itself."""
+    session.relay = None
+    session.recorder = None
 
 
 async def _stop_reply(session: LiveSession) -> None:

@@ -15,7 +15,9 @@ socket. The browser may send two kinds of text, each a JSON object:
   The browser is not trusted, so at most TIMING_PER_S of them are passed on in any one second
   and the rest are dropped. The relay does not read the numbers; the tracer judges them.
 Any other text is dropped, and so is text that is not a JSON object, deeply nested JSON included
-(Review Focus 2).
+(Review Focus 2). Text longer than MAX_TEXT_CHARS is dropped before it is parsed at all: parsing
+runs on the one event loop that relays every live call's audio, and a page could otherwise send
+megabytes of JSON for it to parse, again and again.
 
 `run()` holds two pumps (one per direction), a cap timer and a browser ping under one
 TaskGroup. `end(reason)` starts the hang-up and stops that group. The hang-up runs as its own
@@ -95,6 +97,9 @@ OnBrowserMessage = Callable[[dict], None]
 # At most this many timing messages from the browser are passed on in any one second. The rest
 # are dropped. A page sends one or two per turn, so only a broken or hostile one gets near it.
 TIMING_PER_S = 10
+# The longest browser text frame the relay parses. The end and timing messages the page sends are
+# under 200 characters, so only a broken or hostile page sends more.
+MAX_TEXT_CHARS = 1024
 
 
 class SocketClosed(Exception):
@@ -252,8 +257,12 @@ class Relay:
                 tg.create_task(self._end_at_cap())
                 tg.create_task(self._ping_browser())
                 tg.create_task(self._stop_when_ending())
-        except* _Stopped:
-            pass
+        except* _Stopped as stopped:
+            # Python 3.12's TaskGroup keeps the group it raises in a local of its own frame,
+            # which that group's traceback holds: a loop only the garbage collector frees. The
+            # traceback also reaches this frame and the route's, so everything the call holds,
+            # its recorded audio included, would wait for that. Clearing the frames breaks it.
+            traceback.clear_frames(stopped.__traceback__)
         finally:
             # Normally end() has already started the hang-up, and this waits for it to finish.
             # Otherwise a task failed or run() was cancelled, and this hangs up now.
@@ -334,6 +343,9 @@ class Relay:
                 except SocketClosed:
                     await self.end("vapi_closed")
                     return
+            elif len(frame) > MAX_TEXT_CHARS:
+                # Never the frame itself, and never parsed: see MAX_TEXT_CHARS.
+                log.debug("dropped a browser text frame of over %s characters", MAX_TEXT_CHARS)
             else:
                 message = _json_object(frame)
                 kind = None if message is None else message.get("type")
