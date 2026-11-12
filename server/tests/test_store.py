@@ -14,6 +14,7 @@ import os
 import traceback
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from mockingbird.migrate import migrate as run_migrate
 from mockingbird.models import Interview, Turn
 from mockingbird.report import GradeResult, ItemGrade, QuestionGrade, _empty_report, verify_quotes
 from mockingbird.store import MemoryStore, PostgresStore, _score_rows, create_pool
+from mockingbird.tracing import TurnTrace
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 needs_postgres = pytest.mark.skipif(
@@ -344,6 +346,68 @@ async def test_the_recording_round_trips_and_is_a_copy(store):
 
     await store.update_interview("i1", recording={"status": "upload_failed"})
     assert (await store.get_interview("i1")).recording == {"status": "upload_failed"}
+
+
+async def test_latency_traces_round_trip_and_are_listed_from_a_time_on(store, clock):
+    await store.create_interview(make_interview("i1"))
+    await store.create_interview(make_interview("i2"))
+    timed = TurnTrace(
+        turn_idx=2,
+        user_stopped_ms=1000.0,
+        request_ms=1250.5,
+        first_token_ms=1700.25,
+        first_chunk_ms=1710.0,
+        assistant_started_ms=2100.0,
+        first_audio_ms=2160.0,
+        browser_stop_to_audible_ms=1300.0,
+        interrupt_to_silence_ms=180.0,
+        cut_in=True,
+    )
+    untimed = TurnTrace(turn_idx=4, request_ms=9000.0)  # every other hop missing
+    await store.add_latency_traces("i1", [timed, untimed])
+    timed.cut_in = False  # changing what was written does not change the store
+
+    clock.now = NOW + timedelta(days=2)
+    later = TurnTrace(turn_idx=2, request_ms=10.0)
+    await store.add_latency_traces("i2", [later])
+    await store.add_latency_traces("i2", [])  # nothing to write is fine
+
+    everything = await store.list_latency_traces(NOW - timedelta(days=1))
+    assert everything == [replace(timed, cut_in=True), untimed, later]
+    assert await store.list_latency_traces(NOW + timedelta(days=1)) == [later]
+    assert await store.list_latency_traces(NOW + timedelta(days=3)) == []
+
+
+async def test_latency_traces_for_an_unknown_interview_raise_key_error(store):
+    with pytest.raises(KeyError):
+        await store.add_latency_traces("nope", [TurnTrace(turn_idx=2)])
+
+
+async def test_a_latency_trace_needs_a_turn_idx_of_its_own(store):
+    await store.create_interview(make_interview())
+    await store.add_latency_traces("i1", [TurnTrace(turn_idx=2)])
+    with pytest.raises(ValueError, match="turn_idx"):
+        await store.add_latency_traces("i1", [TurnTrace(turn_idx=4), TurnTrace(turn_idx=2)])
+    with pytest.raises(ValueError, match="turn_idx"):
+        await store.add_latency_traces("i1", [TurnTrace(turn_idx=None)])
+    # Nothing of a refused write was kept.
+    assert await store.list_latency_traces(NOW - timedelta(days=1)) == [TurnTrace(turn_idx=2)]
+
+
+async def test_listing_latency_traces_needs_a_time_with_a_timezone(store):
+    with pytest.raises(ValueError, match="timezone"):
+        await store.list_latency_traces(datetime(2026, 10, 19))
+
+
+async def test_deleting_an_old_demo_deletes_its_latency_traces(store):
+    await store.create_interview(make_interview("old", created_at=NOW - timedelta(days=8)))
+    await store.create_interview(make_interview("new"))
+    await store.add_latency_traces("old", [TurnTrace(turn_idx=2, request_ms=1.0)])
+    await store.add_latency_traces("new", [TurnTrace(turn_idx=2, request_ms=2.0)])
+
+    assert await store.delete_demo_data_older_than(7, audio_deleted=["old"]) == 1
+    remaining = await store.list_latency_traces(NOW - timedelta(days=30))
+    assert remaining == [TurnTrace(turn_idx=2, request_ms=2.0)]
 
 
 async def test_demo_interviews_older_than_lists_old_demo_ids_and_the_purge_honours_audio_deleted(
@@ -998,14 +1062,21 @@ async def applied_names(conn) -> list[str]:
 
 
 @needs_postgres
-async def test_the_real_migration_creates_the_four_tables(pg_pool):
+async def test_the_real_migrations_create_every_table(pg_pool):
     tables = {
         r[0]
         for r in await pg_pool.fetch(
             "select table_name from information_schema.tables where table_schema = current_schema()"
         )
     }
-    assert tables == {"schema_migrations", "interviews", "turns", "scores", "quotes"}
+    assert tables == {
+        "schema_migrations",
+        "interviews",
+        "turns",
+        "scores",
+        "quotes",
+        "latency_traces",
+    }
     shipped = sorted(p.name for p in MIGRATIONS_DIR.glob("*.sql"))
     assert "001_init.sql" in shipped
     async with pg_pool.acquire() as conn:
@@ -1033,6 +1104,7 @@ async def test_row_level_security_is_on_for_every_table(pg_pool):
         "turns": True,
         "scores": True,
         "quotes": True,
+        "latency_traces": True,
         "schema_migrations": True,
     }
 

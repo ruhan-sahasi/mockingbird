@@ -15,6 +15,9 @@ it (routes_ws.py commits it), and a draft that is never spoken leaves no trace.
 The draft runs as its own task, feeding a queue that the response streams from, so that the
 next request can cancel it. When Vapi drops the stream, the draft is cancelled too.
 
+Each request gets a latency trace from the call's tracer when it arrives. The trace rides on the
+draft, and is stamped when the brain yields the first text and when that text goes out to Vapi.
+
 The webhook acts only on the end-of-call report. Live events come from the audio socket, so
 every other message gets 200 `{}` and nothing else.
 
@@ -28,7 +31,8 @@ import hmac
 import logging
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
+from functools import partial
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -37,6 +41,7 @@ from mockingbird.brain import Brain
 from mockingbird.sessions import LiveSession
 from mockingbird.sse import SSE_DONE, sse_chunk
 from mockingbird.store import Store
+from mockingbird.tracing import CallTracer, TurnTrace
 from mockingbird.vapi_types import (
     EndOfCallReport,
     Ignored,
@@ -111,34 +116,50 @@ def start_reply(session: LiveSession, req: LlmRequest) -> AsyncIterator[str]:
     """Cancel the reply still streaming for the session, start drafting this one, and return its
     SSE events. There is no await in here, so nothing can run between the cancel and the start.
     """
+    tracer = session.tracer
+    trace = tracer.new_trace() if tracer is not None else None
     previous = session.reply_task
     if previous is not None and not previous.done():
         previous.cancel()
     chunks: asyncio.Queue = asyncio.Queue()
-    task = asyncio.create_task(_draft(session.brain, req, chunks))
+    task = asyncio.create_task(_draft(session.brain, req, chunks, tracer, trace))
     # The end marker goes on from a done callback, not a `finally` in _draft: a task cancelled
     # before its first step never runs its body at all, and its stream would wait forever.
     task.add_done_callback(lambda _: chunks.put_nowait(_END))
     session.reply_task = task
-    return _stream_draft(task, chunks)
+    on_first = partial(tracer.first_chunk, trace) if tracer is not None else None
+    return _stream_draft(task, chunks, on_first)
 
 
-async def _draft(brain: Brain, req: LlmRequest, chunks: asyncio.Queue) -> None:
+async def _draft(
+    brain: Brain,
+    req: LlmRequest,
+    chunks: asyncio.Queue,
+    tracer: CallTracer | None = None,
+    trace: TurnTrace | None = None,
+) -> None:
     """Draft the reply into `chunks`. Cancelling this task stops the draft, and aclosing()
-    makes sure the brain's generator, and with it the Claude stream, is shut."""
+    makes sure the brain's generator, and with it the Claude stream, is shut. `trace` is from
+    `tracer`, and is None exactly when `tracer` is."""
     try:
-        draft = brain.draft(req.user_text, req.spoken_assistant_text)
+        draft = brain.draft(req.user_text, req.spoken_assistant_text, trace=trace)
         async with contextlib.aclosing(draft) as reply:
+            first = True
             async for chunk in reply:
+                if first and tracer is not None:
+                    tracer.first_token(trace)
+                first = False
                 chunks.put_nowait(chunk)
     except Exception as exc:
         # The brain answers Claude's failures itself. This is a bug, so the stream just ends.
         log.error("drafting a reply failed: %s", type(exc).__name__)
 
 
-async def _stream_draft(task: asyncio.Task, chunks: asyncio.Queue) -> AsyncIterator[str]:
+async def _stream_draft(
+    task: asyncio.Task, chunks: asyncio.Queue, on_first: Callable[[], None] | None = None
+) -> AsyncIterator[str]:
     try:
-        async for event in _sse(_until_end(chunks)):
+        async for event in _sse(_until_end(chunks), on_first):
             yield event
     finally:
         # Vapi dropped this stream, or it is done: either way nothing more of it will be heard.
@@ -154,12 +175,17 @@ async def _fixed_line(text: str) -> AsyncIterator[str]:
     yield text
 
 
-async def _sse(texts: AsyncIterator[str]) -> AsyncIterator[str]:
-    """OpenAI chat-completion chunks for each text, then the finish chunk and [DONE]."""
+async def _sse(
+    texts: AsyncIterator[str], on_first: Callable[[], None] | None = None
+) -> AsyncIterator[str]:
+    """OpenAI chat-completion chunks for each text, then the finish chunk and [DONE].
+    `on_first` is called just before the first text's chunk goes out."""
     chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     first = True
     async for text in texts:
+        if first and on_first is not None:
+            on_first()
         yield sse_chunk(text, chunk_id=chunk_id, created=created, first=first)
         first = False
     yield sse_chunk("", chunk_id=chunk_id, created=created, finish=True)
