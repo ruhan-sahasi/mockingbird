@@ -57,6 +57,7 @@ resource "aws_ecs_task_definition" "app" {
     # Not a secret: this is where Vapi and browsers reach the server.
     environment = [
       { name = "PUBLIC_BASE_URL", value = "https://${aws_cloudfront_distribution.main.domain_name}" },
+      { name = "SUPABASE_URL", value = var.supabase_url },
     ]
 
     # ECS reads each parameter at task start. The task definition holds only the ARNs.

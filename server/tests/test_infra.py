@@ -40,17 +40,20 @@ def secret_names_in_the_entrypoint() -> set[str]:
 
 
 def test_terraform_the_entrypoint_and_settings_name_the_same_secrets():
-    # Every text setting is a secret except PUBLIC_BASE_URL, which ecs.tf sets in the open. The
-    # numbers have defaults and are not secrets either.
+    # Every text setting is a secret except these. They are not secrets: ecs.tf sets
+    # PUBLIC_BASE_URL and SUPABASE_URL in the open, and the other two are plain names with
+    # defaults. The numbers have defaults and are not secrets either.
+    not_secrets = {"public_base_url", "supabase_url", "recordings_bucket", "recordings_dir"}
     settings = {
         name.upper()
         for name, field in Settings.model_fields.items()
-        if field.annotation is not int and name != "public_base_url"
+        if field.annotation is not int and name not in not_secrets
     }
 
     assert secret_names_in_terraform() == settings
     assert secret_names_in_the_entrypoint() == settings
     assert re.search(r'name = "PUBLIC_BASE_URL", value = ', read("infra/ecs.tf"))
+    assert re.search(r'name = "SUPABASE_URL", value = ', read("infra/ecs.tf"))
 
 
 def test_env_example_lists_every_setting():

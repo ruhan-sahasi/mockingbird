@@ -13,6 +13,8 @@ def test_settings() -> Settings:
         anthropic_api_key="test-anthropic-key",
         vapi_api_key="test-vapi-key",
         database_url=None,
+        supabase_url=None,
+        supabase_service_key=None,
         public_base_url="https://mockingbird.test",
         brain_secret="test-brain-secret",
         webhook_secret="test-webhook-secret",

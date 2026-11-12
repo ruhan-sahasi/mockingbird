@@ -103,7 +103,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       # Dummy settings and no DATABASE_URL: the entrypoint skips the migration, and the server
-      # starts on its in-memory store. None of these values reaches Vapi or Anthropic.
+      # starts on its in-memory store. With no SUPABASE_URL, recordings would go to a local folder.
+      # None of these values reaches Vapi, Anthropic or Supabase.
       - name: Boot the image and check /healthz
         run: |
           docker run --detach --name app --platform linux/arm64 --publish 8000:8000 \
@@ -111,6 +112,7 @@ jobs:
             --env PUBLIC_BASE_URL=http://localhost:8000 \
             --env BRAIN_SECRET=ci --env WEBHOOK_SECRET=ci \
             --env OWNER_KEY=ci --env VISITOR_SALT=ci \
+            --env SUPABASE_SERVICE_KEY=ci \
             mockingbird:ci
           for _ in $(seq 60); do
             curl -fsS http://localhost:8000/healthz && break

@@ -14,6 +14,16 @@ variable "alert_email" {
   }
 }
 
+variable "supabase_url" {
+  description = "The Supabase project URL, where recordings are stored. Not a secret."
+  type        = string
+
+  validation {
+    condition     = startswith(var.supabase_url, "https://")
+    error_message = "supabase_url must start with https://."
+  }
+}
+
 variable "monthly_budget_usd" {
   description = "Monthly AWS spend that triggers the alert at 80%. This is credit burn, not cash."
   type        = number

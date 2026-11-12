@@ -28,6 +28,7 @@ locals {
     "WEBHOOK_SECRET",
     "OWNER_KEY",
     "VISITOR_SALT",
+    "SUPABASE_SERVICE_KEY",
   ])
 }
 

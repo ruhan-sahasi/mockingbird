@@ -246,10 +246,11 @@ Deploying needs Terraform, Docker with buildx, npm, and the AWS CLI signed in to
 that will hold the stack.
 
 ```bash
-cp infra/terraform.tfvars.example infra/terraform.tfvars   # then set alert_email
+cp infra/terraform.tfvars.example infra/terraform.tfvars   # then set alert_email and supabase_url
 terraform -chdir=infra init
 terraform -chdir=infra apply
 # set each secret with aws ssm put-parameter, as infra/secrets.tf shows
+# (SUPABASE_SERVICE_KEY is one of them)
 ./scripts/deploy.sh
 ```
 

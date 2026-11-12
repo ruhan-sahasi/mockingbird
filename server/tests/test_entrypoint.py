@@ -20,6 +20,7 @@ SECRETS = {
     "WEBHOOK_SECRET": "real-webhook-secret-value",
     "OWNER_KEY": "real-owner-key-value",
     "VISITOR_SALT": "real-visitor-salt-value",
+    "SUPABASE_SERVICE_KEY": "real-supabase-key-value",
 }
 # DATABASE_URL may be absent: without it the server keeps interviews in memory.
 REQUIRED = [name for name in SECRETS if name != "DATABASE_URL"]
