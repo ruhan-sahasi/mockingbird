@@ -69,7 +69,8 @@ ENDED_LINE = "Sorry, this interview has ended."
 DEFAULT_LINE = "Tell me more about that."
 HANG = object()  # a script step that never finishes, like a Claude reply still streaming
 
-MIC = bytes([1]) * 640  # one 20 ms frame from the browser
+MIC = bytes([1]) * 640  # one 20 ms frame from the browser, too quiet to count as speech
+SPEECH = bytes([0, 40]) * 320  # one 20 ms frame of the candidate talking (every sample 10240)
 VOICE = bytes([101]) * 640  # one 20 ms frame of the interviewer's voice
 
 
@@ -1031,6 +1032,9 @@ def test_a_spoken_reply_is_traced_hop_by_hop_and_stored(client, app, fakes):
         assert ws.receive_bytes() == VOICE
         client.portal.call(fakes.vapi_socket.deliver, ASSISTANT_STOPPED)
 
+        ws.send_bytes(SPEECH)  # the end of the candidate's answer
+        ws.send_bytes(MIC)
+        wait_until(lambda: MIC in fakes.vapi_socket.sent)
         client.portal.call(fakes.vapi_socket.deliver, USER_STOPPED)
         assert said(ask(client, "I wrote the plan and shipped it.")) == DEFAULT_LINE
         client.portal.call(fakes.vapi_socket.deliver, ASSISTANT_STARTED)
@@ -1050,6 +1054,7 @@ def test_a_spoken_reply_is_traced_hop_by_hop_and_stored(client, app, fakes):
         DEFAULT_LINE,
     )
     assert trace.user_stopped_ms is not None
+    assert trace.last_candidate_audio_ms <= trace.user_stopped_ms
     assert trace.user_stopped_ms <= trace.request_ms <= trace.first_token_ms
     assert trace.first_token_ms <= trace.first_chunk_ms <= trace.assistant_started_ms
     assert trace.assistant_started_ms <= trace.first_audio_ms

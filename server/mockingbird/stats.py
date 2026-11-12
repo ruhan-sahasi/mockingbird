@@ -23,6 +23,7 @@ from mockingbird.tracing import TurnTrace
 DUCKING_P95_MS = 300
 # Each server hop, by name, as the two stamps of a turn it runs between.
 HOPS = {
+    "last_candidate_audio_to_request": ("last_candidate_audio_ms", "request_ms"),
     "request_to_first_token": ("request_ms", "first_token_ms"),
     "first_token_to_first_chunk": ("first_token_ms", "first_chunk_ms"),
     "first_chunk_to_assistant_started": ("first_chunk_ms", "assistant_started_ms"),

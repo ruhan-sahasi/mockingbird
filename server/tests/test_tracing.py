@@ -102,6 +102,51 @@ def test_first_audio_ignores_frames_before_assistant_started_and_silent_frames(t
     assert trace.first_audio_ms == 1000.0
 
 
+def test_a_request_takes_the_candidates_last_speech_before_it(tracer, clock):
+    # The time from it to the request is Vapi deciding the answer is over, plus its speech to
+    # text: the part of the wait no other hop holds.
+    clock.advance(1.0)
+    tracer.on_audio("candidate", LOUD)
+    clock.advance(0.02)
+    tracer.on_audio("candidate", pcm(-655))  # at the threshold: the browser's 0.02, as int16
+    clock.advance(0.02)
+    tracer.on_audio("candidate", pcm(654))  # just below it: a quiet room, not speech
+    tracer.on_audio("candidate", SILENT)
+    tracer.on_audio("interviewer", LOUD)  # the interviewer is never the candidate
+    clock.advance(0.66)
+    first = tracer.new_trace()
+    clock.advance(0.3)
+    second = tracer.new_trace()  # Vapi asks again for the same answer
+
+    assert first.last_candidate_audio_ms == second.last_candidate_audio_ms
+    assert first.last_candidate_audio_ms == pytest.approx(1020)
+    assert second.request_ms - second.last_candidate_audio_ms == pytest.approx(980)
+
+
+def test_the_candidates_speech_is_forgotten_once_vapi_speaks_a_line(tracer, clock):
+    tracer.on_audio("candidate", LOUD)
+    reply = tracer.new_trace()
+    tracer.assistant_started(reply)
+    clock.advance(5.0)
+    # No speech since: the next reply has nothing to measure from, rather than the old answer.
+    assert tracer.new_trace().last_candidate_audio_ms is None
+
+    tracer.on_audio("candidate", LOUD)
+    tracer.assistant_started(None)  # an untimed line clears it too
+    assert tracer.new_trace().last_candidate_audio_ms is None
+
+
+def test_only_one_frames_worth_of_a_candidate_frame_is_measured(tracer, monkeypatch):
+    # The page sends 640-byte frames. A bigger one from a broken or hostile page must not make
+    # the event loop work out the RMS of all of it.
+    measured = []
+    real = tracing._rms
+    monkeypatch.setattr(tracing, "_rms", lambda frame: measured.append(len(frame)) or real(frame))
+    tracer.on_audio("candidate", LOUD * 1000)
+    assert measured == [640]
+    assert tracer.new_trace().last_candidate_audio_ms == 0.0
+
+
 @pytest.mark.parametrize("frame", [b"", b"\x01", SILENT[:-1], SILENT + b"\x7f"])
 def test_a_short_empty_or_odd_frame_never_raises_and_is_not_audible(tracer, frame):
     trace = tracer.new_trace()

@@ -37,6 +37,7 @@ export default function Stats() {
 }
 
 const HOPS: [keyof StatsData['hops_ms'], string][] = [
+  ['last_candidate_audio_to_request', 'Last candidate speech at the server to brain request'],
   ['request_to_first_token', 'Brain request to first token from Claude'],
   ['first_token_to_first_chunk', 'First token to first chunk sent to Vapi'],
   ['first_chunk_to_assistant_started', 'First chunk to Vapi starting to speak'],

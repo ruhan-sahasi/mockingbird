@@ -130,6 +130,7 @@ const STATS: Stats = {
   turns: 4,
   stop_to_audible_ms: { p50: 1420, p95: 2100, n: 3 },
   hops_ms: {
+    last_candidate_audio_to_request: 900,
     request_to_first_token: 410,
     first_token_to_first_chunk: 2,
     first_chunk_to_assistant_started: 380,

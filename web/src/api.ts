@@ -57,6 +57,7 @@ export type Stats = {
   stop_to_audible_ms: Spread
   // The median of each server hop.
   hops_ms: {
+    last_candidate_audio_to_request: number | null
     request_to_first_token: number | null
     first_token_to_first_chunk: number | null
     first_chunk_to_assistant_started: number | null

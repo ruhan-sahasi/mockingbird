@@ -113,8 +113,8 @@ flowchart LR
 The number that matters is how long the candidate waits: from the moment they stop talking to
 the moment they hear the interviewer. The browser measures it at both ends, and the server
 breaks it into hops. When a call ends, each interviewer reply that became a turn is saved as one
-row of `latency_traces` (`server/migrations/003_latency_traces.sql`), and `/api/stats` sums up
-the rows.
+row of `latency_traces` (`server/migrations/003_latency_traces.sql`, with more stamps added in
+`004_latency_traces_more_stamps.sql`), and `/api/stats` sums up the rows.
 
 **Measured in the browser.** Both ends of each number are stamped on the page clock,
 `performance.now()`, so no other clock has to agree with it (`web/src/timing.ts`).
@@ -137,6 +137,11 @@ reply (`server/mockingbird/tracing.py`).
 
 **Measured on the server**, on its monotonic clock (`server/mockingbird/tracing.py`):
 
+- last candidate speech to request: the relay passes the candidate's last frame of speech, by the
+  same 0.02 threshold the browser uses, and then Vapi asks the brain for a reply. This is Vapi
+  deciding the answer is over plus its speech to text, usually the biggest part of the wait, and
+  the hop that Vapi's wait-before-reply setting tunes. A reply with no candidate speech since the
+  line before it is left out.
 - request to first token: Vapi asks the brain for a reply, and Claude streams its first text.
   The wrap-up line never goes to Claude, and neither does a fallback line said when Claude wrote
   nothing, so a reply that starts with one is left out of this hop and the next.

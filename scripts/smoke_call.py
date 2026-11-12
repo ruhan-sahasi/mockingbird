@@ -78,6 +78,7 @@ STATS_PATH = "/api/stats?days=1"
 # The server hops /api/stats gives a median for (server/mockingbird/stats.py), and their names
 # in the summary.
 HOPS = {
+    "last_candidate_audio_to_request": "last candidate speech to request",
     "request_to_first_token": "request to first token",
     "first_token_to_first_chunk": "first token to first chunk",
     "first_chunk_to_assistant_started": "first chunk to assistant started",
