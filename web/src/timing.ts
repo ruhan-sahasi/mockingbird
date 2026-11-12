@@ -9,7 +9,9 @@
 //   interviewer going quiet, once the server has told the page to flush the reply. The VAD
 //   reports speech only after a few loud frames, so the cut-in is backdated by them. The player
 //   goes quiet while the speakers are still playing what it handed over, so the output latency
-//   is added here too.
+//   is added here too. The cut-in timed is the one the flush answered: talk over the reply that
+//   ended with no flush, such as an "mm-hmm" or a cough Vapi let pass, is forgotten when it ends,
+//   so a real cut-in seconds later is not timed from it.
 //
 // Only the end of an answer starts a stop to audible measurement: the candidate's last stop with
 // no speech after it, heard while the interviewer is quiet. A stop while the interviewer is
@@ -34,7 +36,7 @@ export class TurnTimer {
   private readonly clock: TurnTimerClock
   private audible = false // whether the interviewer is speaking, as the player last said
   private stoppedAt: number | null = null // the end of the candidate's answer, not yet answered
-  private interruptAt: number | null = null // when the candidate first talked over the interviewer
+  private interruptAt: number | null = null // when the candidate started talking over the reply
   private flushPending = false // the server flushed the reply, and it has not gone quiet yet
 
   constructor(clock: TurnTimerClock) {
@@ -43,13 +45,15 @@ export class TurnTimer {
 
   /**
    * The candidate started or stopped speaking. A stop counts only while the interviewer is quiet.
-   * Speaking drops any pending stop, and while the interviewer is heard it is a cut-in, of which
-   * the first one counts until the interviewer goes quiet.
+   * Speaking drops any pending stop, and while the interviewer is heard it is a cut-in. A cut-in
+   * that stops with no flush pending was let pass, so it is dropped. Otherwise the first one
+   * counts until the interviewer goes quiet.
    */
   vad(e: VadEvent): void {
     const at = this.clock.now()
     if (!e.speaking) {
       if (!this.audible) this.stoppedAt = at - (e.quietMs ?? 0)
+      if (!this.flushPending) this.interruptAt = null
       return
     }
     this.stoppedAt = null

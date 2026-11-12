@@ -129,7 +129,8 @@ row of `latency_traces` (`server/migrations/003_latency_traces.sql`, with more s
   timed. A stop while the interviewer is talking, or one followed by more speech, is not.
 - **Interrupt to silence**: from the candidate starting to talk over the interviewer to the
   interviewer going quiet, after the server tells the page to flush the reply. The start is
-  backdated by the three loud frames the threshold needs, and the output latency is added.
+  backdated by the three loud frames the threshold needs, and the output latency is added. Talk
+  over the reply that ends with no flush, such as an "mm-hmm" Vapi lets pass, is not a start.
 
 The page sends each number on the call socket as a `timing` message. The server ties it to the
 reply Vapi is speaking and keeps only numbers from 0 to 60000 ms, the first of each kind per
