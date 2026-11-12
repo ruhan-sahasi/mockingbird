@@ -1,12 +1,16 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
-import { parseServerMessage } from './protocol'
+import { parseServerMessage, timingMessage } from './protocol'
 
 // What the relay really sends, as the server's tests check it (relay.py's FLUSH, PING and the
 // ended frame of its hang-up).
 const WIRE = JSON.parse(
   readFileSync(new URL('../../server/tests/fixtures/wire_protocol.json', import.meta.url), 'utf8'),
-) as { server_to_browser: Record<string, object>; ended_reasons: string[] }
+) as {
+  server_to_browser: Record<string, object>
+  browser_to_server: { timing: object }
+  ended_reasons: string[]
+}
 
 describe('parseServerMessage', () => {
   it.each(Object.entries(WIRE.server_to_browser))(
@@ -68,5 +72,28 @@ describe('parseServerMessage', () => {
     ['error with a message that is not a string', '{"type":"error","message":null}'],
   ])('gives null for %s', (_name, text) => {
     expect(parseServerMessage(text)).toBeNull()
+  })
+})
+
+describe('timingMessage', () => {
+  it('builds the timing frame the server reads', () => {
+    expect(JSON.parse(timingMessage({ stop_to_audible_ms: 1420 }))).toEqual(
+      WIRE.browser_to_server.timing,
+    )
+  })
+
+  it('carries both numbers when both were measured', () => {
+    expect(
+      JSON.parse(timingMessage({ stop_to_audible_ms: 1420, interrupt_to_silence_ms: 180 })),
+    ).toEqual({ type: 'timing', stop_to_audible_ms: 1420, interrupt_to_silence_ms: 180 })
+  })
+
+  it('leaves out a number that was not measured', () => {
+    expect(timingMessage({ interrupt_to_silence_ms: 180 })).toBe(
+      '{"type":"timing","interrupt_to_silence_ms":180}',
+    )
+    expect(timingMessage({ stop_to_audible_ms: 0, interrupt_to_silence_ms: undefined })).toBe(
+      '{"type":"timing","stop_to_audible_ms":0}',
+    )
   })
 })

@@ -9,6 +9,11 @@ export type Player = {
   push(pcm: Int16Array): void
   /** Drop everything queued, at once. */
   flush(): void
+  /**
+   * How long, in ms, a sample takes from the worklet to the speakers, as the browser estimates
+   * it now. Browsers that give no estimate count as 0.
+   */
+  outputLatencyMs(): number
   close(): void
 }
 
@@ -42,6 +47,11 @@ export async function createPlayer(onSpeaking?: (speaking: boolean) => void): Pr
     },
     flush() {
       send({ type: 'flush' })
+    },
+    outputLatencyMs() {
+      // outputLatency covers the whole way out, device included, but not every browser gives it.
+      // baseLatency is only the context's own share, and better than nothing.
+      return (ctx.outputLatency || ctx.baseLatency || 0) * 1000
     },
     close() {
       node.port.onmessage = null

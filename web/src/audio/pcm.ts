@@ -4,7 +4,7 @@
 export const FRAME_SAMPLES = 320
 
 /** Float samples to int16. Anything outside [-1, 1] is clamped; NaN becomes silence. */
-export function floatToInt16(x: Float32Array): Int16Array {
+export function floatToInt16(x: Float32Array): Int16Array<ArrayBuffer> {
   const out = new Int16Array(x.length)
   for (let i = 0; i < x.length; i++) {
     const v = Math.max(-1, Math.min(1, x[i]))

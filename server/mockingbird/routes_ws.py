@@ -13,7 +13,8 @@ While the call runs, the relay hands the route Vapi's live events (Amendment 1):
 - the candidate interrupted: the tracer checks whether it was a cut-in;
 - the interviewer stopped speaking after the wrap-up was committed: the call ends, "plan_done".
 Every audio frame the relay passes goes to the recorder and then the tracer, each on its own, so
-a failure in one never starves the other.
+a failure in one never starves the other. The browser's own timing of each turn goes to the
+tracer too, which puts it on the reply being spoken.
 
 When the call ends, the interview is marked ended with how long it ran and why. That happens in
 the relay's hang-up, before the browser is told the call ended, because the browser's next step
@@ -142,6 +143,8 @@ async def _run_call(websocket: WebSocket, session: LiveSession) -> None:
             on_event=_live_events(session),
             on_end=ending.record,
             on_audio=_fan_out(recorder.on_audio, tracer.on_audio),
+            # The relay passes on only timing messages, and at most TIMING_PER_S a second.
+            on_browser_message=tracer.browser_timing,
         )
         await state.store.update_interview(interview.id, status="live")
         ending.live_since = time.monotonic()

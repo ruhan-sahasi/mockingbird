@@ -7,6 +7,11 @@
 // without one (relay.py's browser_timeout_s). Frames from before the socket opens are dropped,
 // not saved up.
 //
+// It also times each turn (timing.ts): the mic's VAD says when the candidate stops and starts
+// speaking, the player says when the interviewer is heard and goes quiet, and the server's flush
+// marks a cut-in. Each number goes to the server as a timing text frame as soon as it is known,
+// if the socket is open then, and is dropped otherwise.
+//
 // The server's text frames and close codes are in server/tests/fixtures/wire_protocol.json, which
 // the tests on both sides read.
 
@@ -14,8 +19,10 @@ import { ApiError, type LimitReason, type StartResult } from './api'
 import { AudioBlockedError } from './audio/context'
 import type { Mic } from './audio/mic'
 import type { Player } from './audio/player'
-import { parseServerMessage } from './protocol'
+import type { VadEvent } from './audio/vad'
+import { parseServerMessage, timingMessage, type Timing } from './protocol'
 import { sendFrame, type FrameSocket, type SocketHandlers } from './socket'
+import { TurnTimer } from './timing'
 
 export type Phase =
   | { name: 'mic' } // waiting for the visitor to allow the mic
@@ -30,11 +37,14 @@ export type SessionSocket = FrameSocket & { close(): void }
 
 /** Everything with a side effect. The page passes the real ones, and tests pass fakes. */
 export type SessionDeps = {
-  startMic(onFrame: (pcm: Int16Array<ArrayBuffer>) => void): Promise<Mic>
+  startMic(
+    onFrame: (pcm: Int16Array<ArrayBuffer>) => void,
+    onVad: (e: VadEvent) => void,
+  ): Promise<Mic>
   createPlayer(onSpeaking: (speaking: boolean) => void): Promise<Player>
   startInterview(): Promise<StartResult>
   openSocket(path: string, handlers: SocketHandlers): SessionSocket
-  /** A millisecond clock, for when the call went live. */
+  /** A millisecond clock (performance.now), for when the call went live and for turn timing. */
   now(): number
   setTimeout(run: () => void, ms: number): void
 }
@@ -91,10 +101,18 @@ export function runInterview(deps: SessionDeps, events: SessionEvents): Session 
   }
   // Reads `socket` as each frame comes, so frames go out from the moment it opens.
   const onFrame = (pcm: Int16Array<ArrayBuffer>) => sendFrame(socket, pcm)
+  const timer = new TurnTimer({
+    now: () => deps.now(),
+    outputLatencyMs: () => player?.outputLatencyMs() ?? 0,
+  })
+  const report = (timing: Timing | null) => {
+    if (timing === null || finished || socket?.readyState !== WebSocket.OPEN) return
+    socket.send(timingMessage(timing))
+  }
 
   async function run() {
     try {
-      mic = await deps.startMic(onFrame)
+      mic = await deps.startMic(onFrame, (e) => timer.vad(e))
     } catch (error) {
       fail(micProblem(error))
       return
@@ -104,6 +122,7 @@ export function runInterview(deps: SessionDeps, events: SessionEvents): Session 
 
     try {
       player = await deps.createPlayer((on) => {
+        report(timer.interviewerAudible(on))
         if (!cancelled) events.onSpeaking(on)
       })
     } catch (error) {
@@ -133,8 +152,10 @@ export function runInterview(deps: SessionDeps, events: SessionEvents): Session 
         if (finished) return
         if (typeof data === 'string') {
           const message = parseServerMessage(data)
-          if (message?.type === 'flush') player?.flush()
-          else if (message?.type === 'ended') leaveFor(() => events.onEnded(id))
+          if (message?.type === 'flush') {
+            timer.flushed()
+            player?.flush()
+          } else if (message?.type === 'ended') leaveFor(() => events.onEnded(id))
           return
         }
         // After End the interviewer has nothing left to say that needs hearing.

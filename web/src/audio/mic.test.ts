@@ -34,10 +34,15 @@ class FakeContext {
 
 class FakeNode {
   static fail: Error | null = null
-  port = { onmessage: null as unknown, close() {} }
+  static made: FakeNode[] = []
+  port = {
+    onmessage: null as ((event: { data: unknown }) => void) | null,
+    close() {},
+  }
   onprocessorerror: unknown = null
   constructor() {
     if (FakeNode.fail) throw FakeNode.fail
+    FakeNode.made.push(this)
   }
   connect() {}
   disconnect() {}
@@ -48,6 +53,7 @@ let tracks: FakeTrack[]
 beforeEach(() => {
   tracks = [new FakeTrack(), new FakeTrack()]
   FakeContext.made = []
+  FakeNode.made = []
   FakeNode.fail = null
   vi.stubGlobal('navigator', {
     mediaDevices: { getUserMedia: async () => ({ getTracks: () => tracks }) },
@@ -79,5 +85,32 @@ describe('startMic', () => {
 
     expect(tracks.map((t) => t.stopped)).toEqual([1, 1])
     expect(FakeContext.made.map((c) => c.closed)).toEqual([1])
+  })
+
+  it('hands frames to onFrame and VAD changes to onVad, as the worklet tags them', async () => {
+    const frames: Int16Array[] = []
+    const vad: unknown[] = []
+    await startMic((pcm) => void frames.push(pcm), (e) => void vad.push(e))
+    const deliver = (data: unknown) => FakeNode.made[0].port.onmessage!({ data })
+    const pcm = new Int16Array(320)
+
+    deliver({ type: 'frame', pcm })
+    deliver({ type: 'vad', speaking: true })
+    deliver({ type: 'vad', speaking: false, quietMs: 300 })
+
+    expect(frames).toEqual([pcm])
+    expect(frames[0]).toBe(pcm)
+    expect(vad).toEqual([{ speaking: true }, { speaking: false, quietMs: 300 }])
+  })
+
+  it('needs no onVad: frames still flow without one', async () => {
+    const frames: Int16Array[] = []
+    await startMic((pcm) => void frames.push(pcm))
+    const deliver = (data: unknown) => FakeNode.made[0].port.onmessage!({ data })
+
+    deliver({ type: 'vad', speaking: true })
+    deliver({ type: 'frame', pcm: new Int16Array(320) })
+
+    expect(frames).toHaveLength(1)
   })
 })

@@ -12,8 +12,11 @@ A `TurnTrace` holds one reply's stamps, in the order they happen:
 - `first_audio_ms`: the first audible interviewer frame passes through the relay.
 
 The browser's own two numbers, `browser_stop_to_audible_ms` and `interrupt_to_silence_ms`, are
-durations it measured itself. `cut_in` marks a reply the candidate interrupted within
-CUT_IN_WINDOW_MS of its start.
+durations it measured itself and sent on the call's socket (`browser_timing`). They land on the
+reply Vapi is speaking when they arrive. The browser is not trusted: only a number of ms from 0
+to MAX_BROWSER_MS is kept, the first one for each field of a reply, and anything else is ignored
+(Review Focus 2). `cut_in` marks a reply the candidate interrupted within CUT_IN_WINDOW_MS of its
+start.
 
 Vapi sends several requests per answer and speaks only the reply to the last one, so most traces
 are thrown away with their drafts. A trace counts once the brain writes its reply down as an
@@ -41,6 +44,13 @@ AUDIBLE_RMS = 300
 # An interruption this soon after Vapi started speaking a reply marks it as a cut-in: the
 # interviewer most likely started before the candidate had finished.
 CUT_IN_WINDOW_MS = 1500
+# The longest browser timing kept. Anything longer is not a measurement of one turn.
+MAX_BROWSER_MS = 60000
+# The browser's name for each of its numbers, and the trace field it goes into.
+_BROWSER_FIELDS = {
+    "stop_to_audible_ms": "browser_stop_to_audible_ms",
+    "interrupt_to_silence_ms": "interrupt_to_silence_ms",
+}
 
 
 @dataclass
@@ -57,6 +67,17 @@ class TurnTrace:
     browser_stop_to_audible_ms: float | None = None
     interrupt_to_silence_ms: float | None = None
     cut_in: bool = False
+
+
+def _browser_ms(value: object) -> float | None:
+    """`value` as ms if it is a number from 0 to MAX_BROWSER_MS, and None otherwise. A bool is
+    not a number here. NaN fails every comparison, and an int too big for a float is compared as
+    an int, so neither needs a case of its own."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    if not 0 <= value <= MAX_BROWSER_MS:
+        return None
+    return float(value)
 
 
 def _rms(frame: bytes) -> float:
@@ -157,6 +178,18 @@ class CallTracer:
             return
         if now - turn.assistant_started_ms <= CUT_IN_WINDOW_MS:
             turn.cut_in = True
+
+    def browser_timing(self, msg: dict) -> None:
+        """The browser's timing message: its numbers go onto the reply being spoken. A number
+        that is missing or not 0 to MAX_BROWSER_MS ms is ignored, and so is one the reply already
+        has: the first report wins. With no reply spoken yet there is nothing to put it on."""
+        turn = self._current
+        if turn is None:
+            return
+        for key, field in _BROWSER_FIELDS.items():
+            ms = _browser_ms(msg.get(key))
+            if ms is not None and getattr(turn, field) is None:
+                setattr(turn, field, ms)
 
     def committed(self) -> list[TurnTrace]:
         """The traces of the replies that became interviewer turns, in the order spoken."""
