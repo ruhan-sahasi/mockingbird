@@ -17,6 +17,8 @@ next request can cancel it. When Vapi drops the stream, the draft is cancelled t
 
 Each request gets a latency trace from the call's tracer when it arrives. The trace rides on the
 draft, and is stamped when the brain yields the first text and when that text goes out to Vapi.
+Measuring must never cut off the interviewer's line, so each stamp is guarded: a tracing bug is
+logged by type only, and the reply streams on without that stamp.
 
 The webhook acts only on the end-of-call report. Live events come from the audio socket, so
 every other message gets 200 `{}` and nothing else.
@@ -117,7 +119,7 @@ def start_reply(session: LiveSession, req: LlmRequest) -> AsyncIterator[str]:
     SSE events. There is no await in here, so nothing can run between the cancel and the start.
     """
     tracer = session.tracer
-    trace = tracer.new_trace() if tracer is not None else None
+    trace = _stamp(tracer.new_trace) if tracer is not None else None
     previous = session.reply_task
     if previous is not None and not previous.done():
         previous.cancel()
@@ -127,8 +129,19 @@ def start_reply(session: LiveSession, req: LlmRequest) -> AsyncIterator[str]:
     # before its first step never runs its body at all, and its stream would wait forever.
     task.add_done_callback(lambda _: chunks.put_nowait(_END))
     session.reply_task = task
-    on_first = partial(tracer.first_chunk, trace) if tracer is not None else None
+    on_first = partial(_stamp, tracer.first_chunk, trace) if trace is not None else None
     return _stream_draft(task, chunks, on_first)
+
+
+def _stamp[T](hop: Callable[..., T], *args: TurnTrace) -> T | None:
+    """Make one tracer stamp and return what it gives. Measuring a reply must never cut it off,
+    so a tracing bug is logged by its exception type only (ruling R19), the stamp gives None,
+    and the reply goes on without it."""
+    try:
+        return hop(*args)
+    except Exception as exc:
+        log.error("tracing a reply failed: %s", type(exc).__name__)
+        return None
 
 
 async def _draft(
@@ -140,14 +153,15 @@ async def _draft(
 ) -> None:
     """Draft the reply into `chunks`. Cancelling this task stops the draft, and aclosing()
     makes sure the brain's generator, and with it the Claude stream, is shut. `trace` is from
-    `tracer`, and is None exactly when `tracer` is."""
+    `tracer`. It is None when `tracer` is, or when making it failed, and then nothing is
+    stamped."""
     try:
         draft = brain.draft(req.user_text, req.spoken_assistant_text, trace=trace)
         async with contextlib.aclosing(draft) as reply:
             first = True
             async for chunk in reply:
-                if first and tracer is not None:
-                    tracer.first_token(trace)
+                if first and tracer is not None and trace is not None:
+                    _stamp(tracer.first_token, trace)
                 first = False
                 chunks.put_nowait(chunk)
     except Exception as exc:

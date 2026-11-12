@@ -1066,6 +1066,35 @@ def test_one_audio_listener_failing_never_starves_the_other(caplog):
     assert "secret-detail" not in caplog.text
 
 
+@pytest.mark.parametrize("stamp", ["new_trace", "first_token", "first_chunk"])
+def test_a_tracer_that_breaks_never_cuts_off_the_reply(
+    client, app, fakes, monkeypatch, caplog, stamp
+):
+    def broken(self, *args):
+        raise RuntimeError("tracer said secret-detail")
+
+    monkeypatch.setattr(routes_ws, "CallTracer", type("Broken", (CallTracer,), {stamp: broken}))
+    body = start(client)
+    interview_id = body["interview_id"]
+
+    with client.websocket_connect(body["ws_path"]) as ws:
+        client.portal.call(fakes.vapi_socket.wait_reading)
+        assert said(ask(client, "I led the migration.")) == DEFAULT_LINE  # every chunk, then DONE
+        client.portal.call(fakes.vapi_socket.deliver, ASSISTANT_STARTED)
+        hang_up(app, ws, interview_id)
+
+    report_url = f"/api/interviews/{interview_id}/report"
+    wait_until(lambda: client.get(report_url).status_code == 200)
+    turns = client.portal.call(fakes.store.list_turns, interview_id)
+    assert [(t.speaker, t.text) for t in turns][1:] == [
+        ("candidate", "I led the migration."),
+        ("interviewer", DEFAULT_LINE),
+    ]
+    failures = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert failures == ["tracing a reply failed: RuntimeError"]
+    assert "secret-detail" not in caplog.text
+
+
 def test_a_trace_write_that_fails_is_logged_and_the_clean_up_goes_on(client, app, fakes, caplog):
     async def failing_write(interview_id, traces):
         raise RuntimeError("database said secret-detail")

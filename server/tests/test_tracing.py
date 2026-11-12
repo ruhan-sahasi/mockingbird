@@ -180,16 +180,75 @@ def test_a_reply_that_was_started_but_never_written_down_is_not_committed(tracer
     assert tracer.committed() == []
 
 
-def test_user_stopped_is_consumed_by_the_next_new_trace_never_by_two(tracer, clock):
+def test_one_stop_is_copied_into_every_draft_of_the_same_answer(tracer, clock):
+    # Vapi sends several requests per answer and speaks only the reply to the last one.
+    clock.advance(0.25)
+    tracer.user_stopped()
+    drafts = []
+    for _ in range(3):
+        clock.advance(0.125)
+        drafts.append(tracer.new_trace())
+    assert [d.user_stopped_ms for d in drafts] == [250.0, 250.0, 250.0]
+
+    tracer.assistant_started(drafts[-1])
+    for draft in drafts:
+        draft.turn_idx = 2  # only the brain sets it, and only for the spoken one: a stress test
+    assert tracer.committed() == [drafts[-1]]  # still only the reply Vapi spoke
+
+
+def test_a_stop_that_comes_after_the_request_goes_to_the_reply_vapi_then_speaks(tracer, clock):
+    # The order of the recorded call (fixtures/vapi/ws_text_frames.jsonl): the request for a
+    # reply came in 6 ms before Vapi said the candidate stopped, and the reply started at 538 ms.
+    clock.advance(17.227)
+    trace = tracer.new_trace()
+    assert trace.user_stopped_ms is None
+    clock.advance(0.006)
+    tracer.user_stopped()
+    clock.advance(0.532)
+    tracer.assistant_started(trace)
+    assert trace.user_stopped_ms == pytest.approx(17233.0)
+
+    # The candidate's next answer, served by a lone request: the old stop is gone, so this reply
+    # has no measurable start and is left out, never measured from seconds ago (Review Focus 3).
+    clock.advance(5.0)
+    lone = tracer.new_trace()
+    tracer.assistant_started(lone)
+    assert lone.user_stopped_ms is None
+
+
+def test_an_untimed_start_clears_a_pending_stop(tracer, clock):
+    clock.advance(0.25)
+    tracer.user_stopped()
+    tracer.assistant_started(None)  # a line no draft was committed for, such as the opening one
+    clock.advance(0.25)
+    assert tracer.new_trace().user_stopped_ms is None
+
+
+def test_the_latest_stop_wins(tracer, clock):
+    trace = tracer.new_trace()
     clock.advance(0.125)
     tracer.user_stopped()
     clock.advance(0.125)
-    tracer.user_stopped()  # the latest one counts
-    first = tracer.new_trace()
-    second = tracer.new_trace()
+    tracer.user_stopped()
+    tracer.assistant_started(trace)
+    assert trace.user_stopped_ms == 250.0
 
-    assert first.user_stopped_ms == 250.0
-    assert second.user_stopped_ms is None
+    clock.advance(0.125)
+    tracer.user_stopped()
+    clock.advance(0.125)
+    tracer.user_stopped()
+    assert tracer.new_trace().user_stopped_ms == 500.0
+
+
+def test_a_reply_keeps_the_stop_it_was_drafted_with(tracer, clock):
+    clock.advance(0.125)
+    tracer.user_stopped()
+    trace = tracer.new_trace()
+    clock.advance(0.125)
+    tracer.user_stopped()
+    tracer.assistant_started(trace)
+    assert trace.user_stopped_ms == 125.0
+    assert tracer.new_trace().user_stopped_ms is None  # and the later stop was cleared with it
 
 
 def test_stamps_before_start_are_ignored(clock):

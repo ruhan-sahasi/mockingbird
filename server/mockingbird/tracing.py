@@ -21,6 +21,11 @@ interviewer turn and gives it that turn's idx. The opening line has no request, 
 to speak it gets an untimed trace that no turn ever claims: its audio and interruptions land
 there instead of on a reply they do not belong to, and it is never measured (Review Focus 3).
 
+The candidate's latest stop is pending until Vapi next starts speaking a line. Every draft of
+the answer gets a copy of it. Vapi can say the candidate stopped only after the request for the
+reply came in, so the reply it speaks takes the pending stop then if it has none. Then the stop
+is cleared, so it can never be put down to the reply to a later answer.
+
 Stamps that come before `start()` are ignored, so nothing is measured from an undefined origin.
 """
 
@@ -71,7 +76,7 @@ class CallTracer:
     def __init__(self, clock: Callable[[], float]) -> None:
         self._clock = clock
         self._t0: float | None = None
-        self._user_stopped_ms: float | None = None  # the latest one no request has taken yet
+        self._user_stopped_ms: float | None = None  # the latest stop since Vapi last spoke a line
         self._current: TurnTrace | None = None  # the reply Vapi is speaking, or spoke last
         self._spoken: list[TurnTrace] = []  # the timed replies Vapi started speaking, in order
 
@@ -85,16 +90,17 @@ class CallTracer:
         return (self._clock() - self._t0) * 1000
 
     def user_stopped(self) -> None:
+        """The candidate stopped speaking. This stop is pending until Vapi next starts speaking a
+        line, and a later stop before then replaces it: the latest one wins."""
         now = self._now_ms()
         if now is not None:
             self._user_stopped_ms = now
 
     def new_trace(self) -> TurnTrace:
-        """A trace for a brain request that just arrived. It takes the newest candidate stop no
-        earlier request took, so one stop is never counted for two replies."""
-        trace = TurnTrace(user_stopped_ms=self._user_stopped_ms, request_ms=self._now_ms())
-        self._user_stopped_ms = None
-        return trace
+        """A trace for a brain request that just arrived, with a copy of the pending candidate
+        stop. Vapi sends several requests per answer, so every draft of one answer gets the same
+        stop, and the stop stays pending: it is cleared only when Vapi starts speaking a line."""
+        return TurnTrace(user_stopped_ms=self._user_stopped_ms, request_ms=self._now_ms())
 
     def first_token(self, trace: TurnTrace) -> None:
         if trace.first_token_ms is None:
@@ -107,13 +113,21 @@ class CallTracer:
     def assistant_started(self, trace: TurnTrace | None) -> None:
         """Vapi started speaking `trace`'s reply, or, with None, a line no draft was committed
         for, such as the opening line. That one gets an untimed trace that is never measured, so
-        the audio and interruptions that follow are not put down to the reply before it."""
+        the audio and interruptions that follow are not put down to the reply before it.
+
+        Vapi can send a reply's request before it says the candidate stopped, so a reply drafted
+        with no stop takes the pending one here. Either way the pending stop is then cleared: it
+        belongs to the answer this line replies to, and must never be put down to the reply to a
+        later answer, which would measure that reply from seconds too early (Review Focus 3)."""
         now = self._now_ms()
         if now is None:
             return
+        pending, self._user_stopped_ms = self._user_stopped_ms, None
         if trace is None:
             trace = TurnTrace()
         else:
+            if trace.user_stopped_ms is None:
+                trace.user_stopped_ms = pending
             self._spoken.append(trace)
         if trace.assistant_started_ms is None:
             trace.assistant_started_ms = now
