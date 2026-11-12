@@ -44,6 +44,31 @@ export type Report =
 // yet (pollReport waits a while before it believes that one).
 export type ReportResult = Report | { status: 'grading' } | { status: 'not_found' }
 
+// A latency measure over many turns, in ms: its median, its 95th percentile, and how many turns
+// measured it. Both percentiles are null when none did.
+export type Spread = { p50: number | null; p95: number | null; n: number }
+
+// What GET /api/stats answers (server/mockingbird/stats.py): numbers about all the traced calls
+// together. `turns` is how many interviewer replies were traced, and each number leaves out the
+// turns that did not measure it, so a median is null rather than 0 when none did.
+export type Stats = {
+  turns: number
+  // Measured in the browser: the end of the answer to the interviewer being audible.
+  stop_to_audible_ms: Spread
+  // The median of each server hop.
+  hops_ms: {
+    request_to_first_token: number | null
+    first_token_to_first_chunk: number | null
+    first_chunk_to_assistant_started: number | null
+    assistant_started_to_first_audio: number | null
+  }
+  // The share of spoken replies the candidate talked over within 1.5 s of their start.
+  cut_in_rate: number | null
+  // Measured in the browser: talking over the interviewer to the interviewer going quiet.
+  interrupt_to_silence_ms: Spread
+  consider_ducking: boolean
+}
+
 /** The server answered with a status or body this client does not expect. */
 export class ApiError extends Error {
   readonly status: number
@@ -82,6 +107,17 @@ export async function getReport(id: string, signal?: AbortSignal): Promise<Repor
   const body = await readJson(res)
   if (res.status === 200 && isReport(body)) return body
   throw new ApiError(res.status, `unexpected answer to asking for a report: ${res.status}`)
+}
+
+/**
+ * The latency stats over the last `days` days (1 to 30, 7 by default). Throws ApiError for any
+ * answer but a 200 with the stats in it.
+ */
+export async function getStats(days = 7, signal?: AbortSignal): Promise<Stats> {
+  const res = await fetch(`/api/stats?days=${days}`, { signal })
+  const body = await readJson(res)
+  if (res.status === 200 && isStats(body)) return body
+  throw new ApiError(res.status, `unexpected answer to asking for the stats: ${res.status}`)
 }
 
 /**
@@ -184,6 +220,19 @@ function isReport(x: unknown): x is Report {
     isRecord(x) &&
     (x.status === 'graded' || x.status === 'no_answers' || x.status === 'grading_failed') &&
     Array.isArray(x.questions)
+  )
+}
+
+// The parts the stats page reads into are checked, so a strange answer cannot break the page.
+// The numbers in them are the server's own and are trusted as they are.
+function isStats(x: unknown): x is Stats {
+  return (
+    isRecord(x) &&
+    typeof x.turns === 'number' &&
+    isRecord(x.stop_to_audible_ms) &&
+    isRecord(x.hops_ms) &&
+    isRecord(x.interrupt_to_silence_ms) &&
+    typeof x.consider_ducking === 'boolean'
   )
 }
 

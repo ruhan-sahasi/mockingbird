@@ -392,3 +392,61 @@ p {
     grid-template-columns: 1fr;
   }
 }
+
+/* Stats */
+
+.page.stats {
+  max-width: 46rem;
+}
+
+.stats .lede {
+  margin-top: 1rem;
+  font-size: 1rem;
+  color: var(--muted);
+}
+
+.stats-table {
+  width: 100%;
+  margin-top: 2.5rem;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.stats-table caption {
+  padding-bottom: 0.5rem;
+  font-weight: 600;
+  text-align: left;
+}
+
+.stats-table th,
+.stats-table td {
+  padding: 0.5rem 0 0.5rem 1rem;
+  border-bottom: 1px solid var(--rule);
+  text-align: right;
+  vertical-align: top;
+}
+
+.stats-table th:first-child {
+  padding-left: 0;
+  text-align: left;
+}
+
+.stats-table thead th {
+  border-bottom: 2px solid var(--ink);
+  font-size: 0.833rem;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.stats-table tbody th {
+  font-weight: 400;
+}
+
+.stats-table td {
+  white-space: nowrap;
+}
+
+.stats-note {
+  margin-top: 1.5rem;
+  max-width: 36rem;
+}

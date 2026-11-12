@@ -1,4 +1,4 @@
-// The app's three pages, picked by the location hash (route.ts).
+// The app's four pages, picked by the location hash (route.ts).
 //
 // The interview page opens only after the Start button, which is where consent is given. A
 // reload, a typed #/interview or the Forward button lands on the first page instead, so the mic
@@ -10,6 +10,7 @@ import { isPhone } from './device'
 import Interview from './pages/Interview'
 import Landing from './pages/Landing'
 import Report from './pages/Report'
+import Stats from './pages/Stats'
 import {
   INTERVIEW_HASH,
   LANDING_HASH,
@@ -50,6 +51,7 @@ export default function App() {
   }, [blocked])
 
   if (screen.page === 'report') return <Report key={screen.id} id={screen.id} />
+  if (screen.page === 'stats') return <Stats />
   if (screen.page === 'interview') {
     return (
       <Interview

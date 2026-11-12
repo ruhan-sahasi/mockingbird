@@ -60,7 +60,9 @@ flowchart LR
   task, action, result, specificity, ownership), citing quotes. The quotes are checked, and the
   report page asks for the result every 2 s (`report.py`, `server/data/rubric.yaml`).
 - **Storage.** Postgres (Supabase) when `DATABASE_URL` is set, otherwise in memory (`store.py`,
-  `server/migrations/`).
+  `server/migrations/`). Both sides of every call are recorded as 16 kHz WAV files and kept in a
+  private Supabase Storage bucket, or a local folder when Supabase is not set up, and a demo
+  recording is deleted with its interview after 7 days (`recording.py`, `audio_store.py`).
 
 ## The interesting engineering
 
@@ -105,6 +107,74 @@ flowchart LR
   interviews are deleted after 7 days, along with the copy Vapi keeps of each call, and Vapi
   recording and end-of-call analysis are turned off (`limits.py`, `relay.py`, `sessions.py`,
   `vapi_client.py`).
+
+## Latency
+
+The number that matters is how long the candidate waits: from the moment they stop talking to
+the moment they hear the interviewer. The browser measures it at both ends, and the server
+breaks it into hops. When a call ends, each interviewer reply that became a turn is saved as one
+row of `latency_traces` (`server/migrations/003_latency_traces.sql`), and `/api/stats` sums up
+the rows.
+
+**Measured in the browser.** Both ends of each number are stamped on the page clock,
+`performance.now()`, so no other clock has to agree with it (`web/src/timing.ts`).
+
+- **Stop to audible**, the headline number. The end of speech comes from an energy threshold on
+  the mic in the capture worklet: speech is an RMS of 0.02 or more on the -1 to 1 scale, and it
+  ends after 300 ms below that (`web/src/audio/vad.ts`). The stop is backdated by those 300 ms.
+  The other end is the first interviewer audio loud enough to count as speech in the playback
+  worklet, plus the output latency the AudioContext reports. So it includes everything the
+  candidate waits through: Vapi deciding the answer is over, the brain, Claude, text to speech,
+  the network, and the 0.1 s of audio the player keeps queued. Only the end of an answer is
+  timed. A stop while the interviewer is talking, or one followed by more speech, is not.
+- **Interrupt to silence**: from the candidate starting to talk over the interviewer to the
+  interviewer going quiet, after the server tells the page to flush the reply. The start is
+  backdated by the three loud frames the threshold needs, and the output latency is added.
+
+The page sends each number on the call socket as a `timing` message. The server ties it to the
+reply Vapi is speaking and keeps only numbers from 0 to 60000 ms, the first of each kind per
+reply (`server/mockingbird/tracing.py`).
+
+**Measured on the server**, on its monotonic clock (`server/mockingbird/tracing.py`):
+
+- request to first token: Vapi asks the brain for a reply, and Claude streams its first text.
+- first token to first chunk: that text goes out to Vapi.
+- first chunk to assistant started: Vapi says it started speaking the reply.
+- assistant started to first audio: the first loud interviewer frame passes through the relay.
+- **Cut-in rate**: the share of spoken replies the candidate talked over within 1.5 s of their
+  start. It stands in for the interviewer starting before the candidate had finished.
+
+A turn missing a stamp, such as a reply the page sent no timing for, is left out of that number
+and never counts as 0 ms. The two browser numbers say how many turns they are over
+(`server/mockingbird/stats.py`).
+
+**Reading it.** With the API running:
+
+```bash
+curl http://localhost:8000/api/stats             # the last 7 days
+curl "http://localhost:8000/api/stats?days=1"    # any number of days from 1 to 30
+```
+
+It gives the p50, p95 and count of both browser numbers, the median of each server hop, the
+cut-in rate, and `consider_ducking`. The page at http://localhost:5173/#/stats shows the same
+numbers for the last 7 days. They are about all the calls together and name no interview, so
+the endpoint and the page are public.
+
+**Known biases and gaps.**
+
+- Neither browser number includes the mic input latency, usually 10 to 20 ms, so both read that
+  much short.
+- An energy threshold can hear a stop early or late in a noisy room, which moves stop to
+  audible with it.
+- The server puts a browser number on the reply Vapi is speaking when the number arrives. Tests
+  check this against a fake Vapi only, so the first live call has to confirm it.
+
+**Where it stands.** No live call has been measured this way yet, so there are no numbers here.
+The design goal is a stop to audible p50 under 800 ms. The one reading so far, about 2.1 s from
+the smoke call (below), came from a script, not a browser. Real numbers come from interviews run
+in a browser and read from `/api/stats`. Browser ducking, which would turn the interviewer down
+the moment the candidate starts talking, is not built: `consider_ducking` turns true, and the
+page says so, once interrupt to silence p95 is above 300 ms.
 
 ## Run it locally
 
@@ -172,6 +242,12 @@ it for both), talks over the reply to the first answer, hangs up, and waits up t
 report. It prints ok or FAIL for each step and exits 0 only if they all pass. It makes a real
 call, so it costs money.
 
+After the report it reads `/api/stats?days=1` and prints the stop to audible p50 and how many
+turns it is over, the cut-in rate, and the median of each server hop. These are for reading
+only and never fail the run. The script stands in for the browser over a raw socket with no
+speakers, so it sends no timing: its call adds server hops and cut-ins, but nothing to the two
+browser numbers.
+
 **Last live run.** These numbers come from the scripted smoke call run on 2026-10-21 against
 real Vapi and Claude, and the description of
 [PR #18](https://github.com/ruhan-sahasi/mockingbird/pull/18) records its output. It passed:
@@ -183,7 +259,8 @@ report came back graded with 6 scored items and 13 verified quotes.
 talking to the moment the interviewer audio starts, measured in the browser. That goal has not
 been met, and it has not been measured properly yet. The 2.1 s above is one reading taken by the
 smoke call script, not the browser, and it includes the time Vapi waits to decide the answer is
-over. Measuring each hop is phase 2.
+over. The browser measurement and the server hops are built now (see [Latency](#latency)), but
+no live call has been measured with them yet.
 
 ## Tests
 
@@ -211,8 +288,8 @@ terraform -chdir=infra validate
 ```
 
 Counts from a run on this branch on 2026-11-11: `uv run pytest -q` printed
-`623 passed, 58 skipped`, and `npm test` printed `220 passed (220)` across 16 test files. The
-58 skipped tests are the PostgresStore tests in `server/tests/test_store.py`, which run only when
+`786 passed, 66 skipped`, and `npm test` printed `280 passed (280)` across 19 test files. The
+66 skipped tests are the PostgresStore tests in `server/tests/test_store.py`, which run only when
 `TEST_DATABASE_URL` points at a Postgres database (a direct connection, for example
 `postgresql://postgres:postgres@localhost:5432/postgres`).
 
@@ -277,8 +354,9 @@ instead of a separate worker.
 
 ## What is not built yet
 
-- Recording both audio tracks, and latency tracing per hop measured from the browser
-  (phase 2).
+- Browser ducking: turning the interviewer audio down the moment the candidate starts talking,
+  before the flush from the server arrives. It is left out on purpose until `/api/stats` shows
+  interrupt to silence p95 above 300 ms.
 - Word-timestamped transcripts from batch speech-to-text, and quotes you can click to play
   (phase 3).
 - Deploy on merge from GitHub Actions (phase 4). Deploying is `scripts/deploy.sh` by hand for
