@@ -50,8 +50,9 @@ from mockingbird.sessions import (
     sweep_once,
 )
 from mockingbird.sse import SSE_DONE
+from mockingbird.stats import summarize_traces
 from mockingbird.store import MemoryStore
-from mockingbird.tracing import CallTracer
+from mockingbird.tracing import CallTracer, TurnTrace
 from mockingbird.vapi_client import VapiCall, VapiError
 from mockingbird.vapi_types import LlmRequest, SpeechUpdate, UserInterrupted
 
@@ -1336,6 +1337,72 @@ def test_report_for_an_unknown_interview_is_404(client):
 def test_report_for_an_interview_that_never_started_is_404(client):
     body = start(client)
     assert client.get(f"/api/interviews/{body['interview_id']}/report").status_code == 404
+
+
+# --- GET /api/stats ------------------------------------------------------------------------------
+
+
+def keep_traces(client: TestClient, store: MemoryStore, interview_id: str, *traces) -> None:
+    """Put a finished interview and its traces straight into the store."""
+    client.portal.call(store.create_interview, make_interview_record(interview_id, "graded"))
+    client.portal.call(store.add_latency_traces, interview_id, list(traces))
+
+
+@pytest.mark.parametrize("days", [0, 31, -1, "week"])
+def test_stats_refuse_a_window_outside_1_to_30_days(client, days):
+    assert client.get(f"/api/stats?days={days}").status_code == 422
+
+
+def test_stats_summarize_the_traces_for_anyone_and_name_no_interview(client, fakes):
+    interview_id = "iv-7f3a-private"
+    traces = [
+        TurnTrace(
+            turn_idx=1,
+            request_ms=100.0,
+            first_token_ms=500.0,
+            assistant_started_ms=900.0,
+            browser_stop_to_audible_ms=1420.0,
+            interrupt_to_silence_ms=180.0,
+            cut_in=True,
+        ),
+        TurnTrace(turn_idx=3, assistant_started_ms=4000.0, browser_stop_to_audible_ms=900.0),
+    ]
+    keep_traces(client, fakes.store, interview_id, *traces)
+
+    # A plain request: no owner key, no cookie.
+    response = TestClient(client.app).get("/api/stats")
+    assert response.status_code == 200
+    body = response.json()
+    assert body == summarize_traces(traces)
+    assert body["turns"] == 2
+    assert body["stop_to_audible_ms"] == {"p50": 900.0, "p95": 1420.0, "n": 2}
+    assert body["cut_in_rate"] == 0.5
+    # Only numbers about all the calls together: nothing that points at one interview.
+    assert interview_id not in response.text
+    assert "interview_id" not in response.text
+    assert "turn_idx" not in response.text
+
+
+def test_stats_cover_the_days_asked_for_and_7_by_default(settings):
+    now = datetime.now(UTC)
+    kept_at = [now]
+    store = MemoryStore(clock=lambda: kept_at[0])
+    with TestClient(create_app(settings, store=store, audio_store=FakeAudioStore())) as c:
+        for interview_id, age in (("three-days", 3), ("ten-days", 10), ("forty-days", 40)):
+            kept_at[0] = now - timedelta(days=age)
+            keep_traces(c, store, interview_id, TurnTrace(turn_idx=1, assistant_started_ms=1.0))
+        kept_at[0] = now
+
+        def turns(query: str) -> int:
+            response = c.get(f"/api/stats{query}")
+            assert response.status_code == 200
+            return response.json()["turns"]
+
+        assert turns("?days=1") == 0
+        assert turns("?days=2") == 0
+        assert turns("") == 1
+        assert turns("?days=7") == 1
+        assert turns("?days=30") == 2
 
 
 # --- the sweeper -------------------------------------------------------------------------------

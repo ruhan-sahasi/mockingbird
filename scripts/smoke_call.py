@@ -14,6 +14,11 @@ only if the pieces worked: the opening line was heard, a reply to answer 1 was h
 arrived after the interruption, the server said the call ended, and the report came back that
 was not "grading_failed". Exit 1 means a step failed, 2 means it could not get started.
 
+After the report it asks once for the latency stats of the last day (/api/stats?days=1) and
+prints them in the summary. They are not a step: stats that do not come back are a problem line
+and never fail the run. It sends no timing of its own. It has no speakers, so it cannot tell
+when a reply became audible, and the stop-to-audible numbers come only from browser interviews.
+
 It never prints the owner key, the socket token (the whole socket path), a Vapi call id or any
 .env value. Everything it prints goes through one `Printer` that blanks those out, and the
 words the server sends back are printed only when they are ones we know (`safe_word`).
@@ -69,6 +74,15 @@ REPORT_WAIT_S = 120.0
 # server or proxy hiccup. Everything else (400, 401, 403, a redirect) will not change.
 REPORT_RETRY_STATUSES = frozenset({202, 404, 408, 425, 429})
 HTTP_TIMEOUT_S = 15.0
+STATS_PATH = "/api/stats?days=1"
+# The server hops /api/stats gives a median for (server/mockingbird/stats.py), and their names
+# in the summary.
+HOPS = {
+    "request_to_first_token": "request to first token",
+    "first_token_to_first_chunk": "first token to first chunk",
+    "first_chunk_to_assistant_started": "first chunk to assistant started",
+    "assistant_started_to_first_audio": "assistant started to first audio",
+}
 
 HIDDEN = "[hidden]"
 UNRECOGNISED = "unrecognised"
@@ -255,6 +269,12 @@ class Outcome:
     report_status: str | None = None
     scored_items: int = 0
     verified_quotes: int = 0
+    # The day's stats from /api/stats, read after the report: shown, but not needed to pass.
+    stats_fetched: bool = False
+    stats_p50_ms: float | None = None  # stop to audible, as browsers measured it
+    stats_n: int = 0  # the turns that p50 is over
+    stats_cut_in_rate: float | None = None
+    stats_hops_ms: dict[str, float | None] = field(default_factory=dict)  # medians, by HOPS key
     problems: list[str] = field(default_factory=list)
 
 
@@ -294,6 +314,26 @@ def scrub(text: str, secrets: Iterable[str]) -> str:
     return text
 
 
+def ms_text(ms: float | None) -> str:
+    return "n/a" if ms is None else f"{ms:.0f} ms"
+
+
+def format_stats(outcome: Outcome) -> list[str]:
+    """The summary lines for the day's stats."""
+    if not outcome.stats_fetched:
+        return ["Stats (last day): not available"]
+    n = outcome.stats_n
+    rate = outcome.stats_cut_in_rate
+    hops = ", ".join(
+        f"{label} {ms_text(outcome.stats_hops_ms.get(hop))}" for hop, label in HOPS.items()
+    )
+    return [
+        f"Stats (last day): stop-to-audible p50 {ms_text(outcome.stats_p50_ms)} over {n} "
+        f"turn{'s' if n != 1 else ''}, cut-in rate {'n/a' if rate is None else f'{rate:.0%}'}",
+        f"Server hops (last day, median): {hops}",
+    ]
+
+
 def format_summary(outcome: Outcome, secrets: Iterable[str] = ()) -> str:
     def row(ok: bool, label: str) -> str:
         return f"  {'ok' if ok else 'FAIL':<4} {label}"
@@ -318,6 +358,7 @@ def format_summary(outcome: Outcome, secrets: Iterable[str] = ()) -> str:
     ]
     if outcome.report_status == "no_answers":
         lines.append("  (no_answers: nothing of the spoken answers reached the transcript)")
+    lines += format_stats(outcome)
     if outcome.problems:
         lines.append("Problems:")
         lines += [f"  - {problem}" for problem in outcome.problems]
@@ -350,6 +391,18 @@ class Printer:
 # --------------------------------------------------------------------------------------------
 # Small parsers: the report, .env, addresses
 # --------------------------------------------------------------------------------------------
+
+
+def stat_number(value: object) -> float | None:
+    """`value` if it is a finite number, else None. A bool is not a number here."""
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def stat_count(value: object) -> int:
+    """`value` if it is a whole number of 0 or more, else 0."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
 def count_report(report: object) -> tuple[int, int]:
@@ -654,8 +707,38 @@ async def fetch_report(
         await sleep(config.poll_every_s)
 
 
+async def fetch_stats(http: httpx.AsyncClient, out: Printer, outcome: Outcome) -> None:
+    """Ask once for the stats over the last day. Stats that do not come back are a problem line,
+    and never fail the run: they are shown, not checked. Only numbers are kept from them, so no
+    text the server sends reaches the screen."""
+    try:
+        response = await http.get(STATS_PATH)
+    except httpx.HTTPError as exc:
+        outcome.problems.append(f"could not fetch the stats ({type(exc).__name__})")
+        return
+    if response.status_code != 200:
+        outcome.problems.append(f"the stats answered HTTP {response.status_code}")
+        return
+    try:
+        stats = response.json()
+    except ValueError:
+        stats = None
+    headline = stats.get("stop_to_audible_ms") if isinstance(stats, dict) else None
+    if not isinstance(headline, dict):
+        outcome.problems.append("the stats were not in the expected shape")
+        return
+    hops = stats.get("hops_ms")
+    hops = hops if isinstance(hops, dict) else {}
+    outcome.stats_fetched = True
+    outcome.stats_p50_ms = stat_number(headline.get("p50"))
+    outcome.stats_n = stat_count(headline.get("n"))
+    outcome.stats_cut_in_rate = stat_number(stats.get("cut_in_rate"))
+    outcome.stats_hops_ms = {hop: stat_number(hops.get(hop)) for hop in HOPS}
+    out.note("stats for the last day read")
+
+
 async def run_smoke(config: Config, out: Printer) -> Outcome:
-    """The whole smoke call: start, talk, hang up, fetch the report."""
+    """The whole smoke call: start, talk, hang up, fetch the report, then the day's stats."""
     outcome = Outcome()
     # The server accepts a start from a page on its own site, which this stands in for. The
     # owner key skips that check as well, so it is a stand-in and not a way in.
@@ -676,6 +759,7 @@ async def run_smoke(config: Config, out: Printer) -> Outcome:
         await drive_call(config, url, out, outcome)
         if outcome.socket_opened:
             await fetch_report(http, interview_id, config, out, outcome)
+            await fetch_stats(http, out, outcome)
     return outcome
 
 

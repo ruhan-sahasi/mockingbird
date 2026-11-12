@@ -1,14 +1,20 @@
-// Which page the location hash names. The app has three: #/ is the landing page, #/interview is
-// the live interview and #/report/{id} is one interview's report. Anything else is the landing
-// page, so a mistyped or stale link still lands somewhere useful.
+// Which page the location hash names. The app has four: #/ is the landing page, #/interview is
+// the live interview, #/report/{id} is one interview's report and #/stats is the latency stats
+// over every call. Anything else is the landing page, so a mistyped or stale link still lands
+// somewhere useful.
 
-export type Route = { page: 'landing' } | { page: 'interview' } | { page: 'report'; id: string }
+export type Route =
+  | { page: 'landing' }
+  | { page: 'interview' }
+  | { page: 'report'; id: string }
+  | { page: 'stats' }
 
 // Interview ids are UUIDs. Letters, digits and dashes are all an id can hold.
 const REPORT = /^#\/report\/([A-Za-z0-9-]+)$/
 
 export function parseRoute(hash: string): Route {
   if (hash === '#/interview') return { page: 'interview' }
+  if (hash === '#/stats') return { page: 'stats' }
   const report = REPORT.exec(hash)
   if (report) return { page: 'report', id: report[1] }
   return { page: 'landing' }
@@ -26,6 +32,7 @@ export type Screen =
   | { page: 'landing'; redirect: boolean }
   | { page: 'interview' }
   | { page: 'report'; id: string }
+  | { page: 'stats' }
 
 /**
  * What to show for `route`. The interview page opens only after a Start in this visit
@@ -34,7 +41,8 @@ export type Screen =
  * address is put back to it, so the mic never turns on without a fresh Start.
  */
 export function screenFor(route: Route, started: boolean, phone: boolean): Screen {
-  if (route.page === 'report') return route
+  // A report and the stats need no Start: neither turns on the mic.
+  if (route.page === 'report' || route.page === 'stats') return route
   if (route.page === 'interview') {
     return started && !phone ? { page: 'interview' } : { page: 'landing', redirect: true }
   }

@@ -2,11 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   ApiError,
   getReport,
+  getStats,
   NOT_FOUND_GRACE_MS,
   pollReport,
   startInterview,
   wsUrl,
   type Report,
+  type Stats,
 } from './api'
 
 const ID = '0b6f2c1e-4a7d-4e7b-9a51-3f2d8c6b1a90'
@@ -120,6 +122,47 @@ describe('getReport', () => {
   it('throws an ApiError for a 200 that is not a report', async () => {
     fetchMock.mockResolvedValueOnce(json(200, { status: 'exploded' }))
     await expect(getReport(ID)).rejects.toBeInstanceOf(ApiError)
+  })
+})
+
+// What GET /api/stats answers (server/mockingbird/stats.py).
+const STATS: Stats = {
+  turns: 4,
+  stop_to_audible_ms: { p50: 1420, p95: 2100, n: 3 },
+  hops_ms: {
+    request_to_first_token: 410,
+    first_token_to_first_chunk: 2,
+    first_chunk_to_assistant_started: 380,
+    assistant_started_to_first_audio: null,
+  },
+  cut_in_rate: 0.25,
+  interrupt_to_silence_ms: { p50: null, p95: null, n: 0 },
+  consider_ducking: false,
+}
+
+describe('getStats', () => {
+  it('asks for the last 7 days by default and returns the stats on 200', async () => {
+    fetchMock.mockResolvedValueOnce(json(200, STATS))
+    await expect(getStats()).resolves.toEqual(STATS)
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/stats?days=7')
+  })
+
+  it('asks for the days it is given', async () => {
+    fetchMock.mockResolvedValueOnce(json(200, STATS))
+    await getStats(1)
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/stats?days=1')
+  })
+
+  it.each([
+    ['a 500', () => json(500, { detail: 'Internal Server Error' })],
+    ['a 422', () => json(422, { detail: [] })],
+    ['a 200 that is not JSON', () => new Response('oops', { status: 200 })],
+    ['a 200 with no turn count', () => json(200, { ...STATS, turns: undefined })],
+    ['a 200 with no stop to audible', () => json(200, { ...STATS, stop_to_audible_ms: null })],
+    ['a 200 with no hops', () => json(200, { ...STATS, hops_ms: 'none' })],
+  ])('throws an ApiError for %s', async (_name, response) => {
+    fetchMock.mockResolvedValueOnce(response())
+    await expect(getStats()).rejects.toBeInstanceOf(ApiError)
   })
 })
 

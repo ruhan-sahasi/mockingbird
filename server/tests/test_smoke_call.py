@@ -555,6 +555,139 @@ def test_only_an_answer_that_can_still_change_is_asked_for_again():
     assert [s for s in stop if smoke.report_may_change(s)] == []
 
 
+# --- the stats -----------------------------------------------------------------------------------
+
+HOPS = {
+    "request_to_first_token": 410.0,
+    "first_token_to_first_chunk": 2.0,
+    "first_chunk_to_assistant_started": 380.0,
+    "assistant_started_to_first_audio": 95.0,
+}
+
+# What GET /api/stats answers (stats.py's summarize_traces).
+STATS = {
+    "turns": 4,
+    "stop_to_audible_ms": {"p50": 1420.4, "p95": 2100.0, "n": 3},
+    "hops_ms": HOPS,
+    "cut_in_rate": 0.25,
+    "interrupt_to_silence_ms": {"p50": 180.0, "p95": 250.0, "n": 2},
+    "consider_ducking": False,
+}
+
+
+def with_stats(**changes):
+    fields = {
+        "stats_fetched": True,
+        "stats_p50_ms": 1420.4,
+        "stats_n": 3,
+        "stats_cut_in_rate": 0.25,
+        "stats_hops_ms": dict(HOPS),
+    }
+    return good(**{**fields, **changes})
+
+
+def test_the_summary_line_includes_the_stats():
+    text = smoke.format_summary(with_stats())
+    assert step(text, "Stats (last day)") == (
+        "Stats (last day): stop-to-audible p50 1420 ms over 3 turns, cut-in rate 25%"
+    )
+    assert step(text, "Server hops") == (
+        "Server hops (last day, median): request to first token 410 ms, first token to first "
+        "chunk 2 ms, first chunk to assistant started 380 ms, assistant started to first audio "
+        "95 ms"
+    )
+    assert "RESULT: PASS" in text
+
+
+def test_the_stats_say_n_a_for_a_number_the_server_does_not_have():
+    hops = {**HOPS, "assistant_started_to_first_audio": None}
+    text = smoke.format_summary(
+        with_stats(stats_p50_ms=None, stats_n=0, stats_cut_in_rate=None, stats_hops_ms=hops)
+    )
+    assert step(text, "Stats (last day)") == (
+        "Stats (last day): stop-to-audible p50 n/a over 0 turns, cut-in rate n/a"
+    )
+    assert step(text, "Server hops").endswith("assistant started to first audio n/a")
+
+
+def test_stats_that_did_not_come_back_are_not_available_and_do_not_fail_the_run():
+    outcome = good()
+    outcome.problems.append("the stats answered HTTP 500")
+    text = smoke.format_summary(outcome)
+    assert step(text, "Stats (last day)") == "Stats (last day): not available"
+    assert "Server hops" not in text
+    assert "the stats answered HTTP 500" in text
+    assert smoke.passed(outcome) and "RESULT: PASS" in text
+
+
+class FakeStatsHttp:
+    """Stands in for the httpx client: answers the one ask with `answer`, a response or an
+    exception to raise."""
+
+    def __init__(self, answer) -> None:
+        self.answer = answer
+        self.urls: list[str] = []
+
+    async def get(self, url: str):
+        self.urls.append(url)
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
+
+
+async def fetch_stats(answer):
+    http = FakeStatsHttp(answer)
+    outcome = good()
+    lines: list[str] = []
+    await smoke.fetch_stats(http, smoke.Printer([], write=lines.append), outcome)
+    return outcome, http.urls, lines
+
+
+async def test_the_stats_are_asked_for_once_over_the_last_day_and_kept():
+    outcome, urls, lines = await fetch_stats(httpx.Response(200, json=STATS))
+    assert urls == ["/api/stats?days=1"]
+    assert outcome.stats_fetched
+    assert (outcome.stats_p50_ms, outcome.stats_n, outcome.stats_cut_in_rate) == (1420.4, 3, 0.25)
+    assert outcome.stats_hops_ms == HOPS
+    assert outcome.problems == []
+    assert any("stats" in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    ("answer", "problem"),
+    [
+        (httpx.Response(500, text="boom"), "the stats answered HTTP 500"),
+        (httpx.Response(404, json={"detail": "Not Found"}), "the stats answered HTTP 404"),
+        (httpx.ConnectError("refused"), "could not fetch the stats (ConnectError)"),
+        (httpx.ReadTimeout("slow"), "could not fetch the stats (ReadTimeout)"),
+        (httpx.Response(200, text="not json"), "the stats were not in the expected shape"),
+        (httpx.Response(200, json=[1, 2]), "the stats were not in the expected shape"),
+        (httpx.Response(200, json={"turns": 1}), "the stats were not in the expected shape"),
+    ],
+)
+async def test_stats_that_fail_add_a_problem_but_never_fail_the_run(answer, problem):
+    outcome, _, _ = await fetch_stats(answer)
+    assert outcome.problems == [problem]
+    assert not outcome.stats_fetched
+    assert smoke.passed(outcome)
+
+
+async def test_only_numbers_from_the_stats_are_kept_so_no_server_text_is_printed():
+    hostile = {
+        **STATS,
+        "stop_to_audible_ms": {"p50": "tok-A9x7Qe2LmZ", "p95": None, "n": "3"},
+        "cut_in_rate": True,
+        "hops_ms": {"request_to_first_token": "call-id-01a1569", "extra": 5.0},
+    }
+    outcome, _, _ = await fetch_stats(httpx.Response(200, json=hostile))
+    assert outcome.stats_fetched
+    assert (outcome.stats_p50_ms, outcome.stats_n, outcome.stats_cut_in_rate) == (None, 0, None)
+    assert outcome.stats_hops_ms == {hop: None for hop in HOPS}
+    text = smoke.format_summary(outcome)
+    for leaked in ("tok-A9x7Qe2LmZ", "call-id-01a1569", "extra"):
+        assert leaked not in text
+
+
 # --- the whole flow, against the real app --------------------------------------------------------
 
 OPENING_S, FIRST_REPLY_S, SECOND_REPLY_S = 0.4, 1.0, 0.5
@@ -719,6 +852,12 @@ async def test_the_client_runs_a_whole_interview_against_the_real_app(live_app):
     assert outcome.ended_reason == "browser_closed"
     assert outcome.report_status == "graded"
     assert (outcome.scored_items, outcome.verified_quotes) == (1, 1)
+    # After the report it read the day's stats. It sends no timing of its own (it has no
+    # speakers to time), so stop-to-audible has nothing from this call, but the server traced
+    # the hops of the reply it spoke.
+    assert outcome.stats_fetched
+    assert "Stats (last day): stop-to-audible p50 n/a over 0 turns" in printed
+    assert outcome.stats_hops_ms["request_to_first_token"] is not None
     scripted = live_app.vapi_socket
     assert scripted.interruptions == 1
     # The relay passed on what the client sent, in whole 640-byte frames, and nothing else

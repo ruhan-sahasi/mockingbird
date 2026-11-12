@@ -16,6 +16,10 @@ describe('parseRoute', () => {
     expect(parseRoute(`#/report/${ID}`)).toEqual({ page: 'report', id: ID })
   })
 
+  it('gives the stats page for #/stats', () => {
+    expect(parseRoute('#/stats')).toEqual({ page: 'stats' })
+  })
+
   it.each([
     ['an unknown page', '#/settings'],
     ['the interview page with more after it', '#/interview/again'],
@@ -24,6 +28,7 @@ describe('parseRoute', () => {
     ['a report id with a slash in it', `#/report/${ID}/extra`],
     ['a report id with characters an id never has', '#/report/<script>'],
     ['a path without the leading slash', '#interview'],
+    ['the stats page with more after it', '#/stats/7'],
   ])('falls back to the landing page for %s', (_name, hash) => {
     expect(parseRoute(hash)).toEqual({ page: 'landing' })
   })
@@ -54,6 +59,12 @@ describe('screenFor', () => {
     const report = { page: 'report', id: ID } as const
     expect(screenFor(report, false, false)).toEqual(report)
     expect(screenFor(report, true, true)).toEqual(report)
+  })
+
+  it('shows the stats page whether or not there was a Start, on a phone too', () => {
+    const stats = { page: 'stats' } as const
+    expect(screenFor(stats, false, false)).toEqual(stats)
+    expect(screenFor(stats, false, true)).toEqual(stats)
   })
 
   it('shows the first page where it is, with nothing to put back', () => {

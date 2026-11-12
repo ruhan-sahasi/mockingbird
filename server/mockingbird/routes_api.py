@@ -1,4 +1,5 @@
-"""The browser's HTTP routes: start an interview, fetch its report, and the health check.
+"""The browser's HTTP routes: start an interview, fetch its report, the latency stats, and the
+health check.
 
 Starting an interview creates its record, its brain and a one-time socket token, and nothing
 else: no Vapi call exists until the browser opens the socket (routes_ws.py), so a start that is
@@ -13,11 +14,11 @@ import secrets
 import time
 import uuid
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from mockingbird.brain import Brain
@@ -26,6 +27,7 @@ from mockingbird.models import Interview
 from mockingbird.plan import DEMO, FULL, InterviewPlan
 from mockingbird.questions import load_questions
 from mockingbird.sessions import TOKEN_TTL_S, LiveSession
+from mockingbird.stats import summarize_traces
 
 # questions.yaml sits beside the package, not inside it, so find it from this file and not from
 # wherever the server happens to be started (ruling R15).
@@ -122,6 +124,15 @@ async def get_report(interview_id: str, request: Request) -> JSONResponse:
     if interview is not None and interview.status == "ended":
         return JSONResponse({"status": "grading"}, status_code=202)
     raise HTTPException(status_code=404)
+
+
+@router.get("/api/stats")
+async def get_stats(request: Request, days: int = Query(7, ge=1, le=30)) -> dict:
+    """The latency, cut-in and interrupt-to-silence numbers over the traces of the last `days`
+    days (stats.py). It is public: the numbers are about all the calls together, and nothing in
+    them names an interview or a turn. A `days` outside 1 to 30 is a 422."""
+    since = datetime.now(UTC) - timedelta(days=days)
+    return summarize_traces(await request.app.state.store.list_latency_traces(since))
 
 
 def _from_this_site(request: Request, public_base_url: str) -> bool:
