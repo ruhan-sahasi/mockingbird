@@ -168,8 +168,8 @@ and the sweeper that this plan extends:
    a second failure ends in a `grading_failed` report. A worker that renews
    a short lease would find a death within a minute or two. It is left out
    until the first live runs show workers dying.
-6. **This one needs your yes.** A signed link lasts 30 minutes, and one
-   interview can ask for at most 10 a minute. That limit counts links, not
+6. **Accepted by Ruhan on 2026-11-13, for a demo.** A signed link lasts
+   30 minutes, and one interview can ask for at most 10 a minute. That limit counts links, not
    downloads. A link can be downloaded any number of times until it
    expires, straight from Supabase, where the server can neither see nor
    throttle it, and one link cannot be revoked. So anyone who finishes a
