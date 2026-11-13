@@ -408,6 +408,10 @@ v1.
 | Latency trace storage (phase 2) | Postgres table plus a stats page | OpenTelemetry to a hosted tracer; structured logs on CloudWatch |
 | Recording format (phase 2) | WAV, 16 kHz PCM, in Supabase Storage | Opus |
 | Browser ducking on interruption (phase 2) | Measure the flush delay first; add ducking only if p95 is above about 300 ms | Build it now; skip it |
+| Batch speech-to-text (phase 3) | faster-whisper `small.en`, self-hosted in the project's own AWS task | Amazon Transcribe; Deepgram Nova-3; Cloudflare Workers AI |
+| Post-call worker (phase 3) | One ECS task per interview (RunTask), with a job row in Postgres and retries from the sweeper | An always-on worker polling a Postgres queue; a Lambda container; AWS Batch |
+| Quote check (phase 3) | Exact match first, then a word-level fuzzy match at 80% that rejects any edit touching a negation, a number or I/we; the report shows the transcript's own words | The grader cites word numbers; exact match only; character similarity (rapidfuzz) |
+| Click-to-play (phase 3) | A short-lived signed link to the candidate's track, and the page seeks to the quote | A short clip per quote; streaming through the server |
 
 ## My calls (flagged for Ruhan to check)
 
@@ -429,6 +433,19 @@ v1.
   free on AWS credits.
 - No custom domain: CloudFront's default HTTPS address fronts everything.
 - One server task, with the live-session registry in memory.
+- Phase 3: only the candidate's track is transcribed, so an interrupted interviewer line
+  keeps what was written during the call (the words Vapi reported as spoken) and is not
+  corrected from the interviewer's track.
+- Phase 3: the start time of each interviewer reply splits the candidate's words by
+  question.
+- Phase 3: when the recording cannot be transcribed, or no worker can finish, the report
+  is graded from the live text with no playback, and says so. That grade runs in the
+  server: one Claude call and a plain word scan. The word-by-word quote alignment never
+  runs in the process carrying live audio.
+- Phase 3: the worker starts at 2 vCPU and 4 GB with greedy decoding, and is tuned from
+  its own timing logs.
+- Phase 3: the consent notice says that anyone given the report link can play the
+  recording.
 
 Two of these are expensive to change once code exists, because the latency
 harness, schema, and interruption tests are built around them: the
