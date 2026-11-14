@@ -468,6 +468,15 @@ NOT_FOUND_IN_OWN_WORDS = [
         (1, 7, 0.875),
         id="everyones-for-the-we-of-weve",
     ),
+    # The same past the match's end, where the guarded token comes second: "couldn't" is
+    # "could", "not". The match stops at "said", with "yes" left out, so a rule that read only
+    # the next token would read "could" and keep "I said yes" for "I said couldn't".
+    pytest.param(
+        "When they asked if we could ship it in two weeks, I said couldn't.",
+        "When they asked if we could ship it in two weeks, I said yes",
+        (0, 12, 0.929),
+        id="yes-for-the-not-of-couldnt",
+    ),
     # A plain word in place of a guarded first or last word, with the word beside it left out.
     # The match reads "Yes" as a change to "honestly", so only the edge rule reads the "No".
     # Neither "yes" nor "honestly" is guarded, so to the guard these look the same as a word the
