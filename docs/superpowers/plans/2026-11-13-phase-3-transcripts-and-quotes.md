@@ -296,53 +296,81 @@ README.md
     from `first` to `last`, joined by single spaces.
   - Constants: `FILLERS`, `NEGATIONS`, `FIRST_PERSON`.
 
-**The algorithm.** The tests pin its results. This is the rule they pin:
+**The algorithm.** The tests pin its results. This is the rule they pin.
+Ruling P3-R8 tightened it during the build: hyphens split, `'d` and `let's`
+expand, number words gained plurals and more ordinals, fillers never count
+on either side, a match is whole words, and the guard reads every cheapest
+alignment and the words just outside the match.
 
 1. `tokenize`, in this order:
    - Lowercase.
-   - Expand contractions where they end a word: `can't` and `cannot` to
-     `can not`, `won't` to `will not`, any other `n't` to ` not`,
-     `'m` to ` am`, `'re` to ` are`, `'ve` to ` have`, `'ll` to ` will`.
-     An apostrophe is `'`, `’`, `‘` or `ʼ`. A quote mark before a word is
-     not a contraction: `'my` stays `my`.
-   - Delete a hyphen that sits between two word characters (`e-commerce`
-     becomes `ecommerce`, `twenty-five` becomes `twentyfive`).
+   - Expand contractions where they end a word: `let's` to `let us`
+     (whole word), `can't` and `cannot` to `can not`, `won't` to
+     `will not`, any other `n't` to ` not`, `'m` to ` am`, `'re` to
+     ` are`, `'ve` to ` have`, `'ll` to ` will`, and `'d` to ` d` (so the
+     pronoun in "I'd", "we'd", "they'd" stands alone; `d` is left undecided
+     between would and had). An apostrophe is `'`, `’`, `‘` or `ʼ`. A
+     quote mark before a word is not a contraction: `'my` stays `my`.
    - Turn `%` into ` percent `.
    - Delete the remaining apostrophes. Turn every other punctuation
      character into a space (`string.punctuation`, plus any character whose
      Unicode category starts with `P`). This differs from phase 1's
      `normalize`, which deletes punctuation and would join `cause—and` into
-     one word.
+     one word. A hyphen splits like any other punctuation, so `twenty-five`
+     is `twenty`, `five` and `can't-do` is `can`, `not`, `do`. Joined into
+     one token, a guarded word would hide from the guard.
    - Split on whitespace.
-2. Tokenize the quote into `q`. Tokenize each word of `words` and keep
-   `owner[i]`, the index of the word each transcript token came from. A
-   word with no tokens (a lone dash) adds none. If `q` or the transcript
-   has no tokens, return None.
-3. Find the best substring of the transcript tokens with Sellers'
-   algorithm: a Levenshtein table whose first row is all zeros, so a match
-   may start anywhere.
+2. Fillers never count, on either side. Tokenize the quote and drop its
+   fillers: that is `q`. Tokenize each word of `words`, drop fillers, and
+   keep `owner[i]`, the index of the word each kept token came from. A word
+   with no tokens left (a lone dash, an "um") adds none. If `q` or the
+   transcript has no tokens, return None.
+3. Find the best span with Sellers' algorithm, a Levenshtein table whose
+   first row lets a match start anywhere, aligned to whole words:
+   - A span may start only on the first token of a word, and end only on
+     the last token of a word. In the table's first row, a column that is
+     not a word's start costs the number of that word's tokens before it
+     (they are inside the span as insertions), with the word's start as
+     the span's start. Only columns at a word's end are candidate ends.
+     Without this, a quote that stops inside a word ("I knew we could"
+     against "couldn't", "4% of users" against "0.4% of users") scores as
+     an exact match.
    - A substitution, an insertion and a deletion each cost 1.
-   - Skipping a transcript token that is in `FILLERS` costs 0.
-   - Each cell holds `(cost, -matched, start)` and compares on
-     `(cost, -matched)`, so among equally cheap alignments the one that
-     matches more words wins.
-   - Pick the end column by `(cost, -matched, abs(span_length - len(q)),
-     end)`, smallest first. Then trim fillers off both edges of the span.
-     If the trim leaves no tokens (the span was all fillers), return None.
-4. `denominator = max(len(q), non-filler tokens in the span)`, and
+   - Each cell holds `(cost, -matched, start)` and compares as a whole
+     tuple: the cheaper alignment wins, then the one that matches more
+     tokens, then the one that starts earlier.
+   - Pick the end by `(cost, -matched, abs(span_length - len(q)), end)`,
+     smallest first, where `span_length` is the span's token count.
+4. `said` is the span's tokens. `denominator = max(len(q), len(said))`, and
    `ratio = 1 - cost / denominator`.
 5. Accept when `cost == 0`, at any length.
 6. Otherwise accept only when both hold:
    - `5 * cost <= denominator` (a ratio of 0.80 or more, compared in
      integers). No length rule is needed: with 3 quote tokens or fewer, one
      edit already puts the ratio under 0.80.
-   - no edit touches a guarded token. Align `q` against the span's
-     non-filler tokens with a plain Levenshtein table, walk it back, and
-     collect every token on either side of a substitution, insertion or
-     deletion. A token is guarded when it is in `NEGATIONS`, in
-     `FIRST_PERSON`, holds a digit, or is a number word.
+   - No guarded token is touched. Touched tokens are collected over every
+     cheapest alignment of `q` against `said` (a forward and a backward
+     Levenshtein table; an edit is on a cheapest alignment when
+     `forward + 1 + backward` equals the total): both tokens of each
+     substitution, the quote token of each deletion, the transcript token
+     of each insertion. Plus the edge rule: when a cheapest alignment's
+     first step substitutes or drops a quote token, the transcript token
+     just before the span (if there is one) counts as touched, and likewise
+     the token just after the span for the last step. Without it, "He owned
+     the fix end to end" against "I really owned the fix end to end." and
+     "...my answer was yes" against "...my honest answer was no." are kept,
+     because the cheapest span stops short of the changed word. A token is
+     guarded when it is in `NEGATIONS`, in `FIRST_PERSON`, holds a digit,
+     or is a number word.
 7. `first = owner[span_start]`, `last = owner[span_end - 1]`. Round `ratio`
    to 3 places.
+
+The guard errs toward dropping a quote. Two kinds of faithful quote are
+dropped on purpose, and the tests pin both: a guarded word the transcript
+repeats ("and then I led" against "and then I I led"), and a word the
+grader added at the quote's start or end near a guarded word ("Honestly, I
+led" against "No, I led"). Each costs a kept quote and never shows a wrong
+one.
 
 The sets:
 - `FILLERS`: um, uh, uhm, erm, er, ah, hmm, mm, mhm.
@@ -350,15 +378,20 @@ The sets:
   without.
 - `FIRST_PERSON`: i, me, my, mine, myself, we, us, our, ours, ourselves.
   "you" is not in it, so a dropped "you know" still passes.
-- A number word matches
-  `^(?:UNIT)*(?:UNIT|OTHER)$`, where `UNIT` is zero to nineteen, the tens
-  from twenty to ninety, hundred, thousand, million, billion, and `OTHER`
-  is first to twelfth, twentieth, thirtieth, hundredth, thousandth, once,
-  twice, half, double, triple, dozen, percent. So `twentyfive`, `second`
-  and `percent` are all guarded.
+- A number word matches `^(?:UNIT)*(?:UNIT|ORDINAL|OTHER)s?$`, or is one of
+  the decades twenties, thirties, forties, fifties, sixties, seventies,
+  eighties, nineties. So `hundreds`, `thousands`, `dozens`, `tens`,
+  `seconds`, `doubled`, `fourteenth` and `twentyfive` are all guarded.
+  - `UNIT`: zero to nineteen, the tens from twenty to ninety, hundred,
+    thousand, million, billion, trillion.
+  - `ORDINAL`: first to twelfth, thirteenth to nineteenth, twentieth,
+    thirtieth, fortieth, fiftieth, sixtieth, seventieth, eightieth,
+    ninetieth, hundredth, thousandth, millionth, billionth, trillionth.
+  - `OTHER`: once, twice, thrice, half, halves, halve, halved, double,
+    doubled, triple, tripled, quadruple, quadrupled, dozen, percent.
 
-**The fixture.** Every test below uses this answer, split on spaces into 68
-words (index 0 is `So,`, index 43 is the lone `-`):
+**The fixture.** The `locate_quote` table below runs against this answer,
+split on spaces into 68 words (index 0 is `So,`, index 43 is the lone `-`):
 
 > So, um, I led the migration of our billing service to the new queue, and
 > uh I did not skip the load test. We cut errors from 12% to 0.4% in two
@@ -372,8 +405,11 @@ words (index 0 is `So,`, index 43 is the lone `-`):
 
   | Input | Tokens |
   |---|---|
-  | `e-commerce` | `ecommerce` |
-  | `twenty-five percent` | `twentyfive`, `percent` |
+  | `e-commerce` | `e`, `commerce` |
+  | `twenty-five percent` | `twenty`, `five`, `percent` |
+  | `can't-do` | `can`, `not`, `do` |
+  | `We-we` | `we`, `we` |
+  | `12-15` | `12`, `15` |
   | `12%` | `12`, `percent` |
   | `0.4%` | `0`, `4`, `percent` |
   | `can't`, `cannot` | `can`, `not` |
@@ -383,6 +419,8 @@ words (index 0 is `So,`, index 43 is the lone `-`):
   | `we've` | `we`, `have` |
   | `they'll` | `they`, `will` |
   | `You're` | `you`, `are` |
+  | `I'd` | `i`, `d` |
+  | `let's`, `Let’s` | `let`, `us` |
   | `cause—and` | `cause`, `and` |
   | `O’Brien's` | `obriens` |
   | `'my team'` | `my`, `team` |
@@ -405,40 +443,93 @@ words (index 0 is `So,`, index 43 is the lone `-`):
   | `which was much earlier than we expected` | first 36, last 42, ratio 0.857. Shown ends `planned.` |
   | `I personally owned the fix end to end` | first 56, last 62, ratio 0.875. Shown is `I owned the fix end to end.` |
   | `the migration our billing` | first 4, last 8, ratio 0.8: exactly at the line |
-  | `Latency rose by twenty-five percent after the second release` | first 44, last 52, ratio 0.889. Shown says `dropped`. No word list can catch an antonym, which is why the report shows the transcript's words |
+  | `Latency rose by twenty-five percent after the second release` | first 44, last 52, ratio 0.9. Shown says `dropped`. No word list can catch an antonym, which is why the report shows the transcript's words |
+  | `So I owned the fix end to end` | first 55, last 62, ratio 0.875. Shown starts `that I owned`: `So` in place of `that` ties with `So` never said, and the earlier start wins |
   | `I did skip the load test` | None: the edit touches `not` |
   | `We cut errors from 15% to 0.4% in two weeks` | None: the edit touches a number |
   | `in three weeks, like, you know, which was much earlier` | None: `three` for `two` |
   | `We led the migration of our billing service to the new queue` | None: `we` for `i` |
-  | `Latency dropped by thirty-five percent after the second release` | None: a compound number |
+  | `Latency dropped by thirty-five percent after the second release` | None: `thirty` for `twenty`, inside a compound |
   | `Latency dropped by twenty-five percent after the third release` | None: an ordinal |
   | `which was not much earlier than we planned` | None: the quote adds `not` |
   | `which was never earlier than we planned` | None: `never` for `much`, guarded on the quote's side only |
   | `which was much earlier than they planned` | None: `they` for `we`, guarded on the transcript's side only |
   | `We cut errors from 0.4% to 12% in two weeks, like, you know, which was much earlier than we planned` | None: the two numbers swapped (ratio 0.826) |
   | `No, so I led the migration of our billing service` | None: the quote adds `no` at its very start (ratio 0.9) |
+  | `He owned the fix end to end` | None: `he` for `i` at the quote's start |
+  | `They cut errors from 12% to 0.4% in two weeks` | None: `they` for `we` at the quote's start |
+  | `We cut errors from 12 to 0.4% in two weeks` | None: the `percent` of `12%` is left out |
   | `in two weeks, which was much earlier than we planned` | None: 3 words left out of 13 is under 80% |
   | `I led the migration and we cut errors` | None: a splice of two places |
   | `I rewrote the scheduler in Rust over a weekend` | None: invented |
   | `skip the test` | None: one word left out of 4 is 75% |
   | `skip the unit test` | None: one edit in 4 is 75% |
-  | `um` | None: the span is all filler |
+  | `um` | None: a quote of fillers only has no tokens |
   | an empty string, and `… —` | None |
+
+  Every None row the guard rejects is found once `_guarded` is patched to
+  return False, and the tests pin where: `I did skip the load test`, for
+  one, is then first 16, last 22, ratio 0.857. Every other None row stays
+  None. So no guarded row can pass by failing the 80% line instead.
+
+  With their own words, split on spaces ("the same with" changes only the
+  words named):
+
+  | Transcript | Quote | Result |
+  |---|---|---|
+  | `I'd have shipped the whole fix end to end by Friday` | `I would have shipped the whole fix end to end by Friday` | first 0, last 10, ratio 0.917 |
+  | `Let's say we sharded the queue by region` | `Let us say we sharded the queue by region` | first 0, last 7, ratio 1.0 |
+  | `I knew we couldn't. Later I knew we could.` | `I knew we could` | first 5, last 8, ratio 1.0. Shown `I knew we could.` |
+  | `we cut latency from 12-15 ms to 4 ms` | the same with an en dash in `12–15` | first 0, last 8, ratio 1.0 |
+  | `I led the migration` | `um I led` | first 0, last 1, ratio 1.0: the quote's filler does not count |
+  | `I personally owned the rollout plan.` | `I owned the rollout plan` | first 0, last 5, ratio 0.833: a word left out beats `I` changed into `personally` |
+  | `I talked to every single customer.` | `I talked to every customer` | first 0, last 5, ratio 0.833. Shown keeps `customer.` |
+  | `I'd have shipped the whole fix end to end by Friday` | `We'd have shipped the whole fix end to end by Friday` | None: `we` for `i` |
+  | `They'd already shipped the fix by the time I joined` | `We'd already shipped the fix by the time I joined` | None: `we` for `they` |
+  | `We had a five-person team` | `We had a six-person team` | None: `six` for `five` |
+  | `we finished the whole rewrite in a two-week sprint last spring` | the same with `three-week` | None: `three` for `two` |
+  | `the launch was not-so-great for the whole team this quarter` | the same with `so-great` | None: drops `not` |
+  | `everyone on the team had a can't-do attitude about it` | the same with `can-do` | None: drops `not` |
+  | `we migrated hundreds of customers to the new billing service` | the same with `thousands` | None: a plural number word |
+  | `We doubled the throughput of the billing service in two weeks` | the same with `tripled` | None |
+  | `it was the thirteenth release of the billing service this year` | the same with `fourteenth` | None |
+  | `The old billing service was just not fast enough for us` | the same with `not just` | None: one cheapest alignment never touches `not`, another does |
+  | `I knew we couldn't.` | `I knew we could` | None: the match takes all of `couldn't.`, so the edit is `not` |
+  | `0.4% of users saw errors` | `4% of users saw errors` | None: the match takes all of `0.4%` |
+  | `1.5 million dollars in revenue` | `5 million dollars in revenue` | None: the match takes all of `1.5` |
+  | `revenue grew 12.5%` | `revenue grew 12` | None: 2 edits in 5 |
+  | `We-we led the migration of our billing service` | `They led the migration of our billing service` | None: the match starts at `led`, and the edge rule reads the `we` before it |
+  | `When they asked if we could ship it in two weeks, my honest answer was no.` | `When they asked if we could ship it in two weeks, my answer was yes` | None: the match stops at `was`, and the edge rule reads `no` |
+  | `I really owned the fix end to end.` | `He owned the fix end to end` | None: the match starts at `really`, and the edge rule reads `I` |
+  | `I, uh, owned the fix end to end.` | `He owned the fix end to end` | None: the filler changes nothing |
+  | `That part was, um, owned by me.` | `That part was owned by him` | None: the filler changes nothing |
+  | `and then I I led the migration of our billing service` | `and then I led the migration of our billing service` | None, on purpose: a guarded word said twice |
+  | `No, I led the migration of our billing service` | `Honestly, I led the migration of our billing service` | None, on purpose: an added edge word beside a guarded one |
 
   Each guarded row catches a different wrong build: one that reads only
   the transcript's side of an edit, one that reads only the quote's side,
-  one that compares the two sides as bags of words, and one whose walk
-  back stops at the table's edge.
+  one that compares the two sides as bags of words, one that misses an edit
+  on the alignment table's edge, one whose match can start or stop inside a
+  word, one without the edge rule, and one that reads a single cheapest
+  alignment, the one that leaves a swapped `not` alone.
 
   Also:
-  - `locate_quote("Um, uh", "Um, uh, I do not know.".split())` is None.
-  - `locate_quote("um", "I think so, um".split())` is None: the filler is
-    the last word.
+  - Every number word is guarded: for each word of `UNIT`, `ORDINAL` and
+    `OTHER`, each `UNIT` word with an `s` added, every decade, and
+    `twentyfive`, `locate_quote(f"we shipped the fix on friday {w}",
+    "we shipped the fix on friday".split())` is None. With `today` it is
+    first 0, last 5, ratio 0.857.
+  - Putting `um,` before any word of the fixture, or at its end, changes no
+    row of the fixture table: not its verdict, not its ratio. First and
+    last shift by the inserted word only.
   - `locate_quote("anything", [])` is None.
   - A quote of 30 invented words against a 5-word transcript is None.
   - `span_text` joins with single spaces and keeps the words' own
     punctuation and capitals.
-  - The module imports nothing outside the standard library.
+  - Assigning to a field of a `QuoteMatch` raises
+    `dataclasses.FrozenInstanceError`.
+  - The module imports nothing outside the standard library, and not
+    `logging`, `io` or `os`, and never calls `print` or `open`.
 
 - [ ] **Step 2: Run them.** `uv run pytest -q server/tests/test_quotes.py`.
   Expected: FAIL, no module named `mockingbird.quotes`.
