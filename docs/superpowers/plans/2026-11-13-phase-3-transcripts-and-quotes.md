@@ -541,6 +541,7 @@ split on spaces into 68 words (index 0 is `So,`, index 43 is the lone `-`):
   | `I really owned the fix end to end.` | `He owned the fix end to end` | None: the match starts at `really`, and the edge rule reads `I` |
   | `I'm proud that I owned the fix end to end.` | `He's proud that I owned the fix end to end` | None: the match starts at `proud`, and the edge rule reads all of `I'm`, so its `i` |
   | `We've shipped every release on time since March.` | `Everyone's shipped every release on time since March` | None: the same with the `we` of `We've` |
+  | `When they asked if we could ship it in two weeks, I said couldn't.` | `When they asked if we could ship it in two weeks, I said yes` | None: the match stops at `said`, and the edge rule reads all of `couldn't`, so its `not` |
   | `No, honestly, the cutover went fine for the billing team that week.` | `Yes, the cutover went fine for the billing team that week.` | None: the match starts at `honestly,`, and the edge rule reads `No` |
   | `When they asked if we could ship it in two weeks, my answer was, honestly, no.` | `When they asked if we could ship it in two weeks, my answer was yes` | None: the match stops at `honestly,`, and the edge rule reads `no` |
   | `I, uh, owned the fix end to end.` | `He owned the fix end to end` | None: the filler changes nothing |
