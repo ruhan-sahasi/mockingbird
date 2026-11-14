@@ -394,6 +394,25 @@ never shows a wrong one.
   look the same as the added-word quotes. Keeping those without keeping
   these would take a new list of words.
 
+**Open decision, for Ruhan or the controller.** Ruling P3-R8 named the
+second cost as "an unguarded edge word beside a guarded neighbour". The
+rule as built reaches one word further, to a guarded word two words out,
+and that is most of the measured drops: 60 of the 80 at the start and 81
+of the 151 at the end. Nobody has ruled on that wider cost. The build
+keeps it, because the two changes tried so far would relax the quote
+decision, and the rows above pin the behaviour so that changing it is a
+choice. The choices:
+1. Accept it, and make P3-R8's cost line say "one or two words out".
+2. Read past the match only when the quote's edge word is left out, not
+   when it is changed, and guard third-person pronouns in the quote. This
+   keeps the added-word quotes. It also keeps "Yes, the cutover went fine"
+   against "No, honestly, the cutover went fine" and shows the answer with
+   its "No" cut off, so it relaxes the quote decision.
+3. A short list of words a grader may add (and, so, but, overall), with
+   "yes" off it. Not built. Which words real graders add is unmeasured.
+   Task 4's per-report counts of kept and dropped quotes will show how
+   often this bites on live runs.
+
 The sets:
 - `FILLERS`: um, uh, uhm, erm, er, ah, hmm, mm, mhm.
 - `NEGATIONS`: not, no, never, nothing, nobody, none, neither, nor,
