@@ -474,8 +474,9 @@ def test_a_quote_that_changes_the_meaning_is_none_in_its_own_words(
     _assert_none_and_only_the_guard_says_so(quote, said.split(), unguarded, monkeypatch)
 
 
-# Two faithful quotes the guard drops on purpose (the module's docstring says why). Each costs a
-# kept quote and never shows a wrong one. They are pinned so that a change to either is a choice.
+# Two kinds of faithful quote the guard drops on purpose (the module's docstring says why). Each
+# costs a kept quote and never shows a wrong one. They are pinned so that a change to either is a
+# choice.
 @pytest.mark.parametrize(
     ("said", "quote", "unguarded"),
     [
@@ -485,11 +486,29 @@ def test_a_quote_that_changes_the_meaning_is_none_in_its_own_words(
             (0, 10, 0.909),
             id="a-guarded-word-said-twice",
         ),
+        # A word the grader added at the quote's start or end reads as a change to the transcript
+        # word beside the match. Here that word is the guarded one.
         pytest.param(
             "No, I led the migration of our billing service",
             "Honestly, I led the migration of our billing service",
             (0, 8, 0.889),
             id="an-edge-word-beside-a-guarded-one",
+        ),
+        # Here it is not, and the edge rule reads the word past it, two words out. "Overall" reads
+        # as a change to "planned." because the earlier start wins a tie, so the rule reads "we".
+        # "overall" reads as a change to "and" because the run as long as the quote wins a tie, so
+        # the rule reads the "I" after "uh".
+        pytest.param(
+            ANSWER,
+            "Overall latency dropped by twenty-five percent after the second release",
+            (42, 52, 0.909),
+            id="a-first-word-added-two-words-from-a-guarded-one",
+        ),
+        pytest.param(
+            ANSWER,
+            "I led the migration of our billing service to the new queue, overall",
+            (2, 14, 0.923),
+            id="a-last-word-added-two-words-from-a-guarded-one",
         ),
     ],
 )

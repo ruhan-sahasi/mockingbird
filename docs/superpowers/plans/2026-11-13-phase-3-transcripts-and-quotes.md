@@ -366,11 +366,26 @@ alignment and the words just outside the match.
    to 3 places.
 
 The guard errs toward dropping a quote. Two kinds of faithful quote are
-dropped on purpose, and the tests pin both: a guarded word the transcript
-repeats ("and then I led" against "and then I I led"), and a word the
-grader added at the quote's start or end near a guarded word ("Honestly, I
-led" against "No, I led"). Each costs a kept quote and never shows a wrong
-one.
+dropped on purpose, and the tests pin both. Each costs a kept quote and
+never shows a wrong one.
+- A guarded word the transcript repeats: "and then I led" against "and
+  then I I led".
+- A word the grader added at the quote's start or end, with a guarded word
+  one or two words out in the transcript. The added word can read as a
+  change to the transcript word beside the match: at the start because the
+  earlier start wins a tie, at the end because the run nearest the quote's
+  length wins. In "Honestly, I led" against "No, I led", that word is the
+  guarded "No". When it is not guarded, the edge rule reads the word past
+  it. On the fixture, "Overall latency dropped by twenty-five percent after
+  the second release" reads `Overall` in place of `planned.`, then `we`.
+  "I led the migration of our billing service to the new queue, overall"
+  reads `overall` in place of `and`, then the `I` after `uh`. A scratch
+  check during the build cut 29 runs at clause edges from four answers and
+  added each of ten unguarded words (so, then, well, really, also,
+  honestly, overall, basically, and, but) to each run: 290 quotes a side.
+  With the word added at the start, 80 (28%) were dropped: 20 for a
+  guarded word beside the match and 60 for one two words out. With it
+  added at the end, 151 (52%) were dropped: 70 beside and 81 two words out.
 
 The sets:
 - `FILLERS`: um, uh, uhm, erm, er, ah, hmm, mm, mhm.
@@ -472,8 +487,8 @@ split on spaces into 68 words (index 0 is `So,`, index 43 is the lone `-`):
   one, is then first 16, last 22, ratio 0.857. Every other None row stays
   None. So no guarded row can pass by failing the 80% line instead.
 
-  With their own words, split on spaces ("the same with" changes only the
-  words named):
+  With their own words, split on spaces, or with the fixture where the
+  table says so ("the same with" changes only the words named):
 
   | Transcript | Quote | Result |
   |---|---|---|
@@ -505,6 +520,8 @@ split on spaces into 68 words (index 0 is `So,`, index 43 is the lone `-`):
   | `That part was, um, owned by me.` | `That part was owned by him` | None: the filler changes nothing |
   | `and then I I led the migration of our billing service` | `and then I led the migration of our billing service` | None, on purpose: a guarded word said twice |
   | `No, I led the migration of our billing service` | `Honestly, I led the migration of our billing service` | None, on purpose: an added edge word beside a guarded one |
+  | the fixture | `Overall latency dropped by twenty-five percent after the second release` | None, on purpose: `Overall` reads as a change to `planned.`, and the edge rule reads `we`, two words out |
+  | the fixture | `I led the migration of our billing service to the new queue, overall` | None, on purpose: `overall` reads as a change to `and`, and the edge rule reads the `I` after `uh`, two words out |
 
   Each guarded row catches a different wrong build: one that reads only
   the transcript's side of an edit, one that reads only the quote's side,
