@@ -36,7 +36,10 @@ tests pin both, since each costs a kept quote and never shows a wrong one:
   in the transcript. The added word can read as a change to the word beside the match, and the
   edge rule then reads the word past that one. "Honestly, I led" against "No, I led" reads as
   "Honestly" in place of "No". "Overall latency dropped" against "we planned. Latency dropped"
-  reads as "Overall" in place of "planned", and past it is "we".
+  reads as "Overall" in place of "planned", and past it is "we". The same shape can hide a
+  meaning change, which is why these are dropped: "Yes, the cutover went fine" against "No,
+  honestly, the cutover went fine" is a plain word in place of a guarded one, with the word
+  beside it left out.
 
 The module is pure: standard library only, no I/O and no logging, so no quote can reach a log
 from here.

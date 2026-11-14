@@ -386,6 +386,13 @@ never shows a wrong one.
   With the word added at the start, 80 (28%) were dropped: 20 for a
   guarded word beside the match and 60 for one two words out. With it
   added at the end, 151 (52%) were dropped: 70 beside and 81 two words out.
+  The same shape can hide a meaning change, which is why these are
+  dropped: "Yes, the cutover went fine" against "No, honestly, the cutover
+  went fine", or "my answer was yes" against "my answer was, honestly,
+  no.", is a plain word in place of a guarded one with the word beside it
+  left out. Neither `yes` nor `honestly` is guarded, so to the guard these
+  look the same as the added-word quotes. Keeping those without keeping
+  these would take a new list of words.
 
 The sets:
 - `FILLERS`: um, uh, uhm, erm, er, ah, hmm, mm, mhm.
@@ -516,6 +523,8 @@ split on spaces into 68 words (index 0 is `So,`, index 43 is the lone `-`):
   | `We-we led the migration of our billing service` | `They led the migration of our billing service` | None: the match starts at `led`, and the edge rule reads the `we` before it |
   | `When they asked if we could ship it in two weeks, my honest answer was no.` | `When they asked if we could ship it in two weeks, my answer was yes` | None: the match stops at `was`, and the edge rule reads `no` |
   | `I really owned the fix end to end.` | `He owned the fix end to end` | None: the match starts at `really`, and the edge rule reads `I` |
+  | `No, honestly, the cutover went fine for the billing team that week.` | `Yes, the cutover went fine for the billing team that week.` | None: the match starts at `honestly,`, and the edge rule reads `No` |
+  | `When they asked if we could ship it in two weeks, my answer was, honestly, no.` | `When they asked if we could ship it in two weeks, my answer was yes` | None: the match stops at `honestly,`, and the edge rule reads `no` |
   | `I, uh, owned the fix end to end.` | `He owned the fix end to end` | None: the filler changes nothing |
   | `That part was, um, owned by me.` | `That part was owned by him` | None: the filler changes nothing |
   | `and then I I led the migration of our billing service` | `and then I led the migration of our billing service` | None, on purpose: a guarded word said twice |
@@ -527,8 +536,9 @@ split on spaces into 68 words (index 0 is `So,`, index 43 is the lone `-`):
   the transcript's side of an edit, one that reads only the quote's side,
   one that compares the two sides as bags of words, one that misses an edit
   on the alignment table's edge, one whose match can start or stop inside a
-  word, one without the edge rule, and one that reads a single cheapest
-  alignment, the one that leaves a swapped `not` alone.
+  word, one without the edge rule, one whose edge rule reads past a quote
+  word left out but not past a changed one, and one that reads a single
+  cheapest alignment, the one that leaves a swapped `not` alone.
 
   Also:
   - Every number word is guarded: for each word of `UNIT`, `ORDINAL` and

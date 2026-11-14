@@ -10,8 +10,9 @@ row can pass by failing the 80% line instead.
 The guarded rows each catch a different wrong build: one that reads only the transcript's side of
 an edit, one that reads only the quote's side, one that compares the two sides as bags of words,
 one that misses an edit on the alignment table's edge, one whose match can start or stop inside a
-word, one without the edge rule, whose match stops short of a changed word, and one that reads a
-single cheapest alignment, the one that leaves a swapped "not" alone.
+word, one without the edge rule, whose match stops short of a changed word, one whose edge rule
+reads past a left-out quote word but not past a changed one, and one that reads a single cheapest
+alignment, the one that leaves a swapped "not" alone.
 """
 
 import ast
@@ -451,6 +452,23 @@ NOT_FOUND_IN_OWN_WORDS = [
         (1, 7, 0.857),
         id="he-for-i-before-a-left-out-word",
     ),
+    # A plain word in place of a guarded first or last word, with the word beside it left out.
+    # The match reads "Yes" as a change to "honestly", so only the edge rule reads the "No".
+    # Neither "yes" nor "honestly" is guarded, so to the guard these look the same as a word the
+    # grader added with a guarded word two words out, which it drops on purpose (see below).
+    # Keeping those without keeping these would take a new list of words.
+    pytest.param(
+        "No, honestly, the cutover went fine for the billing team that week.",
+        "Yes, the cutover went fine for the billing team that week.",
+        (1, 11, 0.909),
+        id="yes-for-a-first-no-with-the-next-word-left-out",
+    ),
+    pytest.param(
+        "When they asked if we could ship it in two weeks, my answer was, honestly, no.",
+        "When they asked if we could ship it in two weeks, my answer was yes",
+        (0, 14, 0.933),
+        id="yes-for-a-last-no-with-the-word-before-left-out",
+    ),
     # A filler in between changes nothing. Without it, each is None as well.
     pytest.param(
         "I, uh, owned the fix end to end.",
@@ -497,7 +515,8 @@ def test_a_quote_that_changes_the_meaning_is_none_in_its_own_words(
         # Here it is not, and the edge rule reads the word past it, two words out. "Overall" reads
         # as a change to "planned." because the earlier start wins a tie, so the rule reads "we".
         # "overall" reads as a change to "and" because the run as long as the quote wins a tie, so
-        # the rule reads the "I" after "uh".
+        # the rule reads the "I" after "uh". To the guard these look the same as the two
+        # yes-for-no rows with a left-out word above, which must stay None.
         pytest.param(
             ANSWER,
             "Overall latency dropped by twenty-five percent after the second release",
