@@ -2,10 +2,11 @@
 and whether it is close enough to keep (Review Focus 2).
 
 The two tables, FOUND and NOT_FOUND, run against one answer, split on spaces into 68 words the
-way a transcriber writes them, and their expected values are the plan's. Each rejected case names
-the rule that rejects it. The guarded ones each catch a different wrong build: one that reads
-only the transcript's side of an edit, one that reads only the quote's side, one that compares
-the two sides as bags of words, and one whose walk back stops at the table's edge.
+way a transcriber writes them. Their expected values are the plan's, except two NOT_FOUND rows
+marked as not in it. Each rejected case names the rule that rejects it. The guarded ones each
+catch a different wrong build: one that reads only the transcript's side of an edit, one that
+reads only the quote's side, one that compares the two sides as bags of words, one whose walk
+back stops at the table's edge, and one whose span leaves out a changed first word.
 """
 
 import ast
@@ -219,6 +220,12 @@ NOT_FOUND = [
     ),
     # Ratio 0.9: the added "no" sits on the alignment table's edge.
     pytest.param("No, so I led the migration of our billing service", id="adds-no-at-the-start"),
+    # Not in the plan. The quote's first word replaces "I" or "We" with a word the guard does not
+    # know, so only the transcript's side is guarded. Two readings cost one edit and match as many
+    # words: the word was changed, or it was never said and the match starts one word later. Only
+    # the first keeps "I" or "We" in the span the guard reads.
+    pytest.param("He owned the fix end to end", id="he-for-i-at-the-start"),
+    pytest.param("They cut errors from 12% to 0.4% in two weeks", id="they-for-we-at-the-start"),
     pytest.param(
         "in two weeks, which was much earlier than we planned",
         id="3-of-13-left-out-is-under-80-percent",
@@ -263,6 +270,30 @@ def test_of_two_equally_cheap_readings_the_one_that_matches_more_words_wins(said
     match = locate_quote(quote, words)
     assert match == QuoteMatch(first=0, last=5, ratio=0.833)
     assert span_text(words, match) == said
+
+
+# A filler must never change whether a quote is kept. Without its filler each quote here is
+# None: the first is he-for-i-at-the-start above, and in the second the length rule keeps "me",
+# the changed last word, in the span. With "uh" after "I", a third reading ties, "He" in place
+# of "uh", and it starts after "I". With the "um" counted, the span that stops before "me"
+# would be exactly as long as the quote.
+@pytest.mark.parametrize(
+    ("said", "quote"),
+    [
+        pytest.param(
+            "I, uh, owned the fix end to end.",
+            "He owned the fix end to end",
+            id="he-for-i-before-a-filler",
+        ),
+        pytest.param(
+            "That part was, um, owned by me.",
+            "That part was owned by him",
+            id="him-for-me-after-a-filler",
+        ),
+    ],
+)
+def test_a_filler_never_hides_a_changed_first_or_last_word_from_the_guard(said, quote):
+    assert locate_quote(quote, said.split()) is None
 
 
 def test_fillers_that_match_fillers_are_none():

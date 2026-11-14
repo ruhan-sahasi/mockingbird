@@ -30,7 +30,6 @@ import string
 import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
-from operator import itemgetter
 
 FILLERS = frozenset({"um", "uh", "uhm", "erm", "er", "ah", "hmm", "mm", "mhm"})
 NEGATIONS = frozenset(
@@ -77,8 +76,6 @@ _CONTRACTIONS = [
 # agrees with or without it: "e-commerce" and "ecommerce". A dash, or a hyphen beside a space,
 # splits words like any other punctuation.
 _HYPHEN_IN_WORD = re.compile(r"(?<=\w)[-\u2010\u2011](?=\w)")
-
-_cost_then_matched = itemgetter(0, 1)  # what two cells of the alignment table compare on
 
 
 @dataclass(frozen=True)
@@ -168,10 +165,16 @@ def _cheapest_span(q: list[str], tokens: list[str]) -> tuple[int, int, int]:
     substitution, an insertion and a deletion each cost 1, and skipping a filler in the
     transcript costs 0. A long answer makes a wide table, so only two rows are kept, and each
     cell carries where its stretch starts instead of a path back.
+
+    The guard reads only this stretch, so a word the quote changed at either end must stay
+    inside it, and no filler may change that. The two tie rules below see to it.
     """
-    # A cell is (cost, -matched, start), compared on (cost, -matched): of two equally cheap
-    # alignments, the one that matches more words wins. On a full tie, min keeps the first
-    # candidate: a step from the diagonal, then from above, then from the left.
+    # A cell is (cost, -matched, start), and cells compare as whole tuples: the cheaper
+    # alignment wins, then the one that matches more words, then the one that starts earlier.
+    # "He owned the fix" against "I owned the fix" costs one edit two ways: "He" in place of
+    # "I", or "He" never said and the stretch starting at "owned". Only the first holds "I".
+    # Against "I, uh, owned the fix" a third reading ties: "He" in place of "uh", which starts
+    # after "I" too. In both, the earliest start is the reading that holds "I".
     previous = [(0, 0, start) for start in range(len(tokens) + 1)]
     for i, quoted in enumerate(q, start=1):
         current = [(i, 0, 0)]  # the quote's first i tokens, none of them said
@@ -186,15 +189,22 @@ def _cheapest_span(q: list[str], tokens: list[str]) -> tuple[int, int, int]:
             cost, minus_matched, start = current[j - 1]
             skip = 0 if token in FILLERS else 1
             left = (cost + skip, minus_matched, start)  # said but not quoted
-            current.append(min(diagonal, above, left, key=_cost_then_matched))
+            current.append(min(diagonal, above, left))
         previous = current
+
+    said_before = [0]  # said_before[j]: how many of the first j tokens are not fillers
+    for token in tokens:
+        said_before.append(said_before[-1] + (token not in FILLERS))
 
     def end_rank(j: int) -> tuple[int, int, int, int]:
         # The cheapest end, then the one that matched most, then the span nearest the quote's
         # length (so a changed last word is shown, not cut off), then the earliest (so a phrase
-        # said twice is found where it was first said).
+        # said twice is found where it was first said). The length counts only the tokens that
+        # are not fillers. Counting the "um" in "That part was, um, owned by me" would make the
+        # span that stops before "me" as long as "That part was owned by him", and the guard
+        # would never see "me".
         cost, minus_matched, start = previous[j]
-        return cost, minus_matched, abs((j - start) - len(q)), j
+        return cost, minus_matched, abs(said_before[j] - said_before[start] - len(q)), j
 
     end = min(range(1, len(tokens) + 1), key=end_rank)
     cost, _, start = previous[end]
