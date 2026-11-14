@@ -523,6 +523,13 @@ def test_a_quote_that_changes_the_meaning_is_none_in_its_own_words(
             (42, 52, 0.909),
             id="a-first-word-added-two-words-from-a-guarded-one",
         ),
+        # The same with "And", the plainest word a grader puts in front of a quote.
+        pytest.param(
+            ANSWER,
+            "And latency dropped by twenty-five percent after the second release",
+            (42, 52, 0.909),
+            id="a-leading-and-added-two-words-from-a-guarded-one",
+        ),
         pytest.param(
             ANSWER,
             "I led the migration of our billing service to the new queue, overall",

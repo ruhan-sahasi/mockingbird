@@ -530,6 +530,7 @@ split on spaces into 68 words (index 0 is `So,`, index 43 is the lone `-`):
   | `and then I I led the migration of our billing service` | `and then I led the migration of our billing service` | None, on purpose: a guarded word said twice |
   | `No, I led the migration of our billing service` | `Honestly, I led the migration of our billing service` | None, on purpose: an added edge word beside a guarded one |
   | the fixture | `Overall latency dropped by twenty-five percent after the second release` | None, on purpose: `Overall` reads as a change to `planned.`, and the edge rule reads `we`, two words out |
+  | the fixture | `And latency dropped by twenty-five percent after the second release` | None, on purpose: the same with `And`, which reads as a change to `planned.` |
   | the fixture | `I led the migration of our billing service to the new queue, overall` | None, on purpose: `overall` reads as a change to `and`, and the edge rule reads the `I` after `uh`, two words out |
 
   Each guarded row catches a different wrong build: one that reads only
