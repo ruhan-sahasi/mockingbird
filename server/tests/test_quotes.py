@@ -2,7 +2,7 @@
 and whether it is close enough to keep (Review Focus 2).
 
 FOUND and NOT_FOUND run against one answer, split on spaces into 68 words the way a transcriber
-writes them. The rows after them bring their own words, for what that answer cannot show. Every
+writes them. Most rows after them bring their own words, for what that answer cannot show. Every
 row and its result is the plan's. Each rejected row names the rule that rejects it, and each row
 the guard rejects is run again with the guard switched off, where it must be found, so no guarded
 row can pass by failing the 80% line instead.
@@ -11,8 +11,9 @@ The guarded rows each catch a different wrong build: one that reads only the tra
 an edit, one that reads only the quote's side, one that compares the two sides as bags of words,
 one that misses an edit on the alignment table's edge, one whose match can start or stop inside a
 word, one without the edge rule, whose match stops short of a changed word, one whose edge rule
-reads past a left-out quote word but not past a changed one, and one that reads a single cheapest
-alignment, the one that leaves a swapped "not" alone.
+reads past a left-out quote word but not past a changed one, one whose edge rule reads a single
+token of the word outside the match, and one that reads a single cheapest alignment, the one that
+leaves a swapped "not" alone.
 """
 
 import ast
@@ -431,7 +432,8 @@ NOT_FOUND_IN_OWN_WORDS = [
         (0, 4, 0.833),
         id="starts-inside-1.5",
     ),
-    # 2 edits in 5: all of "12.5%" is said, and "5" and "percent" are not quoted.
+    # The cheapest match is "revenue grew", with "12" left out: one edit in 3 tokens, under the
+    # 80% line. Running on to the end of "12.5%" costs two edits, so it is not the cheapest.
     pytest.param("revenue grew 12.5%", "revenue grew 12", None, id="stops-inside-12.5"),
     # The cheapest match stops short of the changed word, so only the edge rule reads it.
     pytest.param(
@@ -451,6 +453,20 @@ NOT_FOUND_IN_OWN_WORDS = [
         "He owned the fix end to end",
         (1, 7, 0.857),
         id="he-for-i-before-a-left-out-word",
+    ),
+    # The word just outside the match is a contraction whose guarded token comes first: "I'm" is
+    # "i", "am". The match is whole words, so the edge rule reads every token of that word.
+    pytest.param(
+        "I'm proud that I owned the fix end to end.",
+        "He's proud that I owned the fix end to end",
+        (1, 9, 0.9),
+        id="hes-for-the-i-of-im",
+    ),
+    pytest.param(
+        "We've shipped every release on time since March.",
+        "Everyone's shipped every release on time since March",
+        (1, 7, 0.875),
+        id="everyones-for-the-we-of-weve",
     ),
     # A plain word in place of a guarded first or last word, with the word beside it left out.
     # The match reads "Yes" as a change to "honestly", so only the edge rule reads the "No".
@@ -492,9 +508,9 @@ def test_a_quote_that_changes_the_meaning_is_none_in_its_own_words(
     _assert_none_and_only_the_guard_says_so(quote, said.split(), unguarded, monkeypatch)
 
 
-# Two kinds of faithful quote the guard drops on purpose (the module's docstring says why). Each
-# costs a kept quote and never shows a wrong one. They are pinned so that a change to either is a
-# choice.
+# Three kinds of faithful quote the guard drops on purpose (the module's docstring says why). Each
+# costs a kept quote and never shows a wrong one. They are pinned so that a change to any of them
+# is a choice.
 @pytest.mark.parametrize(
     ("said", "quote", "unguarded"),
     [
@@ -536,9 +552,25 @@ def test_a_quote_that_changes_the_meaning_is_none_in_its_own_words(
             (2, 14, 0.923),
             id="a-last-word-added-two-words-from-a-guarded-one",
         ),
+        # Or the added word reads as left out, and the word beside the match is a contraction
+        # that holds a guarded token. The edge rule reads all of "I'm", so it reads the "i".
+        pytest.param(
+            "I'm proud that I owned the fix end to end.",
+            "So proud that I owned the fix end to end",
+            (1, 9, 0.9),
+            id="a-first-word-added-beside-the-i-of-im",
+        ),
+        # A closed compound for a hyphenated word that holds a guarded one. A hyphen splits, so
+        # "five-person" is "five", "person", and "fiveperson" reads as a change to "five".
+        pytest.param(
+            "We had a five-person team for the whole migration.",
+            "We had a fiveperson team for the whole migration",
+            (0, 8, 0.8),
+            id="a-closed-compound-for-a-hyphenated-number",
+        ),
     ],
 )
-def test_the_guard_drops_two_kinds_of_faithful_quote_on_purpose(
+def test_the_guard_drops_three_kinds_of_faithful_quote_on_purpose(
     said, quote, unguarded, monkeypatch
 ):
     _assert_none_and_only_the_guard_says_so(quote, said.split(), unguarded, monkeypatch)

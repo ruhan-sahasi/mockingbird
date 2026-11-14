@@ -300,7 +300,8 @@ README.md
 Ruling P3-R8 tightened it during the build: hyphens split, `'d` and `let's`
 expand, number words gained plurals and more ordinals, fillers never count
 on either side, a match is whole words, and the guard reads every cheapest
-alignment and the words just outside the match.
+alignment and the words just outside the match. Ruling P3-R11 then made the
+guard read every token of those words.
 
 1. `tokenize`, in this order:
    - Lowercase.
@@ -354,20 +355,24 @@ alignment and the words just outside the match.
      `forward + 1 + backward` equals the total): both tokens of each
      substitution, the quote token of each deletion, the transcript token
      of each insertion. Plus the edge rule: when a cheapest alignment's
-     first step substitutes or drops a quote token, the transcript token
-     just before the span (if there is one) counts as touched, and likewise
-     the token just after the span for the last step. Without it, "He owned
-     the fix end to end" against "I really owned the fix end to end." and
-     "...my answer was yes" against "...my honest answer was no." are kept,
-     because the cheapest span stops short of the changed word. A token is
-     guarded when it is in `NEGATIONS`, in `FIRST_PERSON`, holds a digit,
-     or is a number word.
+     first step substitutes or drops a quote token, every token of the
+     transcript word just before the span (if there is one) counts as
+     touched, and likewise every token of the word just after the span for
+     the last step. Without it, "He owned the fix end to end" against "I
+     really owned the fix end to end." and "...my answer was yes" against
+     "...my honest answer was no." are kept, because the cheapest span stops
+     short of the changed word. It reads the whole word because the span is
+     whole words, so its edge is a whole word, and a contraction such as
+     "I'm" holds a guarded token behind an unguarded one: reading only the
+     token beside the span, "He's proud" against "I'm proud" would read `am`
+     and never `i`. A token is guarded when it is in `NEGATIONS`, in
+     `FIRST_PERSON`, holds a digit, or is a number word.
 7. `first = owner[span_start]`, `last = owner[span_end - 1]`. Round `ratio`
    to 3 places.
 
-The guard errs toward dropping a quote. Two kinds of faithful quote are
-dropped on purpose, and the tests pin both. Each costs a kept quote and
-never shows a wrong one.
+The guard errs toward dropping a quote. Three kinds of faithful quote are
+dropped on purpose, and the tests pin all three. Each costs a kept quote
+and never shows a wrong one.
 - A guarded word the transcript repeats: "and then I led" against "and
   then I I led".
 - A word the grader added at the quote's start or end, with a guarded word
@@ -385,7 +390,9 @@ never shows a wrong one.
   honestly, overall, basically, and, but) to each run: 290 quotes a side.
   With the word added at the start, 80 (28%) were dropped: 20 for a
   guarded word beside the match and 60 for one two words out. With it
-  added at the end, 151 (52%) were dropped: 70 beside and 81 two words out.
+  added at the end, 161 (56%) were dropped: 80 beside and 81 two words out.
+  Ten of those came with ruling P3-R11, all from one run that ends just
+  before "Let's", whose `us` is guarded.
   The same shape can hide a meaning change, which is why these are
   dropped: "Yes, the cutover went fine" against "No, honestly, the cutover
   went fine", or "my answer was yes" against "my answer was, honestly,
@@ -393,25 +400,15 @@ never shows a wrong one.
   left out. Neither `yes` nor `honestly` is guarded, so to the guard these
   look the same as the added-word quotes. Keeping those without keeping
   these would take a new list of words.
+- A closed compound the grader wrote for a hyphenated transcript word that
+  holds a guarded word. A hyphen splits, so "fiveperson" against
+  "five-person" reads as a change to the guarded `five`.
 
-**Open decision, for Ruhan or the controller.** Ruling P3-R8 named the
-second cost as "an unguarded edge word beside a guarded neighbour". The
-rule as built reaches one word further, to a guarded word two words out,
-and that is most of the measured drops: 60 of the 80 at the start and 81
-of the 151 at the end. Nobody has ruled on that wider cost. The build
-keeps it, because the two changes tried so far would relax the quote
-decision, and the rows above pin the behaviour so that changing it is a
-choice. The choices:
-1. Accept it, and make P3-R8's cost line say "one or two words out".
-2. Read past the match only when the quote's edge word is left out, not
-   when it is changed, and guard third-person pronouns in the quote. This
-   keeps the added-word quotes. It also keeps "Yes, the cutover went fine"
-   against "No, honestly, the cutover went fine" and shows the answer with
-   its "No" cut off, so it relaxes the quote decision.
-3. A short list of words a grader may add (and, so, but, overall), with
-   "yes" off it. Not built. Which words real graders add is unmeasured.
-   Task 4's per-report counts of kept and dropped quotes will show how
-   often this bites on live runs.
+**Accepted by ruling P3-R10.** The added-word drops, with a guarded word
+one or two words out, are the cost of a guard that never shows a wrong
+quote, and the rows below pin them. They will be revisited with Task 4's
+kept and dropped counts from live calls: the dropped count takes in every
+dropped quote, so it bounds this cost but cannot single it out.
 
 The sets:
 - `FILLERS`: um, uh, uhm, erm, er, ah, hmm, mm, mhm.
@@ -538,10 +535,12 @@ split on spaces into 68 words (index 0 is `So,`, index 43 is the lone `-`):
   | `I knew we couldn't.` | `I knew we could` | None: the match takes all of `couldn't.`, so the edit is `not` |
   | `0.4% of users saw errors` | `4% of users saw errors` | None: the match takes all of `0.4%` |
   | `1.5 million dollars in revenue` | `5 million dollars in revenue` | None: the match takes all of `1.5` |
-  | `revenue grew 12.5%` | `revenue grew 12` | None: 2 edits in 5 |
+  | `revenue grew 12.5%` | `revenue grew 12` | None: the cheapest match is `revenue grew`, with `12` left out, one edit in 3. Running on to the end of `12.5%` costs two |
   | `We-we led the migration of our billing service` | `They led the migration of our billing service` | None: the match starts at `led`, and the edge rule reads the `we` before it |
   | `When they asked if we could ship it in two weeks, my honest answer was no.` | `When they asked if we could ship it in two weeks, my answer was yes` | None: the match stops at `was`, and the edge rule reads `no` |
   | `I really owned the fix end to end.` | `He owned the fix end to end` | None: the match starts at `really`, and the edge rule reads `I` |
+  | `I'm proud that I owned the fix end to end.` | `He's proud that I owned the fix end to end` | None: the match starts at `proud`, and the edge rule reads all of `I'm`, so its `i` |
+  | `We've shipped every release on time since March.` | `Everyone's shipped every release on time since March` | None: the same with the `we` of `We've` |
   | `No, honestly, the cutover went fine for the billing team that week.` | `Yes, the cutover went fine for the billing team that week.` | None: the match starts at `honestly,`, and the edge rule reads `No` |
   | `When they asked if we could ship it in two weeks, my answer was, honestly, no.` | `When they asked if we could ship it in two weeks, my answer was yes` | None: the match stops at `honestly,`, and the edge rule reads `no` |
   | `I, uh, owned the fix end to end.` | `He owned the fix end to end` | None: the filler changes nothing |
@@ -551,13 +550,16 @@ split on spaces into 68 words (index 0 is `So,`, index 43 is the lone `-`):
   | the fixture | `Overall latency dropped by twenty-five percent after the second release` | None, on purpose: `Overall` reads as a change to `planned.`, and the edge rule reads `we`, two words out |
   | the fixture | `And latency dropped by twenty-five percent after the second release` | None, on purpose: the same with `And`, which reads as a change to `planned.` |
   | the fixture | `I led the migration of our billing service to the new queue, overall` | None, on purpose: `overall` reads as a change to `and`, and the edge rule reads the `I` after `uh`, two words out |
+  | `I'm proud that I owned the fix end to end.` | `So proud that I owned the fix end to end` | None, on purpose: `So` reads as left out, and the edge rule reads the `i` of `I'm`, beside the match |
+  | `We had a five-person team for the whole migration.` | `We had a fiveperson team for the whole migration` | None, on purpose: a closed compound, which reads as a change to the guarded `five` |
 
   Each guarded row catches a different wrong build: one that reads only
   the transcript's side of an edit, one that reads only the quote's side,
   one that compares the two sides as bags of words, one that misses an edit
   on the alignment table's edge, one whose match can start or stop inside a
   word, one without the edge rule, one whose edge rule reads past a quote
-  word left out but not past a changed one, and one that reads a single
+  word left out but not past a changed one, one whose edge rule reads a
+  single token of the word outside the match, and one that reads a single
   cheapest alignment, the one that leaves a swapped `not` alone.
 
   Also:

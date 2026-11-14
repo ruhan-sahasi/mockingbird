@@ -28,8 +28,8 @@ the cheapest match can stop short of the word that changed. "rose" for "dropped"
 because no list of words can know an antonym. That is why the report shows the transcript's
 words and never the grader's.
 
-The guard errs toward dropping a quote. It drops two kinds of faithful quote on purpose, and the
-tests pin both, since each costs a kept quote and never shows a wrong one:
+The guard errs toward dropping a quote. It drops three kinds of faithful quote on purpose, and
+the tests pin all three, since each costs a kept quote and never shows a wrong one:
 - A guarded word the transcript repeats. "and then I led" against "and then I I led" is one
   edit, and the edit is an "I".
 - A word the grader added at the quote's start or end, with a guarded word one or two words out
@@ -40,6 +40,9 @@ tests pin both, since each costs a kept quote and never shows a wrong one:
   meaning change, which is why these are dropped: "Yes, the cutover went fine" against "No,
   honestly, the cutover went fine" is a plain word in place of a guarded one, with the word
   beside it left out.
+- A closed compound the grader wrote for a hyphenated transcript word that holds a guarded
+  word. A hyphen splits, so "fiveperson" against "five-person" reads as a change to the
+  guarded "five".
 
 The module is pure: standard library only, no I/O and no logging, so no quote can reach a log
 from here.
@@ -143,8 +146,10 @@ def locate_quote(quote: str, words: Sequence[str]) -> QuoteMatch | None:
     `words` are the transcript's words in time order, as the transcriber wrote them. Fillers
     never count, in the quote or in `words`, and the match is a run of whole words. A match with
     no edits is kept at any length. Any other needs a ratio of 0.80 or more, and no edit on any
-    cheapest alignment may touch a negation, a first-person pronoun, a digit or a number word,
-    nor may an edit to the quote's first or last token sit beside one just outside the match.
+    cheapest alignment may touch a negation, a first-person pronoun, a digit or a number word.
+    Nor may an edit to the quote's first or last token sit beside one just outside the match, in
+    any token of the word just before or after it: the match is whole words, so its edge is a
+    whole word, and a contraction such as "I'm" holds a guarded token behind an unguarded one.
     """
     q = [token for token in tokenize(quote) if token not in FILLERS]
     tokens: list[str] = []
@@ -167,8 +172,10 @@ def locate_quote(quote: str, words: Sequence[str]) -> QuoteMatch | None:
         # never passes either.
         if 5 * cost > denominator:
             return None
-        before = tokens[start - 1] if start > 0 else None
-        after = tokens[end] if end < len(tokens) else None
+        # Every token of the word just before the match and of the word just after it, for the
+        # edge rule. At the transcript's start or end the range is empty, and so is the list.
+        before = [tokens[k] for k in range(start) if owner[k] == owner[start - 1]]
+        after = [tokens[k] for k in range(end, len(tokens)) if owner[k] == owner[end]]
         if any(_guarded(token) for token in _touched(q, said, before, after)):
             return None
     return QuoteMatch(
@@ -243,10 +250,13 @@ def _cheapest_span(q: list[str], tokens: list[str], owner: list[int]) -> tuple[i
     return cost, start, end
 
 
-def _touched(q: list[str], said: list[str], before: str | None, after: str | None) -> set[str]:
-    """Every token an edit touches on any cheapest alignment of `q` with `said`, plus the
-    transcript tokens just outside the match that the edge rule adds. `before` and `after` are
-    those tokens, or None at the transcript's start or end.
+def _touched(
+    q: list[str], said: list[str], before: Sequence[str], after: Sequence[str]
+) -> set[str]:
+    """Every token an edit touches on any cheapest alignment of `q` with `said`, plus the tokens
+    the edge rule adds from the transcript words just outside the match. `before` and `after` are
+    every token of the word just before the match and of the word just after it, empty at the
+    transcript's start or end.
 
     An edit touches both tokens of a substitution, and the one token of a deletion (quoted but
     not said) or an insertion (said but not quoted). Two alignments can cost the same and touch
@@ -258,8 +268,10 @@ def _touched(q: list[str], said: list[str], before: str | None, after: str | Non
     The edge rule covers a word the match stopped short of. "He owned the fix end to end"
     against "I really owned the fix end to end" is cheapest from "really", with "He" in place of
     "really", so no edit touches "I". When a cheapest alignment's first step changes or leaves
-    out the quote's first token, the token just before the match counts as touched, and likewise
-    the token just after it when the last step changes or leaves out the quote's last token.
+    out the quote's first token, every token of the word just before the match counts as
+    touched, and likewise every token of the word just after it when the last step changes or
+    leaves out the quote's last token: the match is whole words, so its edge is a whole word, and
+    a contraction such as "I'm" holds a guarded token behind an unguarded one.
     """
     m, n = len(q), len(said)
     forward = _distances(q, said)
@@ -285,10 +297,10 @@ def _touched(q: list[str], said: list[str], before: str | None, after: str | Non
     last_step_edits_quote = (q[-1] != said[-1] and forward[m - 1][n - 1] + 1 == total) or (
         forward[m - 1][n] + 1 == total
     )
-    if first_step_edits_quote and before is not None:
-        touched.add(before)
-    if last_step_edits_quote and after is not None:
-        touched.add(after)
+    if first_step_edits_quote:
+        touched.update(before)
+    if last_step_edits_quote:
+        touched.update(after)
     return touched
 
 
